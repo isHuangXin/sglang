@@ -244,21 +244,39 @@ class MooncakeKVManager(CommonKVManager):
     def register_buffer_to_engine(self):
         # Batch register KV data buffers
         if self.kv_args.kv_data_ptrs and self.kv_args.kv_data_lens:
-            self.engine.batch_register(
+            logger.info(
+                "Registering KV data buffers: ptrs=%s, lens=%s",
+                [hex(p) for p in self.kv_args.kv_data_ptrs],
+                self.kv_args.kv_data_lens,
+            )
+            ret = self.engine.batch_register(
                 self.kv_args.kv_data_ptrs, self.kv_args.kv_data_lens
             )
+            logger.info("KV data buffer registration returned: %s", ret)
 
         # Batch register auxiliary data buffers
         if self.kv_args.aux_data_ptrs and self.kv_args.aux_data_lens:
-            self.engine.batch_register(
+            logger.info(
+                "Registering aux data buffers: ptrs=%s, lens=%s",
+                [hex(p) for p in self.kv_args.aux_data_ptrs],
+                self.kv_args.aux_data_lens,
+            )
+            ret = self.engine.batch_register(
                 self.kv_args.aux_data_ptrs, self.kv_args.aux_data_lens
             )
+            logger.info("Aux data buffer registration returned: %s", ret)
 
         # Batch register state/extra pool data buffers
         if self.kv_args.state_data_ptrs and self.kv_args.state_data_lens:
-            self.engine.batch_register(
+            logger.info(
+                "Registering state data buffers: ptrs=%s, lens=%s",
+                [hex(p) for p in self.kv_args.state_data_ptrs],
+                self.kv_args.state_data_lens,
+            )
+            ret = self.engine.batch_register(
                 self.kv_args.state_data_ptrs, self.kv_args.state_data_lens
             )
+            logger.info("State data buffer registration returned: %s", ret)
 
     def _transfer_data(self, mooncake_session_id, transfer_blocks):
         if not transfer_blocks:

@@ -321,7 +321,12 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         regions = self._registerable_regions()
         if regions:
             ptrs, lens = zip(*regions)
+            # FLAT_MEMORY: Diagnose the deduplicated registration, not old per-pool calls.
+            logger.debug("Registering Mooncake regions: %s", regions)
             self.engine.batch_register(list(ptrs), list(lens))
+            logger.debug(
+                "Registered %d Mooncake regions (%d bytes)", len(regions), sum(lens)
+            )
 
     def deregister_buffer_to_engine(self):
         regions = self._registerable_regions()

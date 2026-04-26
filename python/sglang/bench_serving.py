@@ -104,6 +104,10 @@ class RequestFuncOutput:
     prompt_len: int = 0
     error: str = ""
     output_len: int = 0
+    cached_tokens: int = 0
+    cached_tokens_device: int = 0
+    cached_tokens_host: int = 0
+    cached_tokens_storage: int = 0
     start_time: float = 0.0
 
     @staticmethod
@@ -651,6 +655,12 @@ async def async_request_sglang_generate(
                                 timestamp = time.perf_counter()
                                 generated_text = data["text"]
                                 output_len = data["meta_info"]["completion_tokens"]
+                                output.cached_tokens = data["meta_info"].get("cached_tokens", 0)
+                                details = data["meta_info"].get("cached_tokens_details")
+                                if details:
+                                    output.cached_tokens_device = details.get("device", 0)
+                                    output.cached_tokens_host = details.get("host", 0)
+                                    output.cached_tokens_storage = details.get("storage", 0)
 
                                 # First token
                                 if ttft == 0.0:
@@ -998,6 +1008,12 @@ class BenchmarkMetrics:
     concurrency: float
     max_output_tokens_per_s: float = 0.0
     max_concurrent_requests: int = 0
+    total_cached_tokens: int = 0
+    total_prompt_tokens: int = 0
+    cache_hit_rate: float = 0.0
+    total_cached_tokens_device: int = 0
+    total_cached_tokens_host: int = 0
+    total_cached_tokens_storage: int = 0
 
 
 SHAREGPT_REPO_ID = "anon8231489123/ShareGPT_Vicuna_unfiltered"
@@ -2103,6 +2119,7 @@ def calculate_metrics(
     ttfts: List[float] = []
     e2e_latencies: List[float] = []
     retokenized_itls: List[float] = []
+    cached_tokens_list: List[int] = []
 
     use_retokenized_itl = (
         accept_length is not None
@@ -2138,6 +2155,7 @@ def calculate_metrics(
             ttfts.append(outputs[i].ttft)
 
             e2e_latencies.append(outputs[i].latency)
+            cached_tokens_list.append(outputs[i].cached_tokens)
 
             completed += 1
         else:
@@ -2253,6 +2271,12 @@ def calculate_metrics(
         concurrency=np.sum(e2e_latencies) / dur_s,
         max_output_tokens_per_s=max_output_tokens_per_s,
         max_concurrent_requests=max_concurrent_requests,
+        total_cached_tokens=sum(cached_tokens_list),
+        total_prompt_tokens=total_input,
+        cache_hit_rate=sum(cached_tokens_list) / total_input if total_input > 0 else 0.0,
+        total_cached_tokens_device=sum(o.cached_tokens_device for o in outputs if o.success),
+        total_cached_tokens_host=sum(o.cached_tokens_host for o in outputs if o.success),
+        total_cached_tokens_storage=sum(o.cached_tokens_storage for o in outputs if o.success),
     )
 
     return metrics, output_lens
@@ -2625,6 +2649,15 @@ async def benchmark(
         )
     )
     print("{:<40} {:<10.2f}".format("Concurrency:", metrics.concurrency))
+    if metrics.total_cached_tokens > 0 or metrics.total_prompt_tokens > 0:
+        print("{s:{c}^{n}}".format(s="Cache Hit Statistics", n=50, c="-"))
+        print("{:<40} {:<10}".format("Total cached tokens:", metrics.total_cached_tokens))
+        print("{:<40} {:<10}".format("Total prompt tokens:", metrics.total_prompt_tokens))
+        print("{:<40} {:<10.4f}".format("Cache hit rate:", metrics.cache_hit_rate))
+        if metrics.total_cached_tokens_device > 0 or metrics.total_cached_tokens_host > 0 or metrics.total_cached_tokens_storage > 0:
+            print("{:<40} {:<10}".format("  - Device (GPU HBM):", metrics.total_cached_tokens_device))
+            print("{:<40} {:<10}".format("  - Host (CPU DRAM):", metrics.total_cached_tokens_host))
+            print("{:<40} {:<10}".format("  - Storage (L3 SSD):", metrics.total_cached_tokens_storage))
     if accept_length:
         print("{:<40} {:<10.2f}".format("Accept length:", accept_length))
     print("{s:{c}^{n}}".format(s="End-to-End Latency", n=50, c="-"))
@@ -2715,6 +2748,12 @@ async def benchmark(
             "accept_length": accept_length,
             "max_output_tokens_per_s": metrics.max_output_tokens_per_s,
             "max_concurrent_requests": metrics.max_concurrent_requests,
+            "total_cached_tokens": metrics.total_cached_tokens,
+            "total_prompt_tokens": metrics.total_prompt_tokens,
+            "cache_hit_rate": metrics.cache_hit_rate,
+            "total_cached_tokens_device": metrics.total_cached_tokens_device,
+            "total_cached_tokens_host": metrics.total_cached_tokens_host,
+            "total_cached_tokens_storage": metrics.total_cached_tokens_storage,
         }
     else:
         print(f"Error running benchmark for request rate: {request_rate}")
@@ -2745,6 +2784,10 @@ async def benchmark(
         "itls": [output.itl for output in outputs],
         "generated_texts": [output.generated_text for output in outputs],
         "errors": [output.error for output in outputs],
+        "cached_tokens": [output.cached_tokens for output in outputs],
+        "cached_tokens_device": [output.cached_tokens_device for output in outputs],
+        "cached_tokens_host": [output.cached_tokens_host for output in outputs],
+        "cached_tokens_storage": [output.cached_tokens_storage for output in outputs],
     }
 
     # Append results to a JSONL file

@@ -58,12 +58,28 @@ class SchedulerOutputProcessorMixin:
         """Get detailed cache breakdown for a request, if available.
 
         Returns:
-            - None if HiCache is not enabled
-            - {"device": X, "host": Y} if HiCache enabled but L3 storage is not
+            - None if no cached tokens breakdown is available
+            - {"device": X, "host": Y} if breakdown available but L3 storage is not
             - {"device": X, "host": Y, "storage": Z, "storage_backend": "..."} if L3 enabled
         """
-        # Only show details if HiCache is enabled
+        # In PD disaggregation mode, the decode node receives breakdown data
+        # from the prefill node via metadata buffer, even though HiCache is
+        # not enabled on the decode side. So we check the values directly
+        # instead of checking enable_hierarchical_cache.
         if not getattr(self, "enable_hierarchical_cache", False):
+            # For PD disagg decode: check if prefill sent breakdown data
+            if self.disaggregation_mode == DisaggregationMode.DECODE and (
+                req.cached_tokens_device > 0
+                or req.cached_tokens_host > 0
+                or req.cached_tokens_storage > 0
+            ):
+                details = {
+                    "device": req.cached_tokens_device,
+                    "host": req.cached_tokens_host,
+                }
+                if req.cached_tokens_storage > 0:
+                    details["storage"] = req.cached_tokens_storage
+                return details
             return None
 
         # Only show if there are any cached tokens

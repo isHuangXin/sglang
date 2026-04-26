@@ -108,6 +108,9 @@ class RequestFuncOutput:
     output_len: int = 0
     start_time: float = 0.0
     cached_tokens: int = 0
+    cached_tokens_device: int = 0
+    cached_tokens_host: int = 0
+    cached_tokens_storage: int = 0
     cached_tokens_details: Optional[Dict[str, Any]] = None
     spec_accept_length: float = 0.0
     spec_cap_length: float = 0.0
@@ -730,16 +733,16 @@ async def async_request_sglang_generate(
                                     "spec_accept_length"
                                 ]
 
-                            # NOTE: Some completion API might have a last
-                            # usage summary response without a token so we
-                            # want to check a token was generated
-                            if getattr(args, "cache_report", False):
-                                _meta = data.get("meta_info") or {}
-                                output.cached_tokens = _meta.get("cached_tokens", 0)
-                                output.cached_tokens_details = _meta.get(
-                                    "cached_tokens_details"
-                                )
+                            output.cached_tokens = _meta_info.get("cached_tokens", 0)
+                            output.cached_tokens_details = _meta_info.get(
+                                "cached_tokens_details"
+                            )
+                            details = output.cached_tokens_details or {}
+                            output.cached_tokens_device = details.get("device", 0)
+                            output.cached_tokens_host = details.get("host", 0)
+                            output.cached_tokens_storage = details.get("storage", 0)
 
+                            # A final usage-only response does not contain a new token.
                             if "text" in data and data["text"]:
                                 timestamp = time.perf_counter()
                                 generated_text = data["text"]
@@ -1050,6 +1053,12 @@ class BenchmarkMetrics:
     concurrency: float
     max_output_tokens_per_s: float = 0.0
     max_concurrent_requests: int = 0
+    total_cached_tokens: int = 0
+    total_prompt_tokens: int = 0
+    cache_hit_rate: float = 0.0
+    total_cached_tokens_device: int = 0
+    total_cached_tokens_host: int = 0
+    total_cached_tokens_storage: int = 0
 
 
 async def get_request(
@@ -1225,6 +1234,7 @@ def calculate_metrics(
                 print("tip: install termplotlib and gnuplot to plot the metrics")
 
     itls = retokenized_itls if use_retokenized_itl else itls
+    total_cached_tokens = sum(output.cached_tokens for output in successful_outputs)
     metrics = BenchmarkMetrics(
         completed=completed,
         total_input=total_input,
@@ -1268,6 +1278,18 @@ def calculate_metrics(
         concurrency=np.sum(e2e_latencies) / dur_s,
         max_output_tokens_per_s=max_output_tokens_per_s,
         max_concurrent_requests=max_concurrent_requests,
+        total_cached_tokens=total_cached_tokens,
+        total_prompt_tokens=total_input,
+        cache_hit_rate=total_cached_tokens / total_input if total_input > 0 else 0.0,
+        total_cached_tokens_device=sum(
+            output.cached_tokens_device for output in successful_outputs
+        ),
+        total_cached_tokens_host=sum(
+            output.cached_tokens_host for output in successful_outputs
+        ),
+        total_cached_tokens_storage=sum(
+            output.cached_tokens_storage for output in successful_outputs
+        ),
     )
 
     return metrics, output_lens
@@ -1686,6 +1708,24 @@ async def benchmark(
             )
         )
     print("{:<40} {:<10.2f}".format("Concurrency:", metrics.concurrency))
+    if not args.cache_report and (
+        metrics.total_cached_tokens > 0 or metrics.total_prompt_tokens > 0
+    ):
+        print("{s:{c}^{n}}".format(s="Cache Hit Statistics", n=50, c="-"))
+        print("{:<40} {:<10}".format("Total cached tokens:", metrics.total_cached_tokens))
+        print("{:<40} {:<10}".format("Total prompt tokens:", metrics.total_prompt_tokens))
+        print("{:<40} {:<10.4f}".format("Cache hit rate:", metrics.cache_hit_rate))
+        if (
+            metrics.total_cached_tokens_device > 0
+            or metrics.total_cached_tokens_host > 0
+            or metrics.total_cached_tokens_storage > 0
+        ):
+            for label, value in (
+                ("  - Device (GPU HBM):", metrics.total_cached_tokens_device),
+                ("  - Host (CPU DRAM):", metrics.total_cached_tokens_host),
+                ("  - Storage (L3):", metrics.total_cached_tokens_storage),
+            ):
+                print("{:<40} {:<10}".format(label, value))
     if accept_length:
         print("{:<40} {:<10.2f}".format("Accept length:", accept_length))
     print("{s:{c}^{n}}".format(s="End-to-End Latency", n=50, c="-"))
@@ -1845,6 +1885,12 @@ async def benchmark(
             "accept_length": accept_length,
             "max_output_tokens_per_s": metrics.max_output_tokens_per_s,
             "max_concurrent_requests": metrics.max_concurrent_requests,
+            "total_cached_tokens": metrics.total_cached_tokens,
+            "total_prompt_tokens": metrics.total_prompt_tokens,
+            "cache_hit_rate": metrics.cache_hit_rate,
+            "total_cached_tokens_device": metrics.total_cached_tokens_device,
+            "total_cached_tokens_host": metrics.total_cached_tokens_host,
+            "total_cached_tokens_storage": metrics.total_cached_tokens_storage,
         }
 
         if args.cache_report:
@@ -1886,10 +1932,13 @@ async def benchmark(
         "itls": [output.itl for output in outputs],
         "generated_texts": [output.generated_text for output in outputs],
         "errors": [output.error for output in outputs],
+        "cached_tokens": [output.cached_tokens for output in outputs],
+        "cached_tokens_device": [output.cached_tokens_device for output in outputs],
+        "cached_tokens_host": [output.cached_tokens_host for output in outputs],
+        "cached_tokens_storage": [output.cached_tokens_storage for output in outputs],
     }
 
     if args.cache_report:
-        result_details["cached_tokens"] = [o.cached_tokens for o in outputs]
         result_details["cached_tokens_details"] = [
             o.cached_tokens_details for o in outputs
         ]

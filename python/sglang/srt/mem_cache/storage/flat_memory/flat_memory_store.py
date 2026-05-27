@@ -184,11 +184,18 @@ class FlatMemoryStore(HiCacheStorage):
         target_locations: Optional[Any] = None,
         target_sizes: Optional[Any] = None,
     ) -> bool:
-        assert target_locations is not None and target_sizes is not None
-        assert len(keys) == len(target_locations) == len(target_sizes)
-
         if len(keys) == 0:
             return False
+
+        # Called from _generic_page_set: batch_set(hash_values, data)
+        # where data is a list of torch.Tensor, target_locations/target_sizes are None.
+        # In this case, extract pointers and sizes from the tensor list.
+        if target_locations is None and values is not None:
+            target_locations = [v.data_ptr() for v in values]
+            target_sizes = [v.nbytes for v in values]
+
+        assert target_locations is not None and target_sizes is not None
+        assert len(keys) == len(target_locations) == len(target_sizes)
 
         start_time = time.perf_counter()
         all_ok = True

@@ -144,10 +144,7 @@ class FlatMemoryStore(HiCacheStorage):
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> List[bool]:
         key_strs, buffer_ptrs, buffer_sizes = self._batch_preprocess(keys, host_indices)
-        results = []
-        for i in range(len(key_strs)):
-            ok = self.manager.put(key_strs[i], buffer_ptrs[i], buffer_sizes[i])
-            results.append(ok)
+        results = self.manager.batch_put(key_strs, buffer_ptrs, buffer_sizes)
         return self._batch_postprocess(results, is_set_operate=True)
 
     def batch_get_v1(
@@ -157,10 +154,7 @@ class FlatMemoryStore(HiCacheStorage):
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> List[bool]:
         key_strs, buffer_ptrs, buffer_sizes = self._batch_preprocess(keys, host_indices)
-        results = []
-        for i in range(len(key_strs)):
-            nbytes = self.manager.get(key_strs[i], buffer_ptrs[i], buffer_sizes[i])
-            results.append(nbytes > 0)
+        results = self.manager.batch_get(key_strs, buffer_ptrs, buffer_sizes)
         return self._batch_postprocess(results, is_set_operate=False)
 
     # ---- HiCacheStorage legacy interface ----
@@ -198,14 +192,17 @@ class FlatMemoryStore(HiCacheStorage):
         assert len(keys) == len(target_locations) == len(target_sizes)
 
         start_time = time.perf_counter()
-        all_ok = True
+
+        # Validate: reject batch if any entry is None
         for i in range(len(keys)):
             if keys[i] is None or target_locations[i] is None or target_sizes[i] is None:
                 return False
-            if not self.manager.exists(keys[i]):
-                if not self.manager.put(keys[i], target_locations[i], target_sizes[i]):
-                    all_ok = False
-                    break
+
+        # Pass all keys directly to C++ BatchPutCoalesced which handles
+        # deduplication internally (single lock), avoiding per-key exists() overhead.
+        results = self.manager.batch_put(keys, target_locations, target_sizes)
+        all_ok = all(results)
+
         end_time = time.perf_counter()
 
         self.backup_pgs.append(len(keys))
@@ -241,9 +238,11 @@ class FlatMemoryStore(HiCacheStorage):
             key_multiplier = 2
 
         start_time = time.perf_counter()
-        for i in range(len(keys)):
-            nbytes = self.manager.get(keys[i], target_locations[i], target_sizes[i])
-            if nbytes < 0:
+        results = self.manager.batch_get(keys, target_locations, target_sizes)
+        # Find first failure
+        for i, ok in enumerate(results):
+            if not ok:
+                end_time = time.perf_counter()
                 return i // key_multiplier
         end_time = time.perf_counter()
 

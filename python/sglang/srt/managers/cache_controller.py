@@ -198,6 +198,7 @@ class StorageOperation:
         last_hash: Optional[str] = None,
         hash_value: Optional[List[str]] = None,
         prefix_keys: Optional[List[str]] = None,
+        full_token_ids: Optional[List[int]] = None,
     ):
         self.host_indices = host_indices
         self.token_ids = token_ids
@@ -205,6 +206,9 @@ class StorageOperation:
         self.completed_tokens = 0
         self.hash_value = hash_value if hash_value is not None else []
         self.prefix_keys = prefix_keys
+        # Complete token sequence from the start of the request, used for
+        # fallback hash-chain reconstruction when the suffix-only query misses.
+        self.full_token_ids = full_token_ids
 
         self.id = StorageOperation.counter
         StorageOperation.counter += 1
@@ -221,6 +225,7 @@ class PrefetchOperation(StorageOperation):
         token_ids: List[int],
         last_hash: Optional[str] = None,
         prefix_keys: Optional[List[str]] = None,
+        full_token_ids: Optional[List[int]] = None,
     ):
         self.request_id = request_id
 
@@ -228,7 +233,8 @@ class PrefetchOperation(StorageOperation):
         self._terminated_flag = False
         self.start_time = time.monotonic()
 
-        super().__init__(host_indices, token_ids, last_hash, prefix_keys=prefix_keys)
+        super().__init__(host_indices, token_ids, last_hash, prefix_keys=prefix_keys,
+                         full_token_ids=full_token_ids)
 
     def increment(self, num_tokens: int):
         with self._lock:
@@ -771,12 +777,14 @@ class HiCacheController:
         new_input_tokens: List[int],
         last_hash: Optional[str] = None,
         prefix_keys: Optional[List[str]] = None,
+        full_token_ids: Optional[List[int]] = None,
     ) -> PrefetchOperation:
         """
         Prefetch KV caches from storage backend to host memory.
         """
         operation = PrefetchOperation(
-            request_id, host_indices, new_input_tokens, last_hash, prefix_keys
+            request_id, host_indices, new_input_tokens, last_hash, prefix_keys,
+            full_token_ids=full_token_ids
         )
         self.prefetch_queue.put(operation)
         return operation
@@ -881,11 +889,10 @@ class HiCacheController:
         # todo: more sophisticated rate limiting based on storage backend performance
         return False
 
-    def _storage_hit_query(self, operation) -> tuple[list[str], int]:
-        last_hash = operation.last_hash
-        tokens_to_fetch = operation.token_ids
-        prefix_keys = operation.prefix_keys.copy() if operation.prefix_keys else None
-
+    def _do_storage_query(
+        self, last_hash, tokens_to_fetch, prefix_keys
+    ) -> tuple[list[str], int]:
+        """Core storage query: compute hash chain and check batch_exists."""
         storage_query_count = 0
         hash_value = []
 
@@ -902,12 +909,6 @@ class HiCacheController:
                     batch_tokens[i : i + self.page_size], last_hash
                 )
                 batch_hashes.append(last_hash)
-            if batch_hashes:
-                logger.info(
-                    f"[PREFETCH-DEBUG] _storage_hit_query: first_hash={batch_hashes[0][:16]}, "
-                    f"n_hashes={len(batch_hashes)}, last_hash_in={operation.last_hash[:16] if operation.last_hash else 'None'}, "
-                    f"first_tokens={batch_tokens[:8]}"
-                )
             extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
             hit_page_num = self.storage_backend.batch_exists(batch_hashes, extra_info)
             hash_value.extend(batch_hashes[:hit_page_num])
@@ -918,6 +919,56 @@ class HiCacheController:
                 prefix_keys += batch_hashes
 
         return hash_value, storage_query_count
+
+    def _storage_hit_query(self, operation) -> tuple[list[str], int]:
+        last_hash = operation.last_hash
+        tokens_to_fetch = operation.token_ids
+        prefix_keys = operation.prefix_keys.copy() if operation.prefix_keys else None
+
+        if tokens_to_fetch:
+            first_hash_preview = self.get_hash_str(
+                tokens_to_fetch[: self.page_size], last_hash
+            )
+            logger.info(
+                f"[PREFETCH-DEBUG] _storage_hit_query: first_hash={first_hash_preview[:16]}, "
+                f"n_tokens={len(tokens_to_fetch)}, last_hash_in={last_hash[:16] if last_hash else 'None'}, "
+                f"first_tokens={tokens_to_fetch[:8]}"
+            )
+
+        # Primary query: from the radix cache match point (suffix only)
+        hash_value, storage_hit_count = self._do_storage_query(
+            last_hash, tokens_to_fetch, prefix_keys
+        )
+
+        # Fallback: if suffix query missed and we have the full token sequence,
+        # retry from the beginning of the sequence (last_hash=None).
+        # This handles the case where Round 1 backed up with a different radix
+        # tree structure (different node split points / request ordering).
+        if (
+            storage_hit_count < self.page_size
+            and operation.full_token_ids is not None
+            and last_hash is not None  # only fallback when we started mid-chain
+        ):
+            prefix_len = len(operation.full_token_ids) - len(tokens_to_fetch)
+            logger.info(
+                f"[PREFETCH-FALLBACK] Suffix query missed, retrying from sequence start. "
+                f"prefix_len={prefix_len}, full_len={len(operation.full_token_ids)}"
+            )
+            full_hash_value, full_hit_count = self._do_storage_query(
+                None, operation.full_token_ids, None
+            )
+            if full_hit_count > prefix_len:
+                # Storage has data beyond the radix-cached prefix.
+                # Return only the suffix portion (skip prefix pages).
+                skip_pages = prefix_len // self.page_size
+                hash_value = full_hash_value[skip_pages:]
+                storage_hit_count = full_hit_count - prefix_len
+                logger.info(
+                    f"[PREFETCH-FALLBACK] Hit! full_hit={full_hit_count} tokens, "
+                    f"suffix_hit={storage_hit_count} tokens (skipped {prefix_len} prefix tokens)"
+                )
+
+        return hash_value, storage_hit_count
 
     def prefetch_thread_func(self):
         """

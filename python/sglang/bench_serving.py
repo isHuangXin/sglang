@@ -1917,7 +1917,7 @@ def get_gen_prefix_cache_path(args, tokenizer):
     cache_key = (
         f"gen_shared_prefix_{args.seed}_{args.gsp_num_groups}_{args.gsp_prompts_per_group}_"
         f"{args.gsp_system_prompt_len}_{args.gsp_question_len}_{args.gsp_output_len}_"
-        f"{tokenizer.__class__.__name__}.pkl"
+        f"{getattr(args, 'gsp_num_turns', 1)}_{tokenizer.__class__.__name__}.pkl"
     )
     return cache_dir / cache_key
 
@@ -1937,7 +1937,7 @@ def sample_generated_shared_prefix_requests(
     num_turns = getattr(args, "gsp_num_turns", 1)
 
     cache_path = get_gen_prefix_cache_path(args, tokenizer)
-    should_cache = (range_ratio == 1) and not send_routing_key and num_turns == 1
+    should_cache = (range_ratio == 1) and not send_routing_key
 
     # Try to load from cache first
     if cache_path.exists() and should_cache:

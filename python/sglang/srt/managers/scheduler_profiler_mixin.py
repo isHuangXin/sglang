@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING, List, Optional
@@ -267,72 +268,97 @@ class SchedulerProfilerMixin:
 
         stage_suffix = f"-{stage.name}" if stage else ""
         logger.info("Stop profiling" + stage_suffix + "...")
-        if self.torch_profiler is not None:
-            self.torch_profiler.stop()
-            if not _is_npu:
-                # Build filename with only non-zero ranks to maintain backward compatibility
-                filename_parts = [self.profile_id, f"TP-{self.tp_rank}"]
 
-                # Only add other ranks if parallelism is enabled (size > 1)
-                if getattr(self, "dp_size", 1) > 1:
-                    filename_parts.append(f"DP-{getattr(self, 'dp_rank', 0)}")
-                if getattr(self, "pp_size", 1) > 1:
-                    filename_parts.append(f"PP-{getattr(self, 'pp_rank', 0)}")
-                if getattr(self, "moe_ep_size", 1) > 1:
-                    filename_parts.append(f"EP-{getattr(self, 'moe_ep_rank', 0)}")
+        # Capture all state needed for background export
+        torch_profiler = self.torch_profiler
+        rpd_profiler = self.rpd_profiler
+        profiler_activities = self.profiler_activities
+        torch_profiler_output_dir = self.torch_profiler_output_dir
+        profile_id = self.profile_id
+        tp_rank = self.tp_rank
+        dp_tp_cpu_group = self.dp_tp_cpu_group
+        gpu_id = self.gpu_id
+        rpd_profile_path = self.rpd_profile_path
 
-                filename = (
-                    stage_prefix
-                    + "-".join(filename_parts)
-                    + stage_suffix
-                    + ".trace.json.gz"
-                )
-
-                self.torch_profiler.export_chrome_trace(
-                    os.path.join(self.torch_profiler_output_dir, filename)
-                )
-            torch.distributed.barrier(self.dp_tp_cpu_group)
-
-        if self.rpd_profiler is not None:
-            self.rpd_profiler.rangePop()
-            self.rpd_profiler.stop()
-            self.rpd_profiler.flush()
-
-            torch.distributed.barrier(self.dp_tp_cpu_group)
-            if self.tp_rank == 0:
-                from sglang.srt.utils.rpd_utils import rpd_to_chrome_trace
-
-                rpd_to_chrome_trace("trace.rpd", self.rpd_profile_path)
-            self.rpd_profiler = None
-            self.rpd_profile_path = None
-
-        if self.profiler_activities is not None and "MEM" in self.profiler_activities:
-            memory_profile_path = os.path.join(
-                self.torch_profiler_output_dir,
-                str(time.time())
-                + f"-TP-{self.tp_rank}-memory"
-                + stage_suffix
-                + ".pickle",
-            )
-            torch.cuda.memory._dump_snapshot(memory_profile_path)
-            torch.cuda.memory._record_memory_history(enabled=None)
-
-        if "CUDA_PROFILER" in self.profiler_activities:
-            if self.gpu_id == get_global_server_args().base_gpu_id:
-                torch.cuda.cudart().cudaProfilerStop()
-
-        merge_message = self._merge_profile_traces()
-
-        logger.info(
-            "Profiling done. Traces are saved to: %s%s",
-            self.torch_profiler_output_dir,
-            merge_message,
-        )
+        # Clear profiler references immediately so scheduler can continue
         self.torch_profiler = None
+        self.rpd_profiler = None
+        self.rpd_profile_path = None
         self.profile_in_progress = False
         self.profiler_start_forward_ct = None
 
-        return ProfileReqOutput(success=True, message=f"Succeeded.{merge_message}")
+        def _do_stop_and_export():
+            try:
+                if torch_profiler is not None:
+                    torch_profiler.stop()
+                    if not _is_npu:
+                        # Build filename with only non-zero ranks to maintain backward compatibility
+                        filename_parts = [profile_id, f"TP-{tp_rank}"]
+
+                        # Only add other ranks if parallelism is enabled (size > 1)
+                        if getattr(self, "dp_size", 1) > 1:
+                            filename_parts.append(f"DP-{getattr(self, 'dp_rank', 0)}")
+                        if getattr(self, "pp_size", 1) > 1:
+                            filename_parts.append(f"PP-{getattr(self, 'pp_rank', 0)}")
+                        if getattr(self, "moe_ep_size", 1) > 1:
+                            filename_parts.append(f"EP-{getattr(self, 'moe_ep_rank', 0)}")
+
+                        filename = (
+                            stage_prefix
+                            + "-".join(filename_parts)
+                            + stage_suffix
+                            + ".trace.json.gz"
+                        )
+
+                        torch_profiler.export_chrome_trace(
+                            os.path.join(torch_profiler_output_dir, filename)
+                        )
+                    torch.distributed.barrier(dp_tp_cpu_group)
+
+                if rpd_profiler is not None:
+                    rpd_profiler.rangePop()
+                    rpd_profiler.stop()
+                    rpd_profiler.flush()
+
+                    torch.distributed.barrier(dp_tp_cpu_group)
+                    if tp_rank == 0:
+                        from sglang.srt.utils.rpd_utils import rpd_to_chrome_trace
+
+                        rpd_to_chrome_trace("trace.rpd", rpd_profile_path)
+
+                if profiler_activities is not None and "MEM" in profiler_activities:
+                    memory_profile_path = os.path.join(
+                        torch_profiler_output_dir,
+                        str(time.time())
+                        + f"-TP-{tp_rank}-memory"
+                        + stage_suffix
+                        + ".pickle",
+                    )
+                    torch.cuda.memory._dump_snapshot(memory_profile_path)
+                    torch.cuda.memory._record_memory_history(enabled=None)
+
+                if profiler_activities is not None and "CUDA_PROFILER" in profiler_activities:
+                    if gpu_id == get_global_server_args().base_gpu_id:
+                        torch.cuda.cudart().cudaProfilerStop()
+
+                merge_message = self._merge_profile_traces()
+
+                logger.info(
+                    "Profiling done. Traces are saved to: %s%s",
+                    torch_profiler_output_dir,
+                    merge_message,
+                )
+            except Exception as e:
+                logger.error("Error during profiler stop/export: %s", e, exc_info=True)
+
+        # Run stop + export in background thread to avoid blocking scheduler
+        stop_thread = threading.Thread(
+            target=_do_stop_and_export, name="profiler-stop", daemon=True
+        )
+        stop_thread.start()
+        logger.info("Profiler stop/export dispatched to background thread.")
+
+        return ProfileReqOutput(success=True, message="Profiler stop initiated in background.")
 
     def _profile_batch_predicate(self: Scheduler, batch: ScheduleBatch):
         if envs.SGLANG_PROFILE_V2.get():

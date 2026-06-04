@@ -1686,6 +1686,7 @@ class Scheduler(
                     new_input_tokens,
                     last_hash,
                     prefix_keys,
+                    full_token_ids=req.fill_ids,
                 )
 
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):

@@ -576,6 +576,26 @@ class HiRadixCache(RadixCache):
 
     def reset(self):
         TreeNode.counter = 0
+        # Flush the full GPU→Host→Storage pipeline before clearing queues.
+        # Pipeline: ongoing_write_through (D2H) → writing_check → backup_queue → Storage
+        # Without this, flush_cache discards in-flight data at any stage.
+        if self.enable_storage:
+            logger.info(
+                "[FLUSH] Draining GPU→Host→Storage pipeline before reset..."
+            )
+            # Step 1: Drain pending D2H copies and push completed nodes to backup_queue.
+            # Blocking-wait for all CUDA D2H events in ongoing_write_through.
+            while len(self.ongoing_write_through) > 0:
+                for _, finish_event, ack_list in self.cache_controller.ack_write_queue:
+                    finish_event.synchronize()
+                    for ack_id in ack_list:
+                        backuped_node = self.ongoing_write_through.pop(ack_id)
+                        self.dec_lock_ref(backuped_node)
+                        self.write_backup_storage(backuped_node)
+                self.cache_controller.ack_write_queue.clear()
+            # Step 2: Wait for backup_thread to finish writing all queued data to Storage.
+            self.cache_controller.backup_idle_event.wait(timeout=60.0)
+            logger.info("[FLUSH] All backup writes completed, proceeding with reset.")
         self.cache_controller.reset()
         self.token_to_kv_pool_host.clear()
         # Clear per-request tracking dicts
@@ -1173,6 +1193,7 @@ class HiRadixCache(RadixCache):
         new_input_tokens: List[int],
         last_hash: Optional[str] = None,
         prefix_keys: Optional[List[str]] = None,
+        full_token_ids: Optional[List[int]] = None,
     ):
         # align the number of fetching tokens to the page size
         prefetch_length = len(new_input_tokens) - (
@@ -1204,7 +1225,8 @@ class HiRadixCache(RadixCache):
             # no sufficient host memory for prefetch
             return
         operation = self.cache_controller.prefetch(
-            req_id, host_indices, new_input_tokens, last_hash, prefix_keys
+            req_id, host_indices, new_input_tokens, last_hash, prefix_keys,
+            full_token_ids=full_token_ids
         )
         self.ongoing_prefetch[req_id] = (
             last_host_node,

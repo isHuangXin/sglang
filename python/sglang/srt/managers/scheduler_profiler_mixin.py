@@ -278,12 +278,13 @@ class SchedulerProfilerMixin:
         tp_rank = self.tp_rank
         dp_tp_cpu_group = self.dp_tp_cpu_group
         gpu_id = self.gpu_id
-        rpd_profile_path = self.rpd_profile_path
+        rpd_profile_path = getattr(self, "rpd_profile_path", None)
 
         # Clear profiler references immediately so scheduler can continue
         self.torch_profiler = None
         self.rpd_profiler = None
-        self.rpd_profile_path = None
+        if hasattr(self, "rpd_profile_path"):
+            self.rpd_profile_path = None
         self.profile_in_progress = False
         self.profiler_start_forward_ct = None
 

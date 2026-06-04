@@ -794,6 +794,13 @@ class HiRadixCache(RadixCache):
 
     def reset(self):
         TreeNode.counter = 0
+        if self.enable_storage:
+            for ack in self.cache_controller.ack_write_queue:
+                ack.finish_event.synchronize()
+                for ack_id in ack.node_ids:
+                    self._finish_write_through_ack(ack_id, release_lock=True)
+                self._log_write_ack_metrics(ack)
+            self.cache_controller.ack_write_queue.clear()
         self.cache_controller.reset()
         self.token_to_kv_pool_host.clear()
         # Clear per-request tracking dicts

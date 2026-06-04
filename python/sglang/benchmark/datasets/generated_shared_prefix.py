@@ -130,6 +130,7 @@ def get_gen_prefix_cache_path(
     tokenizer,
     group_distribution: str = "uniform",
     zipf_alpha: Optional[float] = None,
+    num_turns: int = 1,
 ):
     """Create cache directory under ~/.cache/sglang/benchmark.
 
@@ -146,7 +147,7 @@ def get_gen_prefix_cache_path(
     cache_key = (
         f"gen_shared_prefix_{seed}_{num_groups}_{prompts_per_group}_"
         f"{system_prompt_len}_{question_len}_{output_len}{suffix}_"
-        f"{tokenizer.__class__.__name__}.pkl"
+        f"{num_turns}_{tokenizer.__class__.__name__}.pkl"
     )
     return cache_dir / cache_key
 
@@ -190,11 +191,10 @@ def sample_generated_shared_prefix_requests(
         tokenizer,
         group_distribution=group_distribution,
         zipf_alpha=zipf_alpha,
+        num_turns=num_turns,
     )
-    # range_ratio != 1 / num_turns > 1 perturb the payload but are not in the
-    # cache key; send_routing_key embeds a per-run uuid + timestamp that is
-    # meaningless to cache. Bypass for these pre-existing reasons only.
-    should_cache = range_ratio == 1 and not send_routing_key and num_turns == 1
+    # Routing keys embed per-run identity and cannot be cached.
+    should_cache = range_ratio == 1 and not send_routing_key
 
     if should_cache and cache_path.exists():
         print(f"\nLoading cached generated input data from {cache_path}")

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
-import gc
 import logging
 import os
+import shutil
 import time
+import uuid
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import (
@@ -49,6 +51,53 @@ elif _is_mps:
 logger = logging.getLogger(__name__)
 
 
+def _export_profile_snapshot(
+    *,
+    profiler,
+    trace_path,
+    rpd_source,
+    marker_path,
+    required_markers,
+    output_dir,
+    profile_id,
+    merge,
+):
+    # FLAT_MEMORY: Workers never touch serving collectives or live profiler state.
+    marker = Path(marker_path)
+    try:
+        if profiler is not None:
+            profiler.export_chrome_trace(str(trace_path))
+        if rpd_source is not None:
+            from sglang.srt.utils.rpd_utils import rpd_to_chrome_trace
+
+            rpd_to_chrome_trace(str(rpd_source), str(trace_path))
+        marker.write_text("ok")
+        if merge:
+            deadline = time.monotonic() + 300
+            while True:
+                states = [
+                    Path(path).read_text() if Path(path).exists() else None
+                    for path in required_markers
+                ]
+                if any(state and state != "ok" for state in states):
+                    raise RuntimeError("A peer profiler export failed")
+                if all(state == "ok" for state in states):
+                    break
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("Timed out waiting for peer profile exports")
+                time.sleep(0.05)
+            merged = ProfileMerger(output_dir, profile_id).merge_chrome_traces()
+            logger.info("Profile merge completed: %s", merged)
+        logger.info("Profile export completed: %s", trace_path)
+    except Exception as exc:
+        marker.write_text(f"error: {exc}")
+        logger.exception("Asynchronous profile export failed")
+        raise
+    finally:
+        if rpd_source is not None:
+            Path(rpd_source).unlink(missing_ok=True)
+
+
 @dataclass(kw_only=True)
 class SchedulerProfilerManager:
     ps: Any
@@ -56,6 +105,10 @@ class SchedulerProfilerManager:
     get_forward_ct: Callable[[], int]
 
     def __post_init__(self) -> None:
+        # FLAT_MEMORY: Export jobs retain stopped profilers, not mutable manager state.
+        self._export_executor: ThreadPoolExecutor | None = None
+        self._export_jobs: list[Future] = []
+        self._export_errors: list[str] = []
         if envs.SGLANG_PROFILE_V2.get():
             self._profile_manager = ProfileManager(
                 ps=self.ps,
@@ -172,6 +225,17 @@ class SchedulerProfilerManager:
             self._apply_detailed_annotations(self.detailed_annotations)
             return self._profile_manager.manual_start()
 
+        self._collect_export_jobs()
+        backlog = torch.tensor([len(self._export_jobs)], dtype=torch.int32)
+        if torch.distributed.is_initialized():
+            torch.distributed.all_reduce(
+                backlog, op=torch.distributed.ReduceOp.MAX, group=self.dp_tp_cpu_group
+            )
+        if int(backlog.item()) >= 2:
+            return ProfileReqOutput(
+                success=False,
+                message="Two profile exports are still pending; retry after they complete.",
+            )
         stage_str = f" for {stage.name}" if stage else ""
         logger.info(
             f"Profiling starts{stage_str}. Traces will be saved to: {self.torch_profiler_output_dir} (with profile id: {self.profile_id})",
@@ -310,13 +374,138 @@ class SchedulerProfilerManager:
         else:
             return merge_message
 
+    def _collect_export_jobs(self, *, wait=False):
+        pending = []
+        for job in self._export_jobs:
+            if not wait and not job.done():
+                pending.append(job)
+                continue
+            try:
+                job.result()
+            except Exception as exc:
+                self._export_errors.append(str(exc))
+                logger.error("Profile export failed: %s", exc)
+        self._export_jobs = pending
+
+    def close(self):
+        """Stop local recording and drain exports without shutdown collectives."""
+        try:
+            if envs.SGLANG_PROFILE_V2.get():
+                if self._profile_manager.profiler is not None:
+                    self._stop_v2_profile_locally(self._profile_manager.profiler)
+                    self._profile_manager.profiler = None
+                    self._apply_detailed_annotations(False)
+            elif self.profile_in_progress:
+                # FLAT_MEMORY: Shutdown may reach only a subset of the profiling ranks.
+                self._stop_profile(synchronize=False)
+        except Exception as exc:
+            self._export_errors.append(str(exc))
+            logger.exception("Failed to finalize local profiler during shutdown")
+        finally:
+            self._collect_export_jobs(wait=True)
+            if self._export_executor is not None:
+                self._export_executor.shutdown(wait=True)
+                self._export_executor = None
+
+    def _stop_v2_profile_locally(self, profiler):
+        from sglang.srt.utils.profile_utils import (
+            _ProfilerCudart,
+            _ProfilerList,
+            _ProfilerMemory,
+            _ProfilerRPD,
+            _ProfilerTorch,
+        )
+
+        if isinstance(profiler, _ProfilerList):
+            for inner in profiler.inners:
+                self._stop_v2_profile_locally(inner)
+        elif isinstance(profiler, _ProfilerTorch):
+            profiler.torch_profiler.stop()
+            if not _is_npu:
+                path = self._rank_trace_path(
+                    output_dir=profiler.output_dir,
+                    profile_id=profiler.profile_id,
+                    prefix=profiler.output_prefix,
+                    suffix=profiler.output_suffix,
+                )
+                path.parent.mkdir(parents=True, exist_ok=True)
+                profiler.torch_profiler.export_chrome_trace(str(path))
+        elif isinstance(profiler, _ProfilerRPD):
+            profiler.rpd_profiler.rangePop()
+            profiler.rpd_profiler.stop()
+            profiler.rpd_profiler.flush()
+            logger.warning(
+                "RPD shutdown retained trace.rpd without cross-rank conversion"
+            )
+        elif isinstance(profiler, (_ProfilerMemory, _ProfilerCudart)):
+            profiler.stop()
+        else:
+            raise TypeError(
+                f"Unsupported profiler shutdown type: {type(profiler).__name__}"
+            )
+
+    def _trace_path(self, stage):
+        return self._rank_trace_path(
+            output_dir=self.torch_profiler_output_dir,
+            profile_id=self.profile_id,
+            prefix=self.profile_prefix,
+            suffix=f"-{stage.name}" if stage else "",
+        )
+
+    def _rank_trace_path(self, *, output_dir, profile_id, prefix, suffix):
+        parts = [profile_id, f"TP-{self.ps.tp_rank}"]
+        for label, size, rank in (
+            ("DP", self.ps.dp_size, self.ps.dp_rank),
+            ("PP", self.ps.pp_size, self.ps.pp_rank),
+            ("EP", self.ps.moe_ep_size, self.ps.moe_ep_rank),
+        ):
+            if size > 1:
+                parts.append(f"{label}-{rank}")
+        prefix = f"{prefix}-" if prefix else ""
+        return Path(output_dir) / (prefix + "-".join(parts) + suffix + ".trace.json.gz")
+
+    def _queue_export(
+        self, *, profiler, trace_path, rpd_source, marker, markers, allow_merge=True
+    ):
+        self._collect_export_jobs()
+        if self._export_executor is None:
+            self._export_executor = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="profile-export"
+            )
+        merge = (
+            allow_merge
+            and self.merge_profiles
+            and all(
+                (
+                    self.ps.tp_rank == 0,
+                    self.ps.dp_rank == 0,
+                    self.ps.pp_rank == 0,
+                    self.ps.moe_ep_rank == 0,
+                )
+            )
+        )
+        profile_key = f"{self.profile_prefix}-" if self.profile_prefix else ""
+        profile_key += self.profile_id
+        self._export_jobs.append(
+            self._export_executor.submit(
+                _export_profile_snapshot,
+                profiler=profiler,
+                trace_path=trace_path,
+                rpd_source=rpd_source,
+                marker_path=marker,
+                required_markers=tuple(markers),
+                output_dir=self.torch_profiler_output_dir,
+                profile_id=profile_key,
+                merge=merge,
+            )
+        )
+
     def _stop_profile(
-        self, stage: Optional[ForwardMode] = None
+        self, stage: Optional[ForwardMode] = None, *, synchronize: bool = True
     ) -> ProfileReqOutput | None:
         if envs.SGLANG_PROFILE_V2.get():
             self._apply_detailed_annotations(False)
             return self._profile_manager.manual_stop()
-
         if not self.profile_in_progress:
             return ProfileReqOutput(
                 success=False,
@@ -324,86 +513,72 @@ class SchedulerProfilerManager:
             )
 
         self.torch_profiler_output_dir.mkdir(parents=True, exist_ok=True)
-
-        if self.profile_prefix:
-            stage_prefix = self.profile_prefix + "-"
-        else:
-            stage_prefix = ""
-
-        stage_suffix = f"-{stage.name}" if stage else ""
-        logger.info("Stop profiling" + stage_suffix + "...")
-        if self.torch_profiler is not None:
-            self.torch_profiler.stop()
-            if not _is_npu:
-                # Build filename with only non-zero ranks to maintain backward compatibility
-                filename_parts = [self.profile_id, f"TP-{self.ps.tp_rank}"]
-
-                # Only add other ranks if parallelism is enabled (size > 1)
-                if self.ps.dp_size > 1:
-                    filename_parts.append(f"DP-{self.ps.dp_rank}")
-                if self.ps.pp_size > 1:
-                    filename_parts.append(f"PP-{self.ps.pp_rank}")
-                if self.ps.moe_ep_size > 1:
-                    filename_parts.append(f"EP-{self.ps.moe_ep_rank}")
-
-                filename = (
-                    stage_prefix
-                    + "-".join(filename_parts)
-                    + stage_suffix
-                    + ".trace.json.gz"
-                )
-
-                self.torch_profiler.export_chrome_trace(
-                    os.path.join(self.torch_profiler_output_dir, filename)
-                )
-            torch.distributed.barrier(self.dp_tp_cpu_group)
-
+        trace_path = self._trace_path(stage)
+        profiler, rpd_source = self.torch_profiler, None
+        # FLAT_MEMORY: Stop/flush uses the originating thread; only immutable exports run asynchronously.
+        if profiler is not None:
+            profiler.stop()
+            if _is_npu:
+                if synchronize:
+                    torch.distributed.barrier(self.dp_tp_cpu_group)
+                    self._merge_profile_traces()
+                profiler = None
         if self.rpd_profiler is not None:
             self.rpd_profiler.rangePop()
             self.rpd_profiler.stop()
             self.rpd_profiler.flush()
+            if synchronize:
+                torch.distributed.barrier(self.dp_tp_cpu_group)
+                if self.ps.tp_rank == 0:
+                    rpd_source = (
+                        self.torch_profiler_output_dir
+                        / f".rpd-{uuid.uuid4().hex}.snapshot"
+                    )
+                    shutil.copyfile("trace.rpd", rpd_source)
+            else:
+                logger.warning(
+                    "RPD shutdown retained trace.rpd without cross-rank conversion"
+                )
 
-            torch.distributed.barrier(self.dp_tp_cpu_group)
-            if self.ps.tp_rank == 0:
-                from sglang.srt.utils.rpd_utils import rpd_to_chrome_trace
-
-                rpd_to_chrome_trace("trace.rpd", self.rpd_profile_path)
-            self.rpd_profiler = None
-            self.rpd_profile_path = None
-
-        if self.profiler_activities is not None and "MEM" in self.profiler_activities:
-            memory_profile_path = os.path.join(
-                self.torch_profiler_output_dir,
-                stage_prefix
-                + str(time.time())
-                + f"-TP-{self.ps.tp_rank}-memory"
-                + stage_suffix
-                + ".pickle",
-            )
-            torch.cuda.memory._dump_snapshot(memory_profile_path)
+        activities = self.profiler_activities or ()
+        if "MEM" in activities:
+            torch.cuda.memory._dump_snapshot(str(trace_path) + ".memory.pickle")
             torch.cuda.memory._record_memory_history(enabled=None)
+        if "CUDA_PROFILER" in activities and self.ps.gpu_id == get_device().base_gpu_id:
+            torch.cuda.cudart().cudaProfilerStop()
 
-        if "CUDA_PROFILER" in self.profiler_activities:
-            if self.ps.gpu_id == get_device().base_gpu_id:
-                torch.cuda.cudart().cudaProfilerStop()
-
-        merge_message = self._merge_profile_traces()
-
-        logger.info(
-            "Profiling done. Traces are saved to: %s%s",
-            self.torch_profiler_output_dir,
-            merge_message,
-        )
-
-        if self.torch_profiler is not None:
-            self.torch_profiler = None
-            gc.collect()
-
+        marker = str(trace_path) + f".{uuid.uuid4().hex}.export"
+        has_export = profiler is not None or rpd_source is not None
+        markers = [marker] if has_export else []
+        if synchronize and self.merge_profiles:
+            # All communication happens at the existing scheduler-side stop boundary.
+            gathered = [None] * torch.distributed.get_world_size(self.dp_tp_cpu_group)
+            torch.distributed.all_gather_object(
+                gathered, marker if has_export else None, self.dp_tp_cpu_group
+            )
+            markers = [value for value in gathered if value is not None]
+        self.torch_profiler = None
+        self.rpd_profiler = None
+        self.rpd_profile_path = None
         self.profile_in_progress = False
         self.profiler_start_forward_ct = None
-
         self._apply_detailed_annotations(False)
-        return ProfileReqOutput(success=True, message=f"Succeeded.{merge_message}")
+        if has_export:
+            self._queue_export(
+                profiler=profiler,
+                trace_path=trace_path,
+                rpd_source=rpd_source,
+                marker=marker,
+                markers=markers,
+                allow_merge=synchronize,
+            )
+        message = (
+            "Profiler stopped; trace export queued asynchronously."
+            if has_export
+            else "Profiler stopped."
+        )
+        logger.info("%s Output: %s", message, trace_path)
+        return ProfileReqOutput(success=True, message=message)
 
     def _profile_batch_predicate(self, batch: ScheduleBatch):
         if envs.SGLANG_PROFILE_V2.get():
@@ -463,7 +638,7 @@ class SchedulerProfilerManager:
                     recv_req.profile_stages,
                 )
             else:
-                self._init_profile(
+                configured = self._init_profile(
                     recv_req.output_dir,
                     recv_req.start_step,
                     recv_req.num_steps,
@@ -476,6 +651,8 @@ class SchedulerProfilerManager:
                     recv_req.profile_prefix,
                     recv_req.detailed_annotations,
                 )
+                if not configured.success:
+                    return configured
                 return self._start_profile()
         else:
             return self._stop_profile()

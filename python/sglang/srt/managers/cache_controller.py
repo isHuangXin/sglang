@@ -352,6 +352,10 @@ class HiCacheController:
         self.backup_idle_event = threading.Event()
         self.backup_idle_event.set()  # initially idle
 
+        # Track the full GPU→Host→Storage pipeline, not just backup_queue
+        self.pending_backup_count = 0
+        self.pending_backup_lock = threading.Lock()
+
         self.prefetch_revoke_queue = Queue()
         self.ack_backup_queue = Queue()
         self.host_mem_release_queue = Queue()
@@ -1109,10 +1113,15 @@ class HiCacheController:
                 if not self.backup_skip:
                     self._page_backup(operation)
                 self.ack_backup_queue.put(operation)
-                # Signal idle only when queue is drained
-                if self.backup_queue.empty():
-                    self.backup_idle_event.set()
+                # Decrement pipeline counter and signal idle only when fully drained
+                with self.pending_backup_lock:
+                    self.pending_backup_count -= 1
+                    if self.pending_backup_count == 0 and self.backup_queue.empty():
+                        self.backup_idle_event.set()
 
             except Empty:
-                self.backup_idle_event.set()
+                # Only set idle if no pending operations in the full pipeline
+                with self.pending_backup_lock:
+                    if self.pending_backup_count == 0:
+                        self.backup_idle_event.set()
                 continue

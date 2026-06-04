@@ -633,6 +633,12 @@ class HiRadixCache(RadixCache):
             return False
 
     def write_backup(self, node: TreeNode, write_back=False):
+        # Track pipeline entry: increment before any async work begins
+        if self.enable_storage:
+            with self.cache_controller.pending_backup_lock:
+                self.cache_controller.pending_backup_count += 1
+                self.cache_controller.backup_idle_event.clear()
+
         host_indices = self.cache_controller.write(
             device_indices=node.value,
             node_id=node.id,
@@ -651,6 +657,12 @@ class HiRadixCache(RadixCache):
                 # no need to lock nodes if write back
                 self.inc_lock_ref(node)
         else:
+            # Host alloc failed — decrement pipeline counter
+            if self.enable_storage:
+                with self.cache_controller.pending_backup_lock:
+                    self.cache_controller.pending_backup_count -= 1
+                    if self.cache_controller.pending_backup_count == 0:
+                        self.cache_controller.backup_idle_event.set()
             return 0
 
         return len(host_indices)

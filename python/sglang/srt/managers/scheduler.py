@@ -2939,6 +2939,8 @@ class Scheduler(
 
     def _prefetch_kvcache(self, req: Req):
         if self.enable_hicache_storage:
+            if self.enable_hierarchical_cache:
+                self.tree_cache.check_hicache_events()
             req.init_next_round_input(self.tree_cache, cow_mamba=False)
             tree_cache = self.tree_cache
             buffer_mode = get_memory().hicache_host_memory_mode == "buffer_only"

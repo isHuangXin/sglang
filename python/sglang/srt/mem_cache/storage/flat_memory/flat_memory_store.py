@@ -144,6 +144,11 @@ class FlatMemoryStore(HiCacheStorage):
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> List[bool]:
         key_strs, buffer_ptrs, buffer_sizes = self._batch_preprocess(keys, host_indices)
+        if key_strs:
+            logger.info(
+                f"[PREFETCH-DEBUG] batch_set_v1: n_keys={len(key_strs)}, "
+                f"first_key={key_strs[0]}"
+            )
         results = self.manager.batch_put(key_strs, buffer_ptrs, buffer_sizes)
         return self._batch_postprocess(results, is_set_operate=True)
 
@@ -202,6 +207,11 @@ class FlatMemoryStore(HiCacheStorage):
         # deduplication internally (single lock), avoiding per-key exists() overhead.
         results = self.manager.batch_put(keys, target_locations, target_sizes)
         all_ok = all(results)
+        if len(keys) > 0:
+            logger.info(
+                f"[PREFETCH-DEBUG] batch_set: n_keys={len(keys)}, "
+                f"first_key={keys[0][:32]}, all_ok={all_ok}"
+            )
 
         end_time = time.perf_counter()
 
@@ -274,6 +284,12 @@ class FlatMemoryStore(HiCacheStorage):
 
         for i in range(len(query_keys)):
             if not self.manager.exists(query_keys[i]):
+                if i == 0:
+                    logger.info(
+                        f"[PREFETCH-DEBUG] batch_exists: FIRST key miss: {query_keys[0]}, "
+                        f"is_mla={self.is_mla_backend}, total_keys={len(query_keys)}, "
+                        f"total_blocks={self.manager.get_stats()}"
+                    )
                 return i // key_multiplier
         return len(query_keys) // key_multiplier
 

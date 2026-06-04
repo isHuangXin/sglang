@@ -1688,6 +1688,12 @@ class HiRadixCache(RadixCache):
         loaded_from_storage = min_completed_tokens - matched_length
         self.prefetch_loaded_tokens_by_reqid[req_id] = loaded_from_storage
 
+        logger.info(
+            f"[PREFETCH-DEBUG] check_prefetch_progress: req={req_id[:8]}, "
+            f"completed_tokens={completed_tokens}, min_completed={min_completed_tokens}, "
+            f"matched_length={matched_length}, loaded_from_storage={loaded_from_storage}"
+        )
+
         if self.enable_storage_metrics:
             self.storage_metrics_collector.log_prefetched_tokens(loaded_from_storage)
         return
@@ -1790,10 +1796,12 @@ class HiRadixCache(RadixCache):
         # align the number of fetching tokens to the page size
         prefetch_key = prefetch_key.page_aligned(self.page_size)
         prefetch_length = len(prefetch_key)
+        rate_limited = self.cache_controller.prefetch_rate_limited()
+        logger.debug("Storage prefetch: tokens=%d, limited=%s", prefetch_length, rate_limited)
         if (
             not self.enable_storage
             or prefetch_length < self.prefetch_threshold
-            or self.cache_controller.prefetch_rate_limited()
+            or rate_limited
         ):
             return
 

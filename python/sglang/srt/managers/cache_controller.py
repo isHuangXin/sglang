@@ -458,6 +458,8 @@ class HiCacheController:
         )
         self.prefetch_queue = Queue()
         self.backup_queue = Queue()
+        self.backup_idle_event = threading.Event()
+        self.backup_idle_event.set()
         self.prefetch_buffer = Queue()
         self.prefetch_sync_queue = Queue()
         self.prefetch_hit_queue = Queue()
@@ -596,7 +598,7 @@ class HiCacheController:
 
             if (
                 self.storage_backend_type
-                in ["hf3fs", "mooncake", "eic", "nixl", "simm", "mori"]
+                in ["hf3fs", "mooncake", "eic", "nixl", "simm", "mori", "flat_memory"]
             ) or (
                 self.storage_backend_type == "dynamic"
                 and bool(self.storage_config.extra_config.get("interface_v1", 0))
@@ -1181,6 +1183,7 @@ class HiCacheController:
 
         for start in range(0, len(page_hashes), STORAGE_BATCH_SIZE):
             batch_hashes = page_hashes[start : start + STORAGE_BATCH_SIZE]
+            logger.debug("Storage prefix query: pages=%d", len(batch_hashes))
             extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
             hit_page_num = self.storage_backend.batch_exists(batch_hashes, extra_info)
             hash_value.extend(batch_hashes[:hit_page_num])
@@ -1201,6 +1204,7 @@ class HiCacheController:
                 operation = self.prefetch_queue.get(block=True, timeout=1)
                 if operation is None:
                     continue
+                self.backup_idle_event.wait(timeout=10.0)
                 if operation.is_terminated():
                     hash_value, storage_hit_count = [], 0
                 else:
@@ -1288,11 +1292,16 @@ class HiCacheController:
                 if operation is None:
                     continue
 
+                self.backup_idle_event.clear()
                 if not self.backup_skip:
                     self._page_backup(operation)
                 self.ack_backup_queue.put(operation)
+                # Signal idle only when queue is drained
+                if self.backup_queue.empty():
+                    self.backup_idle_event.set()
 
             except Empty:
+                self.backup_idle_event.set()
                 continue
 
     def prefetch_sync_thread_func(self):

@@ -109,6 +109,7 @@ class SchedulerProfilerManager:
         self._export_executor: ThreadPoolExecutor | None = None
         self._export_jobs: list[Future] = []
         self._export_errors: list[str] = []
+        self.rpd_profile_path: str | None = None
         if envs.SGLANG_PROFILE_V2.get():
             self._profile_manager = ProfileManager(
                 ps=self.ps,

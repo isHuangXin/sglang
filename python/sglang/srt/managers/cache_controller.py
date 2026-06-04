@@ -14,6 +14,7 @@ limitations under the License.
 """
 
 import logging
+import os
 import threading
 import time
 from queue import Empty, Full, Queue
@@ -256,7 +257,7 @@ class HiCacheController:
         write_policy: str = "write_through_selective",
         io_backend: str = "",
         storage_backend: Optional[str] = None,
-        prefetch_threshold: int = 256,
+        prefetch_threshold: int = int(os.environ.get("SGLANG_PREFETCH_THRESHOLD", "256")),
         model_name: Optional[str] = None,
         storage_backend_extra_config: Optional[dict] = None,
         pp_rank: int = 0,
@@ -401,7 +402,7 @@ class HiCacheController:
     def attach_storage_backend(
         self,
         storage_backend: str,
-        prefetch_threshold: int = 256,
+        prefetch_threshold: int = int(os.environ.get("SGLANG_PREFETCH_THRESHOLD", "256")),
         model_name: Optional[str] = None,
         storage_backend_extra_config: Optional[dict] = None,
     ):
@@ -449,7 +450,10 @@ class HiCacheController:
 
             self.enable_storage = True
             # todo: threshold policy for prefetching
-            self.prefetch_threshold = max(prefetch_threshold, self.page_size)
+            # Allow runtime override via env var (useful for testing storage cache hits)
+            env_threshold = int(os.environ.get("SGLANG_PREFETCH_THRESHOLD", str(prefetch_threshold)))
+            self.prefetch_threshold = max(env_threshold, self.page_size)
+            logger.info(f"Storage prefetch threshold set to {self.prefetch_threshold} tokens (env={env_threshold}, arg={prefetch_threshold}, page_size={self.page_size})")
             self.prefetch_capacity_limit = max(
                 0, int(0.8 * (self.mem_pool_host.size - self.mem_pool_device.size))
             )
@@ -920,6 +924,9 @@ class HiCacheController:
         Manage prefetching operations from storage backend to host memory.
         """
         self.prefetch_buffer = Queue()
+        self.storage_prefetch_queries = 0
+        self.storage_prefetch_hits = 0
+        self.storage_prefetch_tokens_hit = 0
         self.prefetch_io_aux_thread = threading.Thread(
             target=self.prefetch_io_aux_func, daemon=True
         )
@@ -950,6 +957,7 @@ class HiCacheController:
                     )
                     storage_hit_count = storage_hit_count_tensor.item()
 
+                self.storage_prefetch_queries += 1
                 if storage_hit_count < self.prefetch_threshold:
                     # not to prefetch if not enough benefits
                     self.prefetch_revoke_queue.put(operation.request_id)
@@ -958,6 +966,8 @@ class HiCacheController:
                         f"Revoking prefetch for request {operation.request_id} due to insufficient hits ({storage_hit_count})."
                     )
                 else:
+                    self.storage_prefetch_hits += 1
+                    self.storage_prefetch_tokens_hit += storage_hit_count
                     operation.hash_value = hash_value[
                         : (storage_hit_count // self.page_size)
                     ]
@@ -966,8 +976,11 @@ class HiCacheController:
                         operation.host_indices[storage_hit_count:]
                     )
                     operation.host_indices = operation.host_indices[:storage_hit_count]
-                    logger.debug(
-                        f"Prefetching {len(operation.hash_value)} pages for request {operation.request_id}."
+                    logger.info(
+                        f"[STORAGE-HIT] Prefetching {len(operation.hash_value)} pages "
+                        f"({storage_hit_count} tokens) from storage for req {operation.request_id[:8]}. "
+                        f"Total: {self.storage_prefetch_hits}/{self.storage_prefetch_queries} queries hit, "
+                        f"{self.storage_prefetch_tokens_hit} tokens prefetched from storage."
                     )
                     self.prefetch_buffer.put(operation)
 

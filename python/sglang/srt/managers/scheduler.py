@@ -1655,7 +1655,19 @@ class Scheduler(
 
     def _prefetch_kvcache(self, req: Req):
         if self.enable_hicache_storage:
+            # Flush pending GPU→Host→Storage backup pipeline before querying storage.
+            # Without this, prefetch queries race with async backup writes and miss
+            # data that is still in the CUDA D2H copy or backup queue, causing 0% hit.
+            if self.enable_hierarchical_cache:
+                self.tree_cache.check_hicache_events()
             req.init_next_round_input(self.tree_cache)
+            logger.info(
+                f"[PREFETCH-DEBUG] req={req.rid[:8]}, "
+                f"backuped={req.last_node.backuped}, "
+                f"prefix_indices={len(req.prefix_indices)}, "
+                f"host_hit={req.host_hit_length}, "
+                f"fill_ids={len(req.fill_ids)}"
+            )
             if req.last_node.backuped:
                 # only to initiate the prefetch if the last node is backuped
                 # otherwise, the allocated GPU memory must be locked for integrity

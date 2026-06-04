@@ -342,6 +342,8 @@ class HiCacheController:
         )
         self.prefetch_queue = Queue()
         self.backup_queue = Queue()
+        self.backup_idle_event = threading.Event()
+        self.backup_idle_event.set()  # initially idle
 
         self.prefetch_revoke_queue = Queue()
         self.ack_backup_queue = Queue()
@@ -472,7 +474,7 @@ class HiCacheController:
             self.page_get_func = self._generic_page_get
             self.page_set_func = self._generic_page_set
 
-            if (self.storage_backend_type in ["hf3fs", "mooncake", "eic", "nixl"]) or (
+            if (self.storage_backend_type in ["hf3fs", "mooncake", "eic", "nixl", "flat_memory"]) or (
                 self.storage_backend_type == "dynamic"
                 and bool(self.storage_config.extra_config.get("interface_v1", 0))
             ):
@@ -896,6 +898,12 @@ class HiCacheController:
                     batch_tokens[i : i + self.page_size], last_hash
                 )
                 batch_hashes.append(last_hash)
+            if batch_hashes:
+                logger.info(
+                    f"[PREFETCH-DEBUG] _storage_hit_query: first_hash={batch_hashes[0][:16]}, "
+                    f"n_hashes={len(batch_hashes)}, last_hash_in={operation.last_hash[:16] if operation.last_hash else 'None'}, "
+                    f"first_tokens={batch_tokens[:8]}"
+                )
             extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
             hit_page_num = self.storage_backend.batch_exists(batch_hashes, extra_info)
             hash_value.extend(batch_hashes[:hit_page_num])
@@ -921,7 +929,16 @@ class HiCacheController:
                 operation = self.prefetch_queue.get(block=True, timeout=1)
                 if operation is None:
                     continue
+                # Wait for any pending backup writes to complete before querying storage.
+                # Without this, prefetch queries race with backup writes and miss data
+                # that is still being written to storage, resulting in 0% cache hit rate.
+                self.backup_idle_event.wait(timeout=10.0)
                 hash_value, storage_hit_count = self._storage_hit_query(operation)
+                logger.info(
+                    f"[PREFETCH-DEBUG] storage_hit_query: req={operation.request_id[:8]}, "
+                    f"hit_count={storage_hit_count}, threshold={self.prefetch_threshold}, "
+                    f"total_tokens={len(operation.token_ids)}, hash_count={len(hash_value)}"
+                )
                 if self.tp_world_size > 1:
                     storage_hit_count_tensor = torch.tensor(
                         storage_hit_count, dtype=torch.int
@@ -937,7 +954,7 @@ class HiCacheController:
                     # not to prefetch if not enough benefits
                     self.prefetch_revoke_queue.put(operation.request_id)
                     self.append_host_mem_release(operation.host_indices)
-                    logger.debug(
+                    logger.info(
                         f"Revoking prefetch for request {operation.request_id} due to insufficient hits ({storage_hit_count})."
                     )
                 else:
@@ -990,6 +1007,11 @@ class HiCacheController:
     def _page_backup(self, operation):
         # Backup batch by batch
         prefix_keys = operation.prefix_keys
+        logger.info(
+            f"[PREFETCH-DEBUG] _page_backup: n_hashes={len(operation.hash_value)}, "
+            f"first_hash={operation.hash_value[0][:16] if operation.hash_value else 'EMPTY'}, "
+            f"host_indices_len={len(operation.host_indices)}"
+        )
         for i in range(0, len(operation.hash_value), self.storage_batch_size):
             batch_hashes = operation.hash_value[i : i + self.storage_batch_size]
             batch_host_indices = operation.host_indices[
@@ -1019,9 +1041,14 @@ class HiCacheController:
                 if operation is None:
                     continue
 
+                self.backup_idle_event.clear()
                 if not self.backup_skip:
                     self._page_backup(operation)
                 self.ack_backup_queue.put(operation)
+                # Signal idle only when queue is drained
+                if self.backup_queue.empty():
+                    self.backup_idle_event.set()
 
             except Empty:
+                self.backup_idle_event.set()
                 continue

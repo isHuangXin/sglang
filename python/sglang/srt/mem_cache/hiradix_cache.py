@@ -1101,6 +1101,12 @@ class HiRadixCache(RadixCache):
         loaded_from_storage = min_completed_tokens - matched_length
         self.prefetch_loaded_tokens_by_reqid[req_id] = loaded_from_storage
 
+        logger.info(
+            f"[PREFETCH-DEBUG] check_prefetch_progress: req={req_id[:8]}, "
+            f"completed_tokens={completed_tokens}, min_completed={min_completed_tokens}, "
+            f"matched_length={matched_length}, loaded_from_storage={loaded_from_storage}"
+        )
+
         if self.enable_storage_metrics:
             self.storage_metrics_collector.log_prefetched_tokens(loaded_from_storage)
 
@@ -1173,10 +1179,18 @@ class HiRadixCache(RadixCache):
             len(new_input_tokens) % self.page_size
         )
         new_input_tokens = new_input_tokens[:prefetch_length]
+        rate_limited = self.cache_controller.prefetch_rate_limited()
+        logger.info(
+            f"[PREFETCH-DEBUG] prefetch_from_storage: req={req_id[:8]}, "
+            f"enable_storage={self.enable_storage}, "
+            f"prefetch_length={prefetch_length}, "
+            f"threshold={self.prefetch_threshold}, "
+            f"rate_limited={rate_limited}"
+        )
         if (
             not self.enable_storage
             or prefetch_length < self.prefetch_threshold
-            or self.cache_controller.prefetch_rate_limited()
+            or rate_limited
         ):
             return
 

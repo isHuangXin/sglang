@@ -872,6 +872,11 @@ class HiRadixCache(RadixCache):
         ):
             return 0
 
+        if self.enable_storage:
+            with self.cache_controller.pending_backup_lock:
+                self.cache_controller.pending_backup_count += 1
+                self.cache_controller.backup_idle_event.clear()
+
         host_indices = self.cache_controller.write(
             device_indices=node.value,
             node_id=node.id,
@@ -891,6 +896,12 @@ class HiRadixCache(RadixCache):
             if not write_back:
                 self.inc_lock_ref(node)
         else:
+            # Host alloc failed — decrement pipeline counter
+            if self.enable_storage:
+                with self.cache_controller.pending_backup_lock:
+                    self.cache_controller.pending_backup_count -= 1
+                    if self.cache_controller.pending_backup_count == 0:
+                        self.cache_controller.backup_idle_event.set()
             return 0
 
         return len(host_indices)

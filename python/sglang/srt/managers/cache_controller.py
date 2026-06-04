@@ -23,6 +23,8 @@ from typing import TYPE_CHECKING, Callable, List, NamedTuple, Optional
 
 import torch
 
+from sglang.srt.environ import envs
+
 from sglang.srt.mem_cache.hicache_storage import (
     STORAGE_BATCH_SIZE,
     HiCacheStorageConfig,
@@ -456,6 +458,9 @@ class HiCacheController:
         self.backup_thread = threading.Thread(
             target=self.backup_thread_func, daemon=True
         )
+        self.storage_prefetch_queries = 0
+        self.storage_prefetch_hits = 0
+        self.storage_prefetch_tokens_hit = 0
         self.prefetch_queue = Queue()
         self.backup_queue = Queue()
         self.backup_idle_event = threading.Event()
@@ -573,7 +578,11 @@ class HiCacheController:
 
             self.enable_storage = True
             # todo: threshold policy for prefetching
-            self.prefetch_threshold = max(prefetch_threshold, self.page_size)
+            env_threshold = envs.SGLANG_PREFETCH_THRESHOLD.get()
+            self.prefetch_threshold = max(
+                prefetch_threshold if env_threshold is None else env_threshold,
+                self.page_size,
+            )
             if self.host_memory_mode == "buffer_only":
                 # The whole pool is transient staging; loads may fill it up
                 # to this fraction, and the tree's write flush gate yields
@@ -1218,6 +1227,10 @@ class HiCacheController:
                     self.prefetch_hits_sync_groups,
                 )
                 storage_hit_count = storage_hit_count_tensor.item()
+                self.storage_prefetch_queries += 1
+                if storage_hit_count >= self.prefetch_threshold:
+                    self.storage_prefetch_hits += 1
+                    self.storage_prefetch_tokens_hit += storage_hit_count
 
                 # Record the TP-synced hit count; the scheduler thread decides
                 # at drain time whether to revoke (below threshold) or allocate.

@@ -1668,9 +1668,10 @@ class Scheduler(
                 f"host_hit={req.host_hit_length}, "
                 f"fill_ids={len(req.fill_ids)}"
             )
-            if req.last_node.backuped:
-                # only to initiate the prefetch if the last node is backuped
-                # otherwise, the allocated GPU memory must be locked for integrity
+            if req.last_node.backuped or req.last_node is self.tree_cache.root_node:
+                # Initiate prefetch if the last node is backuped, or if all nodes
+                # have been evicted (last_node == root). In the root case, hash chain
+                # is recomputed from scratch using token_ids. (upstream fix: PR #19663)
                 last_hash = req.last_host_node.get_last_hash_value()
                 matched_len = len(req.prefix_indices) + req.host_hit_length
                 new_input_tokens = req.fill_ids[matched_len:]

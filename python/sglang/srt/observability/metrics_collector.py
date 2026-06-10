@@ -1941,6 +1941,40 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
             buckets=bucket_bandwidth,
         )
 
+        # FLAT_MEMORY: Additional transfer metrics
+        bucket_latency_ms = [10, 50, 100, 250, 500, 1000, 2000, 5000, 10000]
+
+        self.histogram_prefetch_latency_ms = Histogram(
+            name="sglang:prefetch_latency_ms",
+            documentation="Histogram of SSD/DRAM prefetch latency in milliseconds.",
+            labelnames=labels.keys(),
+            buckets=bucket_latency_ms,
+        )
+
+        self.d2h_tokens_total = Counter(
+            name="sglang:d2h_tokens_total",
+            documentation="Total tokens transferred GPU HBM to Host DRAM.",
+            labelnames=labels.keys(),
+        )
+
+        self.storage_write_tokens_total = Counter(
+            name="sglang:storage_write_tokens_total",
+            documentation="Total tokens written Host DRAM to Mooncake Storage.",
+            labelnames=labels.keys(),
+        )
+
+        self.host_eviction_ops_total = Counter(
+            name="sglang:host_eviction_ops_total",
+            documentation="Total number of Host DRAM eviction operations.",
+            labelnames=labels.keys(),
+        )
+
+        self.host_eviction_tokens_total = Counter(
+            name="sglang:host_eviction_tokens_total",
+            documentation="Total tokens evicted from Host DRAM.",
+            labelnames=labels.keys(),
+        )
+
     def log_prefetched_tokens(self, prefetched_tokens: int):
         if prefetched_tokens > 0:
             self.prefetched_tokens_total.labels(**self.labels).inc(prefetched_tokens)
@@ -1958,6 +1992,23 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
             self.prefetch_aux_alloc_failed_tokens_total.labels(**self.labels).inc(
                 num_tokens
             )
+    def log_prefetch_latency_ms(self, latency_ms: float):
+        if latency_ms > 0:
+            self._log_histogram(self.histogram_prefetch_latency_ms, latency_ms)
+
+    def log_d2h_tokens(self, tokens: int):
+        if tokens > 0:
+            self.d2h_tokens_total.labels(**self.labels).inc(tokens)
+
+    def log_storage_write_tokens(self, tokens: int):
+        if tokens > 0:
+            self.storage_write_tokens_total.labels(**self.labels).inc(tokens)
+
+    def log_host_eviction(self, ops: int, tokens: int):
+        if ops > 0:
+            self.host_eviction_ops_total.labels(**self.labels).inc(ops)
+        if tokens > 0:
+            self.host_eviction_tokens_total.labels(**self.labels).inc(tokens)
 
     def _log_histogram(self, histogram, data: Union[int, float]):
         histogram.labels(**self.labels).observe(data)

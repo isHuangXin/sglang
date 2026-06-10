@@ -105,6 +105,14 @@ class SchedulerOutputStreamer:
                 details["storage"] = req.cached_tokens_storage
             if self.enable_hicache_storage():
                 details["storage_backend"] = self._get_storage_backend_type()
+            details.update(
+                page_size=req.kvcache_page_size,
+                bytes_per_page=req.kvcache_bytes_per_page,
+                storage_read_latency_ms=req.storage_read_latency_ms,
+                storage_read_tokens=req.storage_read_tokens,
+                d2h_tokens=req.d2h_tokens,
+                storage_write_tokens=req.storage_write_tokens,
+            )
             return details
 
         if req.cached_tokens > 0:

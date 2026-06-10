@@ -468,6 +468,13 @@ class MetadataBuffers:
         self.cached_tokens[req.metadata_buffer_index][4] = image_t
         self.cached_tokens[req.metadata_buffer_index][5] = audio_t
         self.cached_tokens[req.metadata_buffer_index][6] = video_t
+        self.cached_tokens[req.metadata_buffer_index][7] = 1
+        for slot, value in enumerate((
+            req.kvcache_page_size, req.kvcache_bytes_per_page,
+            int(req.storage_read_latency_ms * 1000), req.storage_read_tokens,
+            req.d2h_tokens, req.storage_write_tokens,
+        ), start=8):
+            self.cached_tokens[req.metadata_buffer_index][slot] = value
         if req.return_logprob:
             if req.logprob.output_token_logprobs_val:  # not none or empty list
                 self.output_token_logprobs_val[req.metadata_buffer_index][0] = (

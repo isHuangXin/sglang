@@ -3680,9 +3680,19 @@ class Scheduler(
                     # skip staging requests that are ongoing prefetch
                     continue
                 # Pop the number of tokens loaded from storage (L3 hits)
+                from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
+
                 loaded_tokens = self.tree_cache.pop_prefetch_loaded_tokens(req.rid)
                 if loaded_tokens > 0:
                     req.storage_hit_length = loaded_tokens
+                if isinstance(self.tree_cache, HiRadixCache):
+                    req.storage_read_latency_ms, req.storage_read_tokens = (
+                        self.tree_cache.pop_prefetch_latency(req.rid)
+                    )
+                    req.kvcache_bytes_per_page = (
+                        self.tree_cache.token_to_kv_pool_host.get_size_per_token()
+                        * self.tree_cache.page_size
+                    )
 
             req.init_next_round_input(self.tree_cache)
             if (

@@ -1202,6 +1202,13 @@ class Req(ReqDllmMixin):
             False  # Track if breakdown was already computed
         )
 
+        self.kvcache_page_size = 0
+        self.kvcache_bytes_per_page = 0
+        self.storage_read_latency_ms = 0.0
+        self.d2h_tokens = 0
+        self.storage_write_tokens = 0
+        self.storage_read_tokens = 0
+
         # Per-request count of verification forward passes.
         self.spec_verify_ct = 0
 
@@ -2620,6 +2627,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                         host_hit_len=req.host_hit_length,
                         storage_hit_len=req.storage_hit_length,
                     )
+                    req.kvcache_page_size = self.tree_cache.page_size
                     req._cache_breakdown_computed = True
 
                 req.already_computed = seq_len

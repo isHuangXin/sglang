@@ -160,6 +160,16 @@ class HiRadixCache(RadixCache):
         )
         self.load_back_threshold = 10
 
+        # FLAT_MEMORY: Aggregate counters for KVCache transfer metrics
+        self._d2h_total_tokens = 0  # GPU HBM → Host DRAM tokens
+        self._d2h_total_ops = 0
+        self._storage_write_total_tokens = 0  # Host DRAM → Mooncake tokens
+        self._storage_write_total_ops = 0
+        self._host_eviction_total_tokens = 0  # Host DRAM eviction tokens
+        self._host_eviction_total_ops = 0
+        # Per-request prefetch latency: {req_id: (latency_ms, completed_tokens)}
+        self._prefetch_latency_by_reqid: dict[str, tuple[float, int]] = {}
+
         # Detach storage backend automatically on process shutdown
         atexit.register(self.shutdown)
 
@@ -656,6 +666,11 @@ class HiRadixCache(RadixCache):
             if not write_back:
                 # no need to lock nodes if write back
                 self.inc_lock_ref(node)
+            # FLAT_MEMORY: track D2H token count
+            self._d2h_total_tokens += len(host_indices)
+            self._d2h_total_ops += 1
+            if self.enable_storage_metrics:
+                self.storage_metrics_collector.log_d2h_tokens(len(host_indices))
         else:
             # Host alloc failed — decrement pipeline counter
             if self.enable_storage:
@@ -679,6 +694,11 @@ class HiRadixCache(RadixCache):
         )
         self.ongoing_backup[operation_id] = node
         node.protect_host()
+        # FLAT_MEMORY: track storage write token count
+        self._storage_write_total_tokens += len(node.host_value)
+        self._storage_write_total_ops += 1
+        if self.enable_storage_metrics:
+            self.storage_metrics_collector.log_storage_write_tokens(len(node.host_value))
 
     def _inc_hit_count(self, node: TreeNode, chunked=False):
         # skip the hit count update for chunked requests
@@ -876,6 +896,7 @@ class HiRadixCache(RadixCache):
         heapq.heapify(eviction_heap)
 
         num_evicted = 0
+        evict_ops = 0
         while num_evicted < num_tokens and len(eviction_heap):
             _priority, x = heapq.heappop(eviction_heap)
             if x == self.root_node:
@@ -889,6 +910,7 @@ class HiRadixCache(RadixCache):
                 continue
 
             num_evicted += self.cache_controller.evict_host(x.host_value)
+            evict_ops += 1
 
             key = self.get_child_key_fn(x.key)
             v = x.parent.children.pop(key, None)
@@ -900,6 +922,13 @@ class HiRadixCache(RadixCache):
             if len(x.parent.children) == 0 and x.parent.evicted:
                 new_priority = self.eviction_strategy.get_priority(x.parent)
                 heapq.heappush(eviction_heap, (new_priority, x.parent))
+
+        # FLAT_MEMORY: track host eviction metrics
+        if num_evicted > 0:
+            self._host_eviction_total_tokens += num_evicted
+            self._host_eviction_total_ops += evict_ops
+            if self.enable_storage_metrics:
+                self.storage_metrics_collector.log_host_eviction(evict_ops, num_evicted)
 
     def load_back(
         self, node: TreeNode, mem_quota: Optional[int] = None
@@ -1096,7 +1125,18 @@ class HiRadixCache(RadixCache):
         completed_tokens, hash_value = self.cache_controller.terminate_prefetch(
             operation
         )
-        logger.debug(f"Prefetch {req_id} completed with {completed_tokens} tokens")
+        # FLAT_MEMORY: record prefetch latency and completed tokens for this request
+        prefetch_latency_ms = (time.monotonic() - operation.start_time) * 1000
+        self._prefetch_latency_by_reqid[req_id] = (
+            prefetch_latency_ms,
+            completed_tokens,
+        )
+        if self.enable_storage_metrics:
+            self.storage_metrics_collector.log_prefetch_latency_ms(prefetch_latency_ms)
+        logger.debug(
+            f"Prefetch {req_id} completed with {completed_tokens} tokens "
+            f"in {prefetch_latency_ms:.1f}ms"
+        )
 
         min_completed_tokens = completed_tokens
         if self.tp_world_size > 1:
@@ -1160,6 +1200,29 @@ class HiRadixCache(RadixCache):
         This should be called after check_prefetch_progress() returns True.
         """
         return self.prefetch_loaded_tokens_by_reqid.pop(req_id, 0)
+
+    def pop_prefetch_latency(self, req_id: str) -> tuple:
+        """
+        Pop and return (latency_ms, completed_tokens) for a request's prefetch.
+        Returns (0.0, 0) if no prefetch was done.
+        This should be called after check_prefetch_progress() returns True.
+        """
+        return self._prefetch_latency_by_reqid.pop(req_id, (0.0, 0))
+
+    def get_transfer_stats(self) -> dict:
+        """
+        Return aggregate transfer statistics for all KVCache operations.
+        Called by server info endpoint or benchmark metrics.
+        """
+        return {
+            "d2h_total_tokens": self._d2h_total_tokens,
+            "d2h_total_ops": self._d2h_total_ops,
+            "storage_write_total_tokens": self._storage_write_total_tokens,
+            "storage_write_total_ops": self._storage_write_total_ops,
+            "host_eviction_total_tokens": self._host_eviction_total_tokens,
+            "host_eviction_total_ops": self._host_eviction_total_ops,
+            "page_size": self.page_size,
+        }
 
     def match_prefix(self, params: MatchPrefixParams):
         key = params.key

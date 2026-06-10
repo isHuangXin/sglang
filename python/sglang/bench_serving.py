@@ -108,6 +108,12 @@ class RequestFuncOutput:
     cached_tokens_device: int = 0
     cached_tokens_host: int = 0
     cached_tokens_storage: int = 0
+    kvcache_page_size: int = 0
+    kvcache_bytes_per_page: int = 0
+    storage_read_latency_ms: float = 0.0
+    storage_read_tokens: int = 0
+    d2h_tokens: int = 0
+    storage_write_tokens: int = 0
     start_time: float = 0.0
 
     @staticmethod
@@ -661,6 +667,14 @@ async def async_request_sglang_generate(
                                     output.cached_tokens_device = details.get("device", 0)
                                     output.cached_tokens_host = details.get("host", 0)
                                     output.cached_tokens_storage = details.get("storage", 0)
+                                    # KVCache block granularity
+                                    output.kvcache_page_size = details.get("page_size", 0)
+                                    output.kvcache_bytes_per_page = details.get("bytes_per_page", 0)
+                                    # Transfer metrics
+                                    output.storage_read_latency_ms = details.get("storage_read_latency_ms", 0.0)
+                                    output.storage_read_tokens = details.get("storage_read_tokens", 0)
+                                    output.d2h_tokens = details.get("d2h_tokens", 0)
+                                    output.storage_write_tokens = details.get("storage_write_tokens", 0)
 
                                 # First token
                                 if ttft == 0.0:
@@ -1014,6 +1028,14 @@ class BenchmarkMetrics:
     total_cached_tokens_device: int = 0
     total_cached_tokens_host: int = 0
     total_cached_tokens_storage: int = 0
+    # KVCache block granularity
+    kvcache_page_size: int = 0
+    kvcache_bytes_per_page: int = 0
+    # Transfer metrics
+    avg_storage_read_latency_ms: float = 0.0
+    total_storage_read_tokens: int = 0
+    total_d2h_tokens: int = 0
+    total_storage_write_tokens: int = 0
 
 
 SHAREGPT_REPO_ID = "anon8231489123/ShareGPT_Vicuna_unfiltered"
@@ -2099,6 +2121,93 @@ async def get_request(
             await asyncio.sleep(interval)
 
 
+def fetch_mooncake_eviction_metrics(
+    master_host: str = "localhost",
+    metrics_port: int = 9003,
+    timeout: float = 5.0,
+) -> dict:
+    """Fetch eviction metrics from Mooncake Master's HTTP metrics endpoint.
+
+    Returns a dict with eviction-related counters parsed from Prometheus text format.
+    Returns empty dict on failure (connection refused, timeout, etc.).
+    """
+    import re
+
+    url = f"http://{master_host}:{metrics_port}/metrics"
+    try:
+        resp = requests.get(url, timeout=timeout)
+        resp.raise_for_status()
+    except Exception as e:
+        print(f"[Warning] Failed to fetch Mooncake Master metrics from {url}: {e}")
+        return {}
+
+    text = resp.text
+    result = {}
+    # Parse Prometheus text format: metric_name value
+    patterns = {
+        "successful_evictions": r"^master_successful_evictions_total\s+(\d+)",
+        "attempted_evictions": r"^master_attempted_evictions_total\s+(\d+)",
+        "evicted_key_count": r"^master_evicted_key_count\s+(\d+)",
+        "evicted_size_bytes": r"^master_evicted_size_bytes\s+(\d+)",
+    }
+    for key, pattern in patterns.items():
+        match = re.search(pattern, text, re.MULTILINE)
+        if match:
+            result[key] = int(match.group(1))
+
+    return result
+
+
+def fetch_sglang_bandwidth_metrics(
+    prefill_host: str = "localhost",
+    prefill_port: int = 30010,
+    timeout: float = 5.0,
+) -> dict:
+    """Fetch KVCache backup/prefetch bandwidth from SGLang Prefill server's Prometheus endpoint.
+
+    Parses Prometheus histogram metrics:
+      - sglang:backup_bandwidth (Host DRAM → Mooncake write bandwidth, GB/s)
+      - sglang:prefetch_bandwidth (Mooncake → Host DRAM read bandwidth, GB/s)
+
+    Returns dict with sum/count/avg for each metric.
+    Returns empty dict on failure.
+    """
+    import re
+
+    url = f"http://{prefill_host}:{prefill_port}/metrics"
+    try:
+        resp = requests.get(url, timeout=timeout)
+        resp.raise_for_status()
+    except Exception as e:
+        print(f"[Warning] Failed to fetch SGLang Prefill metrics from {url}: {e}")
+        return {}
+
+    text = resp.text
+    result = {}
+
+    # Parse Prometheus histogram _sum and _count
+    for metric_name, label in [
+        ("sglang:backup_bandwidth", "backup"),
+        ("sglang:prefetch_bandwidth", "prefetch"),
+    ]:
+        sum_match = re.search(
+            rf'^{re.escape(metric_name)}_sum\b.*?\s+([\d.eE+\-]+)',
+            text, re.MULTILINE
+        )
+        count_match = re.search(
+            rf'^{re.escape(metric_name)}_count\b.*?\s+([\d.eE+\-]+)',
+            text, re.MULTILINE
+        )
+        if sum_match and count_match:
+            total = float(sum_match.group(1))
+            count = float(count_match.group(1))
+            result[f"{label}_bandwidth_sum_gbs"] = total
+            result[f"{label}_bandwidth_count"] = int(count)
+            result[f"{label}_bandwidth_avg_gbs"] = total / count if count > 0 else 0.0
+
+    return result
+
+
 def calculate_metrics(
     input_requests: Optional[List[DatasetRow]],
     outputs: List[RequestFuncOutput],
@@ -2277,6 +2386,17 @@ def calculate_metrics(
         total_cached_tokens_device=sum(o.cached_tokens_device for o in outputs if o.success),
         total_cached_tokens_host=sum(o.cached_tokens_host for o in outputs if o.success),
         total_cached_tokens_storage=sum(o.cached_tokens_storage for o in outputs if o.success),
+        # KVCache block granularity (take from first successful output that has it)
+        kvcache_page_size=next((o.kvcache_page_size for o in outputs if o.success and o.kvcache_page_size > 0), 0),
+        kvcache_bytes_per_page=next((o.kvcache_bytes_per_page for o in outputs if o.success and o.kvcache_bytes_per_page > 0), 0),
+        # Transfer metrics
+        avg_storage_read_latency_ms=(
+            np.mean([o.storage_read_latency_ms for o in outputs if o.success and o.storage_read_latency_ms > 0])
+            if any(o.storage_read_latency_ms > 0 for o in outputs if o.success) else 0.0
+        ),
+        total_storage_read_tokens=sum(o.storage_read_tokens for o in outputs if o.success),
+        total_d2h_tokens=sum(o.d2h_tokens for o in outputs if o.success),
+        total_storage_write_tokens=sum(o.storage_write_tokens for o in outputs if o.success),
     )
 
     return metrics, output_lens
@@ -2658,6 +2778,85 @@ async def benchmark(
             print("{:<40} {:<10}".format("  - Device (GPU HBM):", metrics.total_cached_tokens_device))
             print("{:<40} {:<10}".format("  - Host (CPU DRAM):", metrics.total_cached_tokens_host))
             print("{:<40} {:<10}".format("  - Storage (L3 SSD):", metrics.total_cached_tokens_storage))
+    if metrics.kvcache_page_size > 0 or metrics.kvcache_bytes_per_page > 0:
+        print("{s:{c}^{n}}".format(s="KVCache Block Granularity", n=50, c="-"))
+        print("{:<40} {:<10}".format("Page size (tokens):", metrics.kvcache_page_size))
+        print("{:<40} {:<10}".format("Bytes per page (K+V):", metrics.kvcache_bytes_per_page))
+        print("{:<40} {:<10.2f}".format(
+            "Bytes per page (K+V, KB):", metrics.kvcache_bytes_per_page / 1024.0
+        ))
+    if (metrics.avg_storage_read_latency_ms > 0 or metrics.total_storage_read_tokens > 0
+            or metrics.total_d2h_tokens > 0 or metrics.total_storage_write_tokens > 0):
+        print("{s:{c}^{n}}".format(s="Transfer Metrics", n=50, c="-"))
+        if metrics.avg_storage_read_latency_ms > 0:
+            print("{:<40} {:<10.2f}".format(
+                "Avg SSD→Host latency (ms):", metrics.avg_storage_read_latency_ms
+            ))
+        if metrics.total_storage_read_tokens > 0:
+            print("{:<40} {:<10}".format(
+                "Total SSD→Host tokens:", metrics.total_storage_read_tokens
+            ))
+        if metrics.total_d2h_tokens > 0:
+            print("{:<40} {:<10}".format(
+                "Total GPU→Host tokens:", metrics.total_d2h_tokens
+            ))
+        if metrics.total_storage_write_tokens > 0:
+            print("{:<40} {:<10}".format(
+                "Total Host→Storage tokens:", metrics.total_storage_write_tokens
+            ))
+    # Fetch and print Mooncake Master eviction metrics
+    mooncake_eviction = {}
+    if hasattr(args, 'mooncake_master_host') and args.mooncake_master_host:
+        mooncake_eviction = fetch_mooncake_eviction_metrics(
+            master_host=args.mooncake_master_host,
+            metrics_port=getattr(args, 'mooncake_metrics_port', 9003),
+        )
+        if mooncake_eviction:
+            print("{s:{c}^{n}}".format(s="Mooncake Eviction Statistics", n=50, c="-"))
+            if "successful_evictions" in mooncake_eviction:
+                print("{:<40} {:<10}".format(
+                    "Successful evictions:", mooncake_eviction["successful_evictions"]
+                ))
+            if "attempted_evictions" in mooncake_eviction:
+                print("{:<40} {:<10}".format(
+                    "Attempted evictions:", mooncake_eviction["attempted_evictions"]
+                ))
+            if "evicted_key_count" in mooncake_eviction:
+                print("{:<40} {:<10}".format(
+                    "Evicted keys total:", mooncake_eviction["evicted_key_count"]
+                ))
+            if "evicted_size_bytes" in mooncake_eviction:
+                evicted_mb = mooncake_eviction["evicted_size_bytes"] / (1024 * 1024)
+                print("{:<40} {:<10.2f}".format(
+                    "Evicted size (MB):", evicted_mb
+                ))
+    # Fetch and print SGLang Prefill bandwidth metrics
+    bandwidth_metrics = {}
+    if hasattr(args, 'prefill_metrics_host') and args.prefill_metrics_host:
+        bandwidth_metrics = fetch_sglang_bandwidth_metrics(
+            prefill_host=args.prefill_metrics_host,
+            prefill_port=getattr(args, 'prefill_metrics_port', 30000),
+        )
+        if bandwidth_metrics:
+            print("{s:{c}^{n}}".format(s="KVCache Transfer Bandwidth", n=50, c="-"))
+            if "backup_bandwidth_avg_gbs" in bandwidth_metrics:
+                print("{:<40} {:<10.3f}".format(
+                    "Write bandwidth avg (GB/s):",
+                    bandwidth_metrics["backup_bandwidth_avg_gbs"]
+                ))
+                print("{:<40} {:<10}".format(
+                    "Write batch count:",
+                    bandwidth_metrics["backup_bandwidth_count"]
+                ))
+            if "prefetch_bandwidth_avg_gbs" in bandwidth_metrics:
+                print("{:<40} {:<10.3f}".format(
+                    "Read bandwidth avg (GB/s):",
+                    bandwidth_metrics["prefetch_bandwidth_avg_gbs"]
+                ))
+                print("{:<40} {:<10}".format(
+                    "Read batch count:",
+                    bandwidth_metrics["prefetch_bandwidth_count"]
+                ))
     if accept_length:
         print("{:<40} {:<10.2f}".format("Accept length:", accept_length))
     print("{s:{c}^{n}}".format(s="End-to-End Latency", n=50, c="-"))
@@ -2754,6 +2953,18 @@ async def benchmark(
             "total_cached_tokens_device": metrics.total_cached_tokens_device,
             "total_cached_tokens_host": metrics.total_cached_tokens_host,
             "total_cached_tokens_storage": metrics.total_cached_tokens_storage,
+            # KVCache block granularity
+            "kvcache_page_size": metrics.kvcache_page_size,
+            "kvcache_bytes_per_page": metrics.kvcache_bytes_per_page,
+            # Transfer metrics
+            "avg_storage_read_latency_ms": metrics.avg_storage_read_latency_ms,
+            "total_storage_read_tokens": metrics.total_storage_read_tokens,
+            "total_d2h_tokens": metrics.total_d2h_tokens,
+            "total_storage_write_tokens": metrics.total_storage_write_tokens,
+            # Mooncake eviction metrics
+            "mooncake_eviction": mooncake_eviction if mooncake_eviction else {},
+            # KVCache transfer bandwidth
+            "kvcache_bandwidth": bandwidth_metrics if bandwidth_metrics else {},
         }
     else:
         print(f"Error running benchmark for request rate: {request_rate}")
@@ -3444,6 +3655,36 @@ if __name__ == "__main__":
         ],
         help="Underlying workload for the mooncake dataset.",
     )
+
+    # Mooncake Master metrics arguments
+    mooncake_metrics_group = parser.add_argument_group("mooncake master metrics arguments")
+    mooncake_metrics_group.add_argument(
+        "--mooncake-master-host",
+        type=str,
+        default=None,
+        help="Hostname or IP of Mooncake Master for fetching eviction metrics. "
+        "If not set, Mooncake eviction metrics are not collected.",
+    )
+    mooncake_metrics_group.add_argument(
+        "--mooncake-metrics-port",
+        type=int,
+        default=9003,
+        help="HTTP metrics port of Mooncake Master (default: 9003).",
+    )
+    mooncake_metrics_group.add_argument(
+        "--prefill-metrics-host",
+        type=str,
+        default=None,
+        help="Hostname or IP of SGLang Prefill server for fetching bandwidth metrics. "
+        "If not set, bandwidth metrics are not collected.",
+    )
+    mooncake_metrics_group.add_argument(
+        "--prefill-metrics-port",
+        type=int,
+        default=30000,
+        help="HTTP port of SGLang Prefill server for Prometheus metrics (default: 30000).",
+    )
+
     parser.add_argument(
         "--tag", type=str, default=None, help="The tag to be dumped to output."
     )

@@ -59,8 +59,7 @@ class SchedulerOutputProcessorMixin:
 
         Returns:
             - None if no cached tokens breakdown is available
-            - {"device": X, "host": Y} if breakdown available but L3 storage is not
-            - {"device": X, "host": Y, "storage": Z, "storage_backend": "..."} if L3 enabled
+            - {"device": X, "host": Y, ...} with optional storage, latency, and granularity fields
         """
         # In PD disaggregation mode, the decode node receives breakdown data
         # from the prefill node via metadata buffer, even though HiCache is
@@ -79,6 +78,15 @@ class SchedulerOutputProcessorMixin:
                 }
                 if req.cached_tokens_storage > 0:
                     details["storage"] = req.cached_tokens_storage
+                # FLAT_MEMORY: include transfer metrics from prefill node
+                if req.kvcache_page_size > 0:
+                    details["page_size"] = req.kvcache_page_size
+                if req.kvcache_bytes_per_page > 0:
+                    details["bytes_per_page"] = req.kvcache_bytes_per_page
+                if req.storage_read_latency_ms > 0:
+                    details["storage_read_latency_ms"] = req.storage_read_latency_ms
+                if req.storage_read_tokens > 0:
+                    details["storage_read_tokens"] = req.storage_read_tokens
                 return details
             return None
 
@@ -96,6 +104,15 @@ class SchedulerOutputProcessorMixin:
             if getattr(self, "enable_hicache_storage", False):
                 details["storage"] = req.cached_tokens_storage
                 details["storage_backend"] = self._get_storage_backend_type()
+            # FLAT_MEMORY: include transfer metrics and granularity info
+            if req.kvcache_page_size > 0:
+                details["page_size"] = req.kvcache_page_size
+            if req.kvcache_bytes_per_page > 0:
+                details["bytes_per_page"] = req.kvcache_bytes_per_page
+            if req.storage_read_latency_ms > 0:
+                details["storage_read_latency_ms"] = req.storage_read_latency_ms
+            if req.storage_read_tokens > 0:
+                details["storage_read_tokens"] = req.storage_read_tokens
             return details
         return None
 

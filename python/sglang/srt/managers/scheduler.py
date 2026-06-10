@@ -2105,6 +2105,12 @@ class Scheduler(
                 req.storage_hit_length = self.tree_cache.pop_prefetch_loaded_tokens(
                     req.rid
                 )
+                # FLAT_MEMORY: Pop prefetch latency and token count for this request
+                latency_ms, read_tokens = self.tree_cache.pop_prefetch_latency(
+                    req.rid
+                )
+                req.storage_read_latency_ms = latency_ms
+                req.storage_read_tokens = read_tokens
 
             req.init_next_round_input(self.tree_cache)
             res = adder.add_one_req(

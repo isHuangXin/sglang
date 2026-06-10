@@ -200,6 +200,16 @@ class MetadataBuffers:
         self.cached_tokens[req.metadata_buffer_index][1] = req.cached_tokens_device
         self.cached_tokens[req.metadata_buffer_index][2] = req.cached_tokens_host
         self.cached_tokens[req.metadata_buffer_index][3] = req.cached_tokens_storage
+        # KVCache block granularity and transfer metrics (slots 4-9)
+        self.cached_tokens[req.metadata_buffer_index][4] = req.kvcache_page_size
+        self.cached_tokens[req.metadata_buffer_index][5] = req.kvcache_bytes_per_page
+        # Store latency as microseconds (int32) for precision
+        self.cached_tokens[req.metadata_buffer_index][6] = int(
+            req.storage_read_latency_ms * 1000
+        )
+        self.cached_tokens[req.metadata_buffer_index][7] = req.storage_read_tokens
+        self.cached_tokens[req.metadata_buffer_index][8] = req.d2h_tokens
+        self.cached_tokens[req.metadata_buffer_index][9] = req.storage_write_tokens
         if req.return_logprob:
             if req.output_token_logprobs_val:  # not none or empty list
                 self.output_token_logprobs_val[req.metadata_buffer_index][0] = (

@@ -762,6 +762,18 @@ class Req(ReqDllmMixin):
             False  # Track if breakdown was already computed
         )
 
+        # KVCache block granularity info (set once per request)
+        self.kvcache_page_size = 0  # tokens per page
+        self.kvcache_bytes_per_page = 0  # bytes per page (K+V combined)
+
+        # Transfer latency breakdown (ms)
+        self.storage_read_latency_ms = 0.0  # SSD/DRAM → Host DRAM (prefetch)
+
+        # IO size breakdown (tokens)
+        self.d2h_tokens = 0  # tokens written GPU → Host DRAM
+        self.storage_write_tokens = 0  # tokens written Host DRAM → Mooncake
+        self.storage_read_tokens = 0  # tokens read from SSD/DRAM (prefetch)
+
         # The number of verification forward passes in the speculative decoding.
         # This is used to compute the average acceptance length per request.
         self.spec_verify_ct = 0
@@ -1557,6 +1569,16 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     req.cached_tokens_device = device_portion
                     req.cached_tokens_host = host_portion
                     req.cached_tokens_storage = storage_portion
+
+                    # Set KVCache block granularity info (once per request)
+                    if hasattr(self.tree_cache, 'page_size'):
+                        req.kvcache_page_size = self.tree_cache.page_size
+                    if hasattr(self.tree_cache, 'token_to_kv_pool_host'):
+                        pool = self.tree_cache.token_to_kv_pool_host
+                        req.kvcache_bytes_per_page = (
+                            pool.get_size_per_token() * self.tree_cache.page_size
+                        )
+
                     req._cache_breakdown_computed = True
 
                 req.already_computed = seq_len

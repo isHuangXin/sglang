@@ -797,6 +797,14 @@ class DecodeTransferQueue:
         decode_req.req.cached_tokens_device = cached_tokens[1].item()
         decode_req.req.cached_tokens_host = cached_tokens[2].item()
         decode_req.req.cached_tokens_storage = cached_tokens[3].item()
+        # KVCache block granularity and transfer metrics (slots 4-9)
+        decode_req.req.kvcache_page_size = cached_tokens[4].item()
+        decode_req.req.kvcache_bytes_per_page = cached_tokens[5].item()
+        # Latency stored as microseconds, convert back to ms
+        decode_req.req.storage_read_latency_ms = cached_tokens[6].item() / 1000.0
+        decode_req.req.storage_read_tokens = cached_tokens[7].item()
+        decode_req.req.d2h_tokens = cached_tokens[8].item()
+        decode_req.req.storage_write_tokens = cached_tokens[9].item()
         if not self.spec_algorithm.is_none():
             decode_req.req.output_topk_p = output_topk_p
             decode_req.req.output_topk_index = output_topk_index

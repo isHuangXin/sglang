@@ -2185,6 +2185,28 @@ def fetch_sglang_bandwidth_metrics(
     text = resp.text
     result = {}
 
+    # Debug: print lines containing "bandwidth" to diagnose matching issues
+    bandwidth_lines = [line for line in text.splitlines() if "bandwidth" in line.lower()]
+    if bandwidth_lines:
+        print(f"[Debug] Prometheus bandwidth metrics ({len(bandwidth_lines)} lines):")
+        for line in bandwidth_lines[:10]:
+            print(f"  {line}")
+    else:
+        # Also check what storage-related metrics exist
+        storage_lines = [line for line in text.splitlines()
+                         if any(kw in line.lower() for kw in ["backup", "prefetch", "storage", "hicache"])
+                         and not line.startswith("#")]
+        print(f"[Debug] No 'bandwidth' metrics found in Prefill /metrics response ({len(text)} bytes)")
+        if storage_lines:
+            print(f"[Debug] But found {len(storage_lines)} storage-related metric lines:")
+            for line in storage_lines[:15]:
+                print(f"  {line}")
+        else:
+            print(f"[Debug] No storage-related metrics at all. First 5 metric lines:")
+            metric_lines = [line for line in text.splitlines() if not line.startswith("#") and line.strip()]
+            for line in metric_lines[:5]:
+                print(f"  {line}")
+
     # Parse Prometheus histogram _sum and _count
     for metric_name, label in [
         ("sglang:backup_bandwidth", "backup"),

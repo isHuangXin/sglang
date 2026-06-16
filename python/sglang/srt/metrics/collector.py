@@ -1550,6 +1550,16 @@ class StorageMetricsCollector:
         for v in storage_metrics.backup_bandwidth:
             self._log_histogram(self.histogram_backup_bandwidth, v)
 
+        # Debug: log when bandwidth data flows to Prometheus
+        n_backup = len(storage_metrics.backup_bandwidth)
+        n_prefetch = len(storage_metrics.prefetch_bandwidth)
+        if n_backup > 0 or n_prefetch > 0:
+            import logging
+            logging.getLogger(__name__).info(
+                f"[BANDWIDTH-DEBUG] log_storage_metrics: observed {n_backup} backup_bw, "
+                f"{n_prefetch} prefetch_bw samples into Prometheus"
+            )
+
 
 class ExpertDispatchCollector:
     def __init__(self, ep_size: int) -> None:

@@ -730,6 +730,12 @@ class MooncakeStore(HiCacheStorage):
         storage_metrics.backup_pgs.extend(self.backup_pgs)
         storage_metrics.prefetch_bandwidth.extend(self.prefetch_bandwidth)
         storage_metrics.backup_bandwidth.extend(self.backup_bandwidth)
+        # Debug: log when bandwidth data is available
+        if self.backup_bandwidth or self.prefetch_bandwidth:
+            logger.info(
+                f"[BANDWIDTH-DEBUG] get_stats: backup_bw={len(self.backup_bandwidth)} samples, "
+                f"prefetch_bw={len(self.prefetch_bandwidth)} samples"
+            )
         self.prefetch_pgs.clear()
         self.backup_pgs.clear()
         self.prefetch_bandwidth.clear()

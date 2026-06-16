@@ -31,9 +31,9 @@ SGLang 是 LLM 推理框架，在 Flat Memory 项目中承担：
 
 | 文件 | 说明 | Flat Memory 改动点 |
 |------|------|-------------------|
-| `python/sglang/srt/mem_cache/hiradix_cache.py` | HiRadixCache 核心 — GPU/Host/Storage 三级 RadixTree 缓存 | **Ghost Node 修改点**: `evict_host()` (L839) 需保留节点索引而非 `children.pop()` |
-| `python/sglang/srt/mem_cache/hiradix_cache.py:1163` | `prefetch_from_storage()` — 从 SSD 预取 KVCache 到 Host DRAM | 当前为死代码（Ghost Node 导致），修复后可激活 |
-| `python/sglang/srt/mem_cache/radix_cache.py` | RadixTree 基类 — `match_prefix()` 前缀匹配逻辑 | 需扩展以识别 Ghost Node 并触发 storage prefetch |
+| `python/sglang/srt/mem_cache/hiradix_cache.py` | HiRadixCache 核心 — GPU/Host/Storage 三级 RadixTree 缓存 | `evict_host()` (L891) 仍用 `children.pop()` (L916) 删除节点；**无需** Ghost Node 改造 — 取回不依赖 RadixTree 残留节点 |
+| `python/sglang/srt/mem_cache/hiradix_cache.py:1264` | `prefetch_from_storage()` — 从 SSD/DRAM 预取 KVCache 到 Host DRAM | **已激活**（Issue #4 修复后）；通过 `token_ids` 重算 prefix-hash 链去 Mooncake 查询 |
+| `python/sglang/srt/mem_cache/radix_cache.py` | RadixTree 基类 — `match_prefix()` 前缀匹配逻辑 | 无需改动 — prefetch 触发不依赖 `match_prefix()` 命中残留节点（见 §3.1） |
 
 ### 2.2 MooncakeStore 存储后端
 
@@ -53,24 +53,38 @@ SGLang 是 LLM 推理框架，在 Flat Memory 项目中承担：
 
 | 文件 | 说明 |
 |------|------|
-| `python/sglang/srt/managers/scheduler.py:1656` | `_prefetch_kvcache()` — 预取触发入口，检查 `req.last_node.backuped` |
+| `python/sglang/srt/managers/scheduler.py:1656` | `_prefetch_kvcache()` — 预取触发入口 |
+| `python/sglang/srt/managers/scheduler.py:1671` | 触发条件 `req.last_node.backuped or req.last_node is root_node` — root 分支从 `token_ids` 重算 hash 链（PR #19663），即使节点被 `children.pop()` 删光仍能触发 |
 
 ---
 
 ## 3. 已知问题 (Flat Memory 相关)
 
-### 3.1 Ghost Node 问题 (P0)
+### 3.1 Ghost Node 问题 (P0) — ✅ 已修复（通过 PR #19663 root_node 特判，非 Ghost Node 改造）
 
-**根因:** `hiradix_cache.py` 的 `evict_host()` 使用 `children.pop(key)` 从 RadixTree 中彻底删除已驱逐节点。
+**原始根因:** `hiradix_cache.py` 的 `evict_host()` (L891) 使用 `children.pop(key)` (L916) 从 RadixTree 中彻底删除已驱逐节点，导致 `_prefetch_kvcache()` 的旧触发条件 `req.last_node.backuped` 永远为 False。
 
-**影响:** SSD 中的 KVCache 永远无法被 `match_prefix()` 发现，`cached_tokens_storage` 始终为 0。
+**原始影响:** SSD/DRAM 中的 KVCache 无法被取回，`cached_tokens_storage` 始终为 0。
 
-**修复方案:** 将 `children.pop(key)` 替换为 Ghost Node 标记（保留节点、清空数据引用），使 `match_prefix()` 能匹配到 Ghost 节点并触发 `prefetch_from_storage()`。
+**实际修复方案（已落地）:** **保留 `children.pop()` 不动**，改为在触发条件上加 root_node 特判（`scheduler.py:1671`，上游 PR #19663）：
+
+```python
+# scheduler.py:1671
+if req.last_node.backuped or req.last_node is self.tree_cache.root_node:
+    # root 分支：节点被 evict 删光后 last_node 退化为 root，
+    # 此时从 req.fill_ids (token_ids) 重算 SHA256 prefix-hash 链去 Mooncake 查询
+    last_hash = req.last_host_node.get_last_hash_value()
+    ...
+    self.tree_cache.prefetch_from_storage(req.rid, req.last_host_node,
+                                          new_input_tokens, last_hash, ...)
+```
+
+**关键认知:** KVCache 取回**不依赖 RadixTree 是否残留节点**，而是靠 **prefix hash**：SGLang 用 token_ids 重算 hash → Mooncake Master 用该 hash 查询 → `is_local_disk_replica()` 决定从 **mooncake-DRAM**（RDMA 直读）还是 **mooncake-SSD**（RPC + preadv + RDMA 取回）读取。因此原先设想的「Ghost Node 标记 + 扩展 `match_prefix()`」方案**没有采用、也不需要**。
 
 **关键代码位置:**
-- `evict_host()`: L839-871 — 修改为 Ghost Node 标记
-- `match_prefix()`: 需扩展识别 Ghost Node
-- `_prefetch_kvcache()`: L1656 — 已有预取逻辑，修复后自动激活
+- `scheduler.py:1671` — 修复点（root_node 特判）
+- `evict_host()`: L891-925 — 维持 `children.pop()` 原样
+- `prefetch_from_storage()`: hiradix_cache.py:1264 — 修复后已激活
 
 ### 3.2 Duplicate DRAM 问题 (P0)
 
@@ -85,9 +99,12 @@ SGLang 是 LLM 推理框架，在 Flat Memory 项目中承担：
 ```
 L1 (GPU HBM)   — RadixTree 索引（hiradix_cache.py）
 L2 (Host DRAM)  — RadixTree 索引（与 L1 共用同一棵树）
-L3 (SSD)        — Prefix Hash 索引（Mooncake Master 维护）
+L3 (SSD/DRAM)   — Prefix Hash 索引（Mooncake Master 维护）
 
-当前问题: evict_host() 的 children.pop() 导致 L1/L2 RadixTree 与 L3 Prefix Hash 断裂
+L1/L2 与 L3 的衔接（已修复，§3.1）:
+  evict_host() 的 children.pop() 仍会清空 L1/L2 RadixTree 节点，
+  但取回不依赖残留节点 —— scheduler.py:1671 在 last_node==root 时
+  从 token_ids 重算 prefix-hash 链，直接用 hash 查询 L3，打通 L1/L2 → L3。
 ```
 
 ---

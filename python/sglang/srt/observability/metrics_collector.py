@@ -2027,6 +2027,11 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
             self._log_histogram(self.histogram_prefetch_bandwidth, v)
         for v in storage_metrics.backup_bandwidth:
             self._log_histogram(self.histogram_backup_bandwidth, v)
+        logger.debug(
+            "Storage bandwidth samples: backup=%d, prefetch=%d",
+            len(storage_metrics.backup_bandwidth),
+            len(storage_metrics.prefetch_bandwidth),
+        )
 
 
 class ExpertDispatchCollector(_StatLoggerDIMixin):

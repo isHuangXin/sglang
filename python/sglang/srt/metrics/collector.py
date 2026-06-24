@@ -1403,6 +1403,8 @@ class StorageMetrics:
     backup_pgs: List[int] = field(default_factory=list)
     prefetch_bandwidth: List[float] = field(default_factory=list)
     backup_bandwidth: List[float] = field(default_factory=list)
+    # FLAT_MEMORY: C++ level per-backend bandwidth report
+    flat_memory_bandwidth: Optional[Dict[str, Any]] = None
 
 
 class StorageMetricsCollector:
@@ -1506,6 +1508,85 @@ class StorageMetricsCollector:
             labelnames=labels.keys(),
         )
 
+        # FLAT_MEMORY: C++ level per-backend bandwidth gauges
+        from prometheus_client import Gauge
+
+        self.flat_memory_dram_write_bw = Gauge(
+            name="sglang:flat_memory_dram_write_bw_gbps",
+            documentation="Flat Memory DRAM write bandwidth (GB/s).",
+            labelnames=labels.keys(),
+        )
+        self.flat_memory_dram_read_bw = Gauge(
+            name="sglang:flat_memory_dram_read_bw_gbps",
+            documentation="Flat Memory DRAM read bandwidth (GB/s).",
+            labelnames=labels.keys(),
+        )
+        self.flat_memory_ssd_write_bw = Gauge(
+            name="sglang:flat_memory_ssd_write_bw_gbps",
+            documentation="Flat Memory SSD write bandwidth (GB/s).",
+            labelnames=labels.keys(),
+        )
+        self.flat_memory_ssd_read_bw = Gauge(
+            name="sglang:flat_memory_ssd_read_bw_gbps",
+            documentation="Flat Memory SSD read bandwidth (GB/s).",
+            labelnames=labels.keys(),
+        )
+        self.flat_memory_dram_write_bytes = Gauge(
+            name="sglang:flat_memory_dram_write_total_bytes",
+            documentation="Flat Memory total bytes written to DRAM.",
+            labelnames=labels.keys(),
+        )
+        self.flat_memory_dram_read_bytes = Gauge(
+            name="sglang:flat_memory_dram_read_total_bytes",
+            documentation="Flat Memory total bytes read from DRAM.",
+            labelnames=labels.keys(),
+        )
+        self.flat_memory_ssd_write_bytes = Gauge(
+            name="sglang:flat_memory_ssd_write_total_bytes",
+            documentation="Flat Memory total bytes written to SSD.",
+            labelnames=labels.keys(),
+        )
+        self.flat_memory_ssd_read_bytes = Gauge(
+            name="sglang:flat_memory_ssd_read_total_bytes",
+            documentation="Flat Memory total bytes read from SSD.",
+            labelnames=labels.keys(),
+        )
+        self.flat_memory_dram_write_ops = Gauge(
+            name="sglang:flat_memory_dram_write_ops",
+            documentation="Flat Memory DRAM write operation count.",
+            labelnames=labels.keys(),
+        )
+        self.flat_memory_dram_read_ops = Gauge(
+            name="sglang:flat_memory_dram_read_ops",
+            documentation="Flat Memory DRAM read operation count.",
+            labelnames=labels.keys(),
+        )
+        self.flat_memory_ssd_write_ops = Gauge(
+            name="sglang:flat_memory_ssd_write_ops",
+            documentation="Flat Memory SSD write operation count.",
+            labelnames=labels.keys(),
+        )
+        self.flat_memory_ssd_read_ops = Gauge(
+            name="sglang:flat_memory_ssd_read_ops",
+            documentation="Flat Memory SSD read operation count.",
+            labelnames=labels.keys(),
+        )
+        self.flat_memory_dram_used_bytes = Gauge(
+            name="sglang:flat_memory_dram_used_bytes",
+            documentation="Flat Memory DRAM used bytes.",
+            labelnames=labels.keys(),
+        )
+        self.flat_memory_ssd_used_bytes = Gauge(
+            name="sglang:flat_memory_ssd_used_bytes",
+            documentation="Flat Memory SSD used bytes.",
+            labelnames=labels.keys(),
+        )
+        self.flat_memory_total_blocks = Gauge(
+            name="sglang:flat_memory_total_blocks",
+            documentation="Flat Memory total stored blocks.",
+            labelnames=labels.keys(),
+        )
+
     def log_prefetched_tokens(self, prefetched_tokens: int):
         if prefetched_tokens > 0:
             self.prefetched_tokens_total.labels(**self.labels).inc(prefetched_tokens)
@@ -1559,6 +1640,25 @@ class StorageMetricsCollector:
                 f"[BANDWIDTH-DEBUG] log_storage_metrics: observed {n_backup} backup_bw, "
                 f"{n_prefetch} prefetch_bw samples into Prometheus"
             )
+
+        # FLAT_MEMORY: Update C++ bandwidth gauges if available
+        if storage_metrics.flat_memory_bandwidth is not None:
+            bw = storage_metrics.flat_memory_bandwidth
+            self.flat_memory_dram_write_bw.labels(**self.labels).set(bw.get("dram_write_bw_gbps", 0))
+            self.flat_memory_dram_read_bw.labels(**self.labels).set(bw.get("dram_read_bw_gbps", 0))
+            self.flat_memory_ssd_write_bw.labels(**self.labels).set(bw.get("ssd_write_bw_gbps", 0))
+            self.flat_memory_ssd_read_bw.labels(**self.labels).set(bw.get("ssd_read_bw_gbps", 0))
+            self.flat_memory_dram_write_bytes.labels(**self.labels).set(bw.get("dram_write_total_bytes", 0))
+            self.flat_memory_dram_read_bytes.labels(**self.labels).set(bw.get("dram_read_total_bytes", 0))
+            self.flat_memory_ssd_write_bytes.labels(**self.labels).set(bw.get("ssd_write_total_bytes", 0))
+            self.flat_memory_ssd_read_bytes.labels(**self.labels).set(bw.get("ssd_read_total_bytes", 0))
+            self.flat_memory_dram_write_ops.labels(**self.labels).set(bw.get("dram_write_count", 0))
+            self.flat_memory_dram_read_ops.labels(**self.labels).set(bw.get("dram_read_count", 0))
+            self.flat_memory_ssd_write_ops.labels(**self.labels).set(bw.get("ssd_write_count", 0))
+            self.flat_memory_ssd_read_ops.labels(**self.labels).set(bw.get("ssd_read_count", 0))
+            self.flat_memory_dram_used_bytes.labels(**self.labels).set(bw.get("dram_used_bytes", 0))
+            self.flat_memory_ssd_used_bytes.labels(**self.labels).set(bw.get("ssd_used_bytes", 0))
+            self.flat_memory_total_blocks.labels(**self.labels).set(bw.get("total_blocks", 0))
 
 
 class ExpertDispatchCollector:

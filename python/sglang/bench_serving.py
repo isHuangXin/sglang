@@ -2208,6 +2208,76 @@ def fetch_sglang_bandwidth_metrics(
     return result
 
 
+def fetch_flat_memory_metrics(
+    prefill_host: str = "localhost",
+    prefill_port: int = 30010,
+    timeout: float = 5.0,
+) -> dict:
+    """Fetch Flat Memory System per-backend bandwidth and storage metrics from SGLang Prometheus endpoint.
+
+    Parses Prometheus gauge metrics:
+      - sglang:flat_memory_dram_write_bw_gbps
+      - sglang:flat_memory_dram_read_bw_gbps
+      - sglang:flat_memory_ssd_write_bw_gbps
+      - sglang:flat_memory_ssd_read_bw_gbps
+      - sglang:flat_memory_dram_write_total_bytes
+      - sglang:flat_memory_dram_read_total_bytes
+      - sglang:flat_memory_ssd_write_total_bytes
+      - sglang:flat_memory_ssd_read_total_bytes
+      - sglang:flat_memory_dram_write_ops
+      - sglang:flat_memory_dram_read_ops
+      - sglang:flat_memory_ssd_write_ops
+      - sglang:flat_memory_ssd_read_ops
+      - sglang:flat_memory_dram_used_bytes
+      - sglang:flat_memory_ssd_used_bytes
+      - sglang:flat_memory_total_blocks
+
+    Returns dict with parsed values. Returns empty dict on failure.
+    """
+    import re
+
+    url = f"http://{prefill_host}:{prefill_port}/metrics"
+    try:
+        resp = requests.get(url, timeout=timeout)
+        resp.raise_for_status()
+    except Exception as e:
+        print(f"[Warning] Failed to fetch Flat Memory metrics from {url}: {e}")
+        return {}
+
+    text = resp.text
+    result = {}
+
+    # Parse Prometheus gauge format: metric_name{labels} value
+    gauge_names = [
+        "sglang:flat_memory_dram_write_bw_gbps",
+        "sglang:flat_memory_dram_read_bw_gbps",
+        "sglang:flat_memory_ssd_write_bw_gbps",
+        "sglang:flat_memory_ssd_read_bw_gbps",
+        "sglang:flat_memory_dram_write_total_bytes",
+        "sglang:flat_memory_dram_read_total_bytes",
+        "sglang:flat_memory_ssd_write_total_bytes",
+        "sglang:flat_memory_ssd_read_total_bytes",
+        "sglang:flat_memory_dram_write_ops",
+        "sglang:flat_memory_dram_read_ops",
+        "sglang:flat_memory_ssd_write_ops",
+        "sglang:flat_memory_ssd_read_ops",
+        "sglang:flat_memory_dram_used_bytes",
+        "sglang:flat_memory_ssd_used_bytes",
+        "sglang:flat_memory_total_blocks",
+    ]
+
+    for metric_name in gauge_names:
+        # Match: metric_name{...} value  OR  metric_name value
+        pattern = rf'^{re.escape(metric_name)}\b[^\n]*?\s+([\d.eE+\-]+)'
+        match = re.search(pattern, text, re.MULTILINE)
+        if match:
+            # Strip the "sglang:flat_memory_" prefix for the result key
+            short_name = metric_name.replace("sglang:flat_memory_", "")
+            result[short_name] = float(match.group(1))
+
+    return result
+
+
 def calculate_metrics(
     input_requests: Optional[List[DatasetRow]],
     outputs: List[RequestFuncOutput],
@@ -2857,6 +2927,82 @@ async def benchmark(
                     "Read batch count:",
                     bandwidth_metrics["prefetch_bandwidth_count"]
                 ))
+    # Fetch and print Flat Memory System per-backend stats
+    flat_memory_metrics = {}
+    fm_host = getattr(args, 'prefill_metrics_host', None)
+    if fm_host:
+        flat_memory_metrics = fetch_flat_memory_metrics(
+            prefill_host=fm_host,
+            prefill_port=getattr(args, 'prefill_metrics_port', 30000),
+        )
+    if flat_memory_metrics:
+        print("{s:{c}^{n}}".format(s="Flat Memory System Statistics", n=50, c="-"))
+        # Storage usage
+        dram_used = flat_memory_metrics.get("dram_used_bytes", 0)
+        ssd_used = flat_memory_metrics.get("ssd_used_bytes", 0)
+        total_blocks = int(flat_memory_metrics.get("total_blocks", 0))
+        if dram_used > 0 or ssd_used > 0:
+            print("{:<40} {:<10.2f}".format(
+                "DRAM used (GB):", dram_used / (1024**3)
+            ))
+            print("{:<40} {:<10.2f}".format(
+                "SSD used (GB):", ssd_used / (1024**3)
+            ))
+            print("{:<40} {:<10}".format(
+                "Total blocks stored:", total_blocks
+            ))
+        # DRAM bandwidth
+        dram_write_bw = flat_memory_metrics.get("dram_write_bw_gbps", 0)
+        dram_read_bw = flat_memory_metrics.get("dram_read_bw_gbps", 0)
+        dram_write_ops = int(flat_memory_metrics.get("dram_write_ops", 0))
+        dram_read_ops = int(flat_memory_metrics.get("dram_read_ops", 0))
+        dram_write_bytes = flat_memory_metrics.get("dram_write_total_bytes", 0)
+        dram_read_bytes = flat_memory_metrics.get("dram_read_total_bytes", 0)
+        if dram_write_ops > 0 or dram_read_ops > 0:
+            print("{:<40} {:<10.2f}".format(
+                "DRAM write bandwidth (GB/s):", dram_write_bw
+            ))
+            print("{:<40} {:<10}".format(
+                "DRAM write ops:", dram_write_ops
+            ))
+            print("{:<40} {:<10.2f}".format(
+                "DRAM write total (GB):", dram_write_bytes / (1024**3)
+            ))
+            print("{:<40} {:<10.2f}".format(
+                "DRAM read bandwidth (GB/s):", dram_read_bw
+            ))
+            print("{:<40} {:<10}".format(
+                "DRAM read ops:", dram_read_ops
+            ))
+            print("{:<40} {:<10.2f}".format(
+                "DRAM read total (GB):", dram_read_bytes / (1024**3)
+            ))
+        # SSD bandwidth
+        ssd_write_bw = flat_memory_metrics.get("ssd_write_bw_gbps", 0)
+        ssd_read_bw = flat_memory_metrics.get("ssd_read_bw_gbps", 0)
+        ssd_write_ops = int(flat_memory_metrics.get("ssd_write_ops", 0))
+        ssd_read_ops = int(flat_memory_metrics.get("ssd_read_ops", 0))
+        ssd_write_bytes = flat_memory_metrics.get("ssd_write_total_bytes", 0)
+        ssd_read_bytes = flat_memory_metrics.get("ssd_read_total_bytes", 0)
+        if ssd_write_ops > 0 or ssd_read_ops > 0:
+            print("{:<40} {:<10.2f}".format(
+                "SSD write bandwidth (GB/s):", ssd_write_bw
+            ))
+            print("{:<40} {:<10}".format(
+                "SSD write ops:", ssd_write_ops
+            ))
+            print("{:<40} {:<10.2f}".format(
+                "SSD write total (GB):", ssd_write_bytes / (1024**3)
+            ))
+            print("{:<40} {:<10.2f}".format(
+                "SSD read bandwidth (GB/s):", ssd_read_bw
+            ))
+            print("{:<40} {:<10}".format(
+                "SSD read ops:", ssd_read_ops
+            ))
+            print("{:<40} {:<10.2f}".format(
+                "SSD read total (GB):", ssd_read_bytes / (1024**3)
+            ))
     if accept_length:
         print("{:<40} {:<10.2f}".format("Accept length:", accept_length))
     print("{s:{c}^{n}}".format(s="End-to-End Latency", n=50, c="-"))
@@ -2965,6 +3111,8 @@ async def benchmark(
             "mooncake_eviction": mooncake_eviction if mooncake_eviction else {},
             # KVCache transfer bandwidth
             "kvcache_bandwidth": bandwidth_metrics if bandwidth_metrics else {},
+            # Flat Memory System per-backend stats
+            "flat_memory": flat_memory_metrics if flat_memory_metrics else {},
         }
     else:
         print(f"Error running benchmark for request rate: {request_rate}")

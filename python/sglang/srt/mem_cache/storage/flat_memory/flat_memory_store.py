@@ -312,4 +312,27 @@ class FlatMemoryStore(HiCacheStorage):
         self.backup_pgs.clear()
         self.prefetch_bandwidth.clear()
         self.backup_bandwidth.clear()
+        # FLAT_MEMORY: Include C++ level bandwidth report + storage usage for Prometheus
+        bw_report = self.manager.get_bandwidth_report()
+        stats = self.manager.get_stats()
+        bw_report["dram_used_bytes"] = stats.get("dram_used", 0)
+        bw_report["ssd_used_bytes"] = stats.get("ssd_used", 0)
+        bw_report["total_blocks"] = stats.get("total_blocks", 0)
+        storage_metrics.flat_memory_bandwidth = bw_report
         return storage_metrics
+
+    # ---- Flat Memory specific stats (exposed via HTTP endpoint) ----
+
+    def get_flat_memory_stats(self) -> Dict[str, Any]:
+        """Return comprehensive Flat Memory statistics including bandwidth report.
+
+        Used by bench_serving to display per-backend throughput at the end of a run.
+        """
+        storage_stats = self.manager.get_stats()
+        bandwidth_report = self.manager.get_bandwidth_report()
+        return {
+            # Storage capacity / usage
+            "storage": storage_stats,
+            # Per-backend bandwidth (from C++ atomic counters)
+            "bandwidth": bandwidth_report,
+        }

@@ -381,8 +381,11 @@ class HiCacheController:
                 self.prefetch_queue.put_nowait(None)
             if hasattr(self, "backup_queue"):
                 self.backup_queue.put_nowait(None)
+            # FLAT_MEMORY: wake all IO workers (each may be blocked on prefetch_buffer)
             if hasattr(self, "prefetch_buffer"):
-                self.prefetch_buffer.put_nowait(None)
+                num_io_workers = len(getattr(self, "prefetch_io_aux_threads", []))
+                for _ in range(max(num_io_workers, 1)):
+                    self.prefetch_buffer.put_nowait(None)
         except Exception:
             pass
 
@@ -392,7 +395,10 @@ class HiCacheController:
             threads.append(self.prefetch_thread)
         if hasattr(self, "backup_thread"):
             threads.append(self.backup_thread)
-        if hasattr(self, "prefetch_io_aux_thread"):
+        # FLAT_MEMORY: join all prefetch IO aux threads (may be 1 or N)
+        if hasattr(self, "prefetch_io_aux_threads"):
+            threads.extend(self.prefetch_io_aux_threads)
+        elif hasattr(self, "prefetch_io_aux_thread"):
             threads.append(self.prefetch_io_aux_thread)
 
         for t in threads:
@@ -467,8 +473,28 @@ class HiCacheController:
             self.prefetch_capacity_limit = max(
                 0, int(0.8 * (self.mem_pool_host.size - self.mem_pool_device.size))
             )
-            # granularity of batch storage IO operations, in number of pages
-            self.storage_batch_size = 128
+            # FLAT_MEMORY: Separate read and write batch sizes.
+            # - READ batch size: large (8192) so C++ BatchReadByKeys sees all ~15 buckets
+            #   in a single call, enabling parallel pread via io_pool_ (4-5 GB/s).
+            # - WRITE batch size: small (512) so each batch_set_v1 call creates a small
+            #   bucket file (~32-64MB), matching Mooncake's design of many small files.
+            # Other backends use the same batch size for both read and write.
+            if self.storage_backend_type == "flat_memory":
+                self.storage_batch_size = int(
+                    os.environ.get("SGLANG_STORAGE_READ_BATCH_SIZE", "8192")
+                )
+                self.storage_write_batch_size = int(
+                    os.environ.get("SGLANG_STORAGE_WRITE_BATCH_SIZE", "512")
+                )
+            else:
+                self.storage_batch_size = int(
+                    os.environ.get("SGLANG_STORAGE_BATCH_SIZE", "512")
+                )
+                self.storage_write_batch_size = self.storage_batch_size
+            logger.info(
+                f"Storage batch size: read={self.storage_batch_size}, write={self.storage_write_batch_size} pages "
+                f"(backend={self.storage_backend_type})"
+            )
             # tracking the number of tokens locked in prefetching, updated by the main scheduler thread
             self.prefetch_tokens_occupied = 0
 
@@ -624,6 +650,10 @@ class HiCacheController:
         if self.enable_storage:
             self.prefetch_thread.join()
             self.backup_thread.join()
+            # FLAT_MEMORY: join all prefetch IO aux threads
+            if hasattr(self, "prefetch_io_aux_threads"):
+                for t in self.prefetch_io_aux_threads:
+                    t.join(timeout=10)
             self.prefetch_queue.queue.clear()
             self.backup_queue.queue.clear()
             self.prefetch_revoke_queue.queue.clear()
@@ -982,10 +1012,26 @@ class HiCacheController:
         self.storage_prefetch_queries = 0
         self.storage_prefetch_hits = 0
         self.storage_prefetch_tokens_hit = 0
-        self.prefetch_io_aux_thread = threading.Thread(
-            target=self.prefetch_io_aux_func, daemon=True
+        # FLAT_MEMORY: spawn multiple IO workers for parallel SSD prefetch reads.
+        # With a single worker (upstream default), concurrent prefetch requests
+        # serialize through one thread — each request waits behind the previous
+        # one's full SSD read (~1.8 GB per request @ 128 KB/token × 7168 tokens).
+        # Multiple workers allow io_uring to serve reads from different requests
+        # in parallel, reducing per-request SSD→Host latency proportionally.
+        num_io_workers = int(os.environ.get("SGLANG_PREFETCH_IO_WORKERS", "4"))
+        self.prefetch_io_aux_threads = []
+        for i in range(num_io_workers):
+            t = threading.Thread(
+                target=self.prefetch_io_aux_func,
+                daemon=True,
+                name=f"prefetch-io-{i}",
+            )
+            t.start()
+            self.prefetch_io_aux_threads.append(t)
+        logger.info(
+            f"[PREFETCH] Started {num_io_workers} prefetch IO workers "
+            f"(env SGLANG_PREFETCH_IO_WORKERS={num_io_workers})"
         )
-        self.prefetch_io_aux_thread.start()
         while (not self.storage_stop_event.is_set()) or not self.prefetch_queue.empty():
             try:
                 operation = self.prefetch_queue.get(block=True, timeout=1)
@@ -1074,14 +1120,18 @@ class HiCacheController:
     # Backup batch by batch
     def _page_backup(self, operation):
         # Backup batch by batch
+        # FLAT_MEMORY: Use storage_write_batch_size (512) for writes to keep bucket
+        # files small (~32-64MB each), matching Mooncake's design. The read path uses
+        # the larger storage_batch_size (8192) for parallel SSD reads.
         prefix_keys = operation.prefix_keys
+        write_batch_size = self.storage_write_batch_size
         logger.info(
             f"[PREFETCH-DEBUG] _page_backup: n_hashes={len(operation.hash_value)}, "
             f"first_hash={operation.hash_value[0][:16] if operation.hash_value else 'EMPTY'}, "
-            f"host_indices_len={len(operation.host_indices)}"
+            f"host_indices_len={len(operation.host_indices)}, write_batch_size={write_batch_size}"
         )
-        for i in range(0, len(operation.hash_value), self.storage_batch_size):
-            batch_hashes = operation.hash_value[i : i + self.storage_batch_size]
+        for i in range(0, len(operation.hash_value), write_batch_size):
+            batch_hashes = operation.hash_value[i : i + write_batch_size]
             batch_host_indices = operation.host_indices[
                 i * self.page_size : (i + len(batch_hashes)) * self.page_size
             ]

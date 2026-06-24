@@ -17,6 +17,9 @@ limitations under the License.
 import logging
 import threading
 import time
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
+from contextlib import contextmanager
 from dataclasses import dataclass
 from queue import Empty, Queue
 from typing import TYPE_CHECKING, Callable, List, NamedTuple, Optional
@@ -215,6 +218,32 @@ class PrefetchAck:
     # Number of hits in extra pools.
     pool_hits: Optional[dict[str, int]] = None
     completed_req: Optional[bool] = None
+
+
+class _OrderedPrefetchAckQueue(Queue):
+    # FLAT_MEMORY: Worker-local ACKs must reach TP collectives in operation order.
+    def __init__(self):
+        super().__init__()
+        self._local = threading.local()
+
+    @contextmanager
+    def capture(self, *, streaming=False):
+        acks = []
+        self._local.capture = (acks, streaming)
+        try:
+            yield acks
+        finally:
+            del self._local.capture
+
+    def put(self, item, block=True, timeout=None):
+        capture = getattr(self._local, "capture", None)
+        if capture is not None:
+            acks, streaming = capture
+            acks.append(item)
+            if not streaming:
+                return
+        super().put(item, block=block, timeout=timeout)
+
 
 
 class StorageOperation:
@@ -468,7 +497,7 @@ class HiCacheController:
         self.pending_backup_count = 0
         self.pending_backup_lock = threading.Lock()
         self.prefetch_buffer = Queue()
-        self.prefetch_sync_queue = Queue()
+        self.prefetch_sync_queue = _OrderedPrefetchAckQueue()
         self.prefetch_hit_queue = Queue()
         self.ack_prefetch_queue = Queue()
         self.ack_backup_queue = Queue()
@@ -597,6 +626,13 @@ class HiCacheController:
                 self.prefetch_capacity_limit = int(0.5 * self.mem_pool_host.size)
             # tracking the number of tokens locked in prefetching, updated by the main scheduler thread
             self.prefetch_tokens_occupied = 0
+            if self.storage_backend_type == "flat_memory":
+                self.storage_batch_size = envs.SGLANG_STORAGE_READ_BATCH_SIZE.get()
+                self.storage_write_batch_size = envs.SGLANG_STORAGE_WRITE_BATCH_SIZE.get()
+            else:
+                self.storage_batch_size = envs.SGLANG_STORAGE_BATCH_SIZE.get()
+                self.storage_write_batch_size = self.storage_batch_size
+            self.prefetch_io_workers = envs.SGLANG_PREFETCH_IO_WORKERS.get()
 
             # Use dedicated gloo groups so storage prefetch sync is isolated
             # from other collectives and consistent across CPxTP participants.
@@ -1064,14 +1100,14 @@ class HiCacheController:
         ]
         all_success = True
         completed_pages = 0
-        for i in range(0, len(operation.hash_value), STORAGE_BATCH_SIZE):
+        for i in range(0, len(operation.hash_value), self.storage_batch_size):
             # When an error is occurred, we should keep looping and produce the same number of
             # PrefetchAck as other ranks do, because prefetch_sync_thread (i.e. consumer of
             # prefetch_sync_queue) perform reduce on the results.  This is so tricky.
             if all_success and operation.is_terminated():
                 all_success = False
             if all_success:
-                batch_hashes = operation.hash_value[i : i + STORAGE_BATCH_SIZE]
+                batch_hashes = operation.hash_value[i : i + self.storage_batch_size]
                 batch_host_indices = operation.host_indices[
                     i * self.page_size : (i + len(batch_hashes)) * self.page_size
                 ]
@@ -1140,25 +1176,34 @@ class HiCacheController:
         return min([kv_hits, *sidecar_hits.values()])
 
     def prefetch_io_aux_func(self):
-        """
-        Auxiliary function conducting IO operations for prefetching.
-        """
-        while not self.storage_stop_event.is_set():
-            try:
-                operation = self.prefetch_buffer.get(block=True, timeout=1)
-                if operation is None:
-                    continue
-                self._page_transfer(operation)
+        pending = deque()
+        with ThreadPoolExecutor(max_workers=self.prefetch_io_workers) as executor:
+            while not self.storage_stop_event.is_set() or pending:
+                if not self.storage_stop_event.is_set() and len(pending) < 2 * self.prefetch_io_workers:
+                    try:
+                        operation = self.prefetch_buffer.get(timeout=0.01)
+                        if operation is not None:
+                            pending.append(executor.submit(self._read_prefetch_acks, operation))
+                    except Empty:
+                        pass
+                if pending:
+                    try:
+                        acks = pending[0].result(timeout=0.01)
+                    except FutureTimeoutError:
+                        if not pending[0].done():
+                            continue
+                        raise
+                    pending.popleft()
+                    for ack in acks:
+                        self.prefetch_sync_queue.put(ack)
 
-                self.prefetch_sync_queue.put(
-                    PrefetchAck(
-                        rid=operation.request_id,
-                        completed_req=True,
-                        operation=operation,
-                    )
-                )
-            except Empty:
-                continue
+    def _read_prefetch_acks(self, operation):
+        with self.prefetch_sync_queue.capture() as acks:
+            self._page_transfer(operation)
+            self.prefetch_sync_queue.put(
+                PrefetchAck(rid=operation.request_id, completed_req=True, operation=operation)
+            )
+        return acks
 
     def prefetch_rate_limited(self) -> bool:
         """
@@ -1192,8 +1237,8 @@ class HiCacheController:
         )
         operation.all_hash_values = page_hashes
 
-        for start in range(0, len(page_hashes), STORAGE_BATCH_SIZE):
-            batch_hashes = page_hashes[start : start + STORAGE_BATCH_SIZE]
+        for start in range(0, len(page_hashes), self.storage_batch_size):
+            batch_hashes = page_hashes[start : start + self.storage_batch_size]
             logger.debug("Storage prefix query: pages=%d", len(batch_hashes))
             extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
             hit_page_num = self.storage_backend.batch_exists(batch_hashes, extra_info)
@@ -1278,8 +1323,8 @@ class HiCacheController:
     def _page_backup(self, operation):
         # Backup batch by batch
         prefix_keys = operation.prefix_keys
-        for i in range(0, len(operation.hash_value), STORAGE_BATCH_SIZE):
-            batch_hashes = operation.hash_value[i : i + STORAGE_BATCH_SIZE]
+        for i in range(0, len(operation.hash_value), self.storage_write_batch_size):
+            batch_hashes = operation.hash_value[i : i + self.storage_write_batch_size]
             batch_host_indices = operation.host_indices[
                 i * self.page_size : (i + len(batch_hashes)) * self.page_size
             ]

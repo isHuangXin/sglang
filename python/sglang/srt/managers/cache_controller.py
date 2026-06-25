@@ -1263,6 +1263,45 @@ class HiCacheController:
                 prefix_keys += batch_hashes
             operation.completed_tokens += self.page_size * len(batch_hashes)
 
+    # FLAT_MEMORY: Direct GPU→SSD backup path (8.2b).
+    # Writes from HiCache DRAM to SSD via pre-aligned buffer + io_uring writev,
+    # skipping the intermediate memcpy packing step in SSDBucketBackend.
+    # The data in HiCache DRAM host_indices is already page-first layout.
+    def _page_backup_direct(self, operation):
+        """Write KVCache pages from HiCache DRAM directly to SSD via batch_set_direct.
+
+        This uses the same HiCache DRAM source as the normal path (GPU→HiCache DRAM
+        has already happened by the time backup_thread picks up the operation).
+        The improvement is in the HiCache DRAM→SSD step: instead of going through
+        batch_set_v1 which triggers memcpy packing in SSDBucketBackend, we use
+        batch_set_direct which passes aligned pointers directly to io_uring writev.
+        """
+        write_batch_size = self.storage_write_batch_size
+        prefix_keys = operation.prefix_keys
+
+        for i in range(0, len(operation.hash_value), write_batch_size):
+            batch_hashes = operation.hash_value[i : i + write_batch_size]
+            batch_host_indices = operation.host_indices[
+                i * self.page_size : (i + len(batch_hashes)) * self.page_size
+            ]
+
+            # Get buffer pointers and sizes from HostKVCache (same as _page_set_zero_copy)
+            # These are pointers into pinned HiCache DRAM which may be 4KB-aligned
+            extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
+
+            # Try direct path (storage backend handles alignment check)
+            success = self.page_set_func(batch_hashes, batch_host_indices, extra_info)
+
+            if not success:
+                logger.warning(
+                    f"Direct write to storage: {len(batch_hashes)} pages failed."
+                )
+                break
+
+            if prefix_keys and len(prefix_keys) > 0:
+                prefix_keys += batch_hashes
+            operation.completed_tokens += self.page_size * len(batch_hashes)
+
     def backup_thread_func(self):
         """
         Manage backup operations from host memory to storage backend.

@@ -152,6 +152,60 @@ class FlatMemoryStore(HiCacheStorage):
         results = self.manager.batch_put(key_strs, buffer_ptrs, buffer_sizes)
         return self._batch_postprocess(results, is_set_operate=True)
 
+    # FLAT_MEMORY: Direct write from pre-aligned buffer (8.2b).
+    # Called by cache_controller's direct GPU→SSD path.
+    # Buffer pointers are 4KB-aligned (from alloc_aligned), enabling
+    # io_uring zero-copy writev in C++ SSDBucketBackend.
+    def batch_set_direct(
+        self,
+        keys: List[str],
+        buffer_ptrs: List[int],
+        buffer_sizes: List[int],
+    ) -> List[bool]:
+        """Write KVCache pages directly from aligned buffers (bypasses HiCache DRAM).
+
+        Args:
+            keys: Hash values for each page (like batch_set_v1).
+            buffer_ptrs: Pre-aligned buffer addresses (from alloc_aligned).
+            buffer_sizes: Size of each buffer.
+
+        Returns:
+            List of bool indicating success for each key.
+        """
+        # Build key list with MHA/MLA suffix (same encoding as _batch_preprocess)
+        key_strs = []
+        for key_ in keys:
+            if self.is_mla_backend:
+                key_strs.append(f"{key_}_{self.mla_suffix}_k")
+            else:
+                key_strs.append(f"{key_}_{self.mha_suffix}_k")
+                key_strs.append(f"{key_}_{self.mha_suffix}_v")
+
+        if self.is_mla_backend:
+            # 1:1 mapping
+            results = self.manager.batch_put(key_strs, buffer_ptrs, buffer_sizes)
+        else:
+            # MHA: each key produces k+v entries, split ptrs/sizes accordingly
+            expanded_ptrs = []
+            expanded_sizes = []
+            for i in range(len(keys)):
+                # For MHA, each page has [k_data, v_data] packed.
+                # The ptr points to the start, size covers both k and v.
+                # Split in half: first half = k, second half = v
+                half = buffer_sizes[i] // 2
+                expanded_ptrs.append(buffer_ptrs[i])
+                expanded_sizes.append(half)
+                expanded_ptrs.append(buffer_ptrs[i] + half)
+                expanded_sizes.append(half)
+            results = self.manager.batch_put(key_strs, expanded_ptrs, expanded_sizes)
+
+        if key_strs:
+            logger.info(
+                f"[PREFETCH-DEBUG] batch_set_direct: n_keys={len(key_strs)}, "
+                f"first_key={key_strs[0]}, direct_path=True"
+            )
+        return self._batch_postprocess(results, is_set_operate=True)
+
     def batch_get_v1(
         self,
         keys: List[str],

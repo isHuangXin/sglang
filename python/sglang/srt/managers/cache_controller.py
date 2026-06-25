@@ -633,6 +633,7 @@ class HiCacheController:
                 self.storage_batch_size = envs.SGLANG_STORAGE_BATCH_SIZE.get()
                 self.storage_write_batch_size = self.storage_batch_size
             self.prefetch_io_workers = envs.SGLANG_PREFETCH_IO_WORKERS.get()
+            self.prefetch_query_workers = envs.SGLANG_PREFETCH_QUERY_WORKERS.get()
 
             # Use dedicated gloo groups so storage prefetch sync is isolated
             # from other collectives and consistent across CPxTP participants.
@@ -1252,25 +1253,29 @@ class HiCacheController:
         return hash_value, storage_query_count
 
     def prefetch_thread_func(self):
-        """
-        Manage prefetching operations from storage backend to host memory.
-        """
-        while (not self.storage_stop_event.is_set()) or not self.prefetch_queue.empty():
-            try:
-                operation = self.prefetch_queue.get(block=True, timeout=1)
-                if operation is None:
+        pending = deque()
+        with ThreadPoolExecutor(max_workers=self.prefetch_query_workers) as executor:
+            while not self.storage_stop_event.is_set() or pending:
+                if not self.storage_stop_event.is_set() and len(pending) < 2 * self.prefetch_query_workers:
+                    try:
+                        operation = self.prefetch_queue.get(timeout=0.01)
+                        if operation is not None:
+                            pending.append((operation, executor.submit(self._query_prefetch_local, operation)))
+                    except Empty:
+                        pass
+                if not pending:
                     continue
-                self.backup_idle_event.wait(timeout=10.0)
-                if operation.is_terminated():
-                    hash_value, storage_hit_count = [], 0
-                else:
-                    hash_value, storage_hit_count = self._storage_hit_query(operation)
-                storage_hit_count_tensor = torch.tensor(
-                    storage_hit_count, dtype=torch.int
-                )
+                operation, future = pending[0]
+                try:
+                    hash_value, storage_hit_count = future.result(timeout=0.01)
+                except FutureTimeoutError:
+                    if not future.done():
+                        continue
+                    raise
+                pending.popleft()
+                storage_hit_count_tensor = torch.tensor(storage_hit_count, dtype=torch.int)
                 self._all_reduce(
-                    storage_hit_count_tensor,
-                    torch.distributed.ReduceOp.MIN,
+                    storage_hit_count_tensor, torch.distributed.ReduceOp.MIN,
                     self.prefetch_hits_sync_groups,
                 )
                 storage_hit_count = storage_hit_count_tensor.item()
@@ -1278,17 +1283,15 @@ class HiCacheController:
                 if storage_hit_count >= self.prefetch_threshold:
                     self.storage_prefetch_hits += 1
                     self.storage_prefetch_tokens_hit += storage_hit_count
-
-                # Record the TP-synced hit count; the scheduler thread decides
-                # at drain time whether to revoke (below threshold) or allocate.
-                operation.hash_value = hash_value[
-                    : (storage_hit_count // self.page_size)
-                ]
+                operation.hash_value = hash_value[:storage_hit_count // self.page_size]
                 operation.storage_hit_count = storage_hit_count
                 self.prefetch_hit_queue.put(operation)
 
-            except Empty:
-                continue
+    def _query_prefetch_local(self, operation):
+        self.backup_idle_event.wait(timeout=10.0)
+        if operation.is_terminated():
+            return [], 0
+        return self._storage_hit_query(operation)
 
     def write_storage(
         self,

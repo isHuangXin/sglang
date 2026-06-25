@@ -232,6 +232,7 @@ class PrefetchOperation(StorageOperation):
         self._lock = threading.Lock()
         self._terminated_flag = False
         self.start_time = time.monotonic()
+        self.start_time_perf = time.perf_counter()  # FLAT_MEMORY: high-res timer for per-phase timing
 
         super().__init__(host_indices, token_ids, last_hash, prefix_keys=prefix_keys,
                          full_token_ids=full_token_ids)
@@ -902,10 +903,30 @@ class HiCacheController:
         """
         while not self.storage_stop_event.is_set():
             try:
+                t_io_dequeue = time.perf_counter()
                 operation = self.prefetch_buffer.get(block=True, timeout=1)
                 if operation is None:
                     continue
+                # FLAT_MEMORY: measure IO buffer queue wait
+                io_queue_wait_ms = (t_io_dequeue - operation.start_time_perf) * 1000 if hasattr(operation, 'start_time_perf') else -1
+
+                t_io_start = time.perf_counter()
                 self._page_transfer(operation)
+                t_io_end = time.perf_counter()
+                io_transfer_ms = (t_io_end - t_io_start) * 1000
+                total_elapsed_ms = (t_io_end - operation.start_time_perf) * 1000 if hasattr(operation, 'start_time_perf') else -1
+
+                # FLAT_MEMORY: log IO phase timing
+                if len(operation.hash_value) > 10:
+                    logger.info(
+                        f"[PREFETCH-TIMING] io_aux: req={operation.request_id[:8]}, "
+                        f"total_elapsed={total_elapsed_ms:.1f}ms, "
+                        f"io_queue_wait={io_queue_wait_ms:.1f}ms, "
+                        f"io_transfer={io_transfer_ms:.1f}ms, "
+                        f"pages={len(operation.hash_value)}, "
+                        f"completed={operation.completed_tokens}"
+                    )
+
                 # operation terminated by controller, release pre-allocated memory
                 self.append_host_mem_release(
                     operation.host_indices[operation.completed_tokens :]
@@ -930,6 +951,12 @@ class HiCacheController:
         storage_query_count = 0
         hash_value = []
 
+        # FLAT_MEMORY: per-phase timing instrumentation
+        t_hash_total = 0.0
+        t_exists_total = 0.0
+        n_hash_calls = 0
+        n_exists_calls = 0
+
         for start in range(
             0, len(tokens_to_fetch), self.page_size * self.storage_batch_size
         ):
@@ -938,19 +965,38 @@ class HiCacheController:
             )
             batch_tokens = tokens_to_fetch[start:end]
             batch_hashes = []
+            t0_hash = time.perf_counter()
             for i in range(0, len(batch_tokens), self.page_size):
                 last_hash = self.get_hash_str(
                     batch_tokens[i : i + self.page_size], last_hash
                 )
                 batch_hashes.append(last_hash)
+            t1_hash = time.perf_counter()
+            t_hash_total += (t1_hash - t0_hash)
+            n_hash_calls += len(batch_hashes)
+
+            t0_exists = time.perf_counter()
             extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
             hit_page_num = self.storage_backend.batch_exists(batch_hashes, extra_info)
+            t1_exists = time.perf_counter()
+            t_exists_total += (t1_exists - t0_exists)
+            n_exists_calls += len(batch_hashes)
+
             hash_value.extend(batch_hashes[:hit_page_num])
             storage_query_count += hit_page_num * self.page_size
             if hit_page_num < len(batch_hashes):
                 break
             if prefix_keys and len(prefix_keys) > 0:
                 prefix_keys += batch_hashes
+
+        # FLAT_MEMORY: log per-phase timing breakdown
+        if len(tokens_to_fetch) > 256:
+            logger.info(
+                f"[PREFETCH-TIMING] _do_storage_query: n_tokens={len(tokens_to_fetch)}, "
+                f"hash_compute={t_hash_total*1000:.1f}ms ({n_hash_calls} calls), "
+                f"batch_exists={t_exists_total*1000:.1f}ms ({n_exists_calls} keys), "
+                f"hit_count={storage_query_count}"
+            )
 
         return hash_value, storage_query_count
 
@@ -1006,19 +1052,22 @@ class HiCacheController:
 
     def prefetch_thread_func(self):
         """
-        Manage prefetching operations from storage backend to host memory.
+        Coordinator: sets up shared state, spawns query workers and IO workers.
+
+        FLAT_MEMORY: The original single-thread design is the #1 bottleneck.
+        Each storage query takes ~1s (hash + exists), so with concurrency=4,
+        requests queue behind each other adding 0-11s of wait.
+        Fix: spawn N query workers that pull from prefetch_queue in parallel.
         """
         self.prefetch_buffer = Queue()
         self.storage_prefetch_queries = 0
         self.storage_prefetch_hits = 0
         self.storage_prefetch_tokens_hit = 0
+        # FLAT_MEMORY: lock for shared stats counters across query workers
+        self._prefetch_stats_lock = threading.Lock()
+
         # FLAT_MEMORY: spawn multiple IO workers for parallel SSD prefetch reads.
-        # With a single worker (upstream default), concurrent prefetch requests
-        # serialize through one thread — each request waits behind the previous
-        # one's full SSD read (~1.8 GB per request @ 128 KB/token × 7168 tokens).
-        # Multiple workers allow io_uring to serve reads from different requests
-        # in parallel, reducing per-request SSD→Host latency proportionally.
-        num_io_workers = int(os.environ.get("SGLANG_PREFETCH_IO_WORKERS", "4"))
+        num_io_workers = int(os.environ.get("SGLANG_PREFETCH_IO_WORKERS", "8"))
         self.prefetch_io_aux_threads = []
         for i in range(num_io_workers):
             t = threading.Thread(
@@ -1028,20 +1077,76 @@ class HiCacheController:
             )
             t.start()
             self.prefetch_io_aux_threads.append(t)
+
+        # FLAT_MEMORY: spawn N query workers to parallelize hash+exists queries.
+        # Each query takes ~1s (SHA256 hash chain + batch_exists Python→C++ loop).
+        # With 1 worker and concurrency=4, average queue wait is 2.2s (max 11s).
+        # With 4 workers, queue wait drops to ~0.3s, cutting SSD→Host latency 5x.
+        num_query_workers = int(os.environ.get("SGLANG_PREFETCH_QUERY_WORKERS", "4"))
+        self.prefetch_query_threads = []
+        for i in range(num_query_workers):
+            t = threading.Thread(
+                target=self._prefetch_query_worker,
+                daemon=True,
+                name=f"prefetch-query-{i}",
+            )
+            t.start()
+            self.prefetch_query_threads.append(t)
+
         logger.info(
-            f"[PREFETCH] Started {num_io_workers} prefetch IO workers "
-            f"(env SGLANG_PREFETCH_IO_WORKERS={num_io_workers})"
+            f"[PREFETCH] Started {num_query_workers} prefetch query workers "
+            f"(env SGLANG_PREFETCH_QUERY_WORKERS) + "
+            f"{num_io_workers} IO workers (env SGLANG_PREFETCH_IO_WORKERS)"
         )
+
+        # Coordinator sleeps until stop; actual work is in query workers.
+        while not self.storage_stop_event.is_set():
+            self.storage_stop_event.wait(timeout=1)
+
+    def _prefetch_query_worker(self):
+        """
+        Worker thread: dequeue from prefetch_queue → hash+exists → prefetch_buffer.
+
+        FLAT_MEMORY: Multiple instances run in parallel to eliminate the
+        single-thread queuing bottleneck that dominated SSD→Host latency.
+        """
+        worker_name = threading.current_thread().name
         while (not self.storage_stop_event.is_set()) or not self.prefetch_queue.empty():
             try:
+                t_dequeue_start = time.perf_counter()
                 operation = self.prefetch_queue.get(block=True, timeout=1)
+                t_dequeue_end = time.perf_counter()
                 if operation is None:
                     continue
-                # Wait for any pending backup writes to complete before querying storage.
-                # Without this, prefetch queries race with backup writes and miss data
-                # that is still being written to storage, resulting in 0% cache hit rate.
-                self.backup_idle_event.wait(timeout=10.0)
+                # FLAT_MEMORY: measure queue wait time (from PrefetchOperation creation to dequeue)
+                queue_wait_ms = (t_dequeue_end - operation.start_time_perf) * 1000 if hasattr(operation, 'start_time_perf') else -1
+                # FLAT_MEMORY: Reduced backup wait timeout from 10s to 0.1s.
+                # Original 10s wait blocks ALL prefetch reads until ALL backup writes
+                # finish, adding ~2000ms to SSD→Host latency when concurrent writes
+                # are in flight. With Flat Memory's C++ BatchPutCoalesced(), data is
+                # visible in the block_index_ immediately after put() returns, and
+                # SSDBucketBackend's pending_ buffer handles reads of not-yet-flushed
+                # data. A short 100ms wait is sufficient to let the backup thread pick
+                # up new operations without starving prefetch reads.
+                t_backup_wait_start = time.perf_counter()
+                self.backup_idle_event.wait(timeout=0.1)
+                t_backup_wait_end = time.perf_counter()
+                backup_wait_ms = (t_backup_wait_end - t_backup_wait_start) * 1000
+
+                t_query_start = time.perf_counter()
                 hash_value, storage_hit_count = self._storage_hit_query(operation)
+                t_query_end = time.perf_counter()
+                query_ms = (t_query_end - t_query_start) * 1000
+
+                # FLAT_MEMORY: log per-phase timing for prefetch query worker
+                if len(operation.token_ids) > 256:
+                    logger.info(
+                        f"[PREFETCH-TIMING] {worker_name}: req={operation.request_id[:8]}, "
+                        f"queue_wait={queue_wait_ms:.1f}ms, "
+                        f"backup_wait={backup_wait_ms:.1f}ms, "
+                        f"storage_query={query_ms:.1f}ms, "
+                        f"hit_count={storage_hit_count}, n_tokens={len(operation.token_ids)}"
+                    )
                 logger.info(
                     f"[PREFETCH-DEBUG] storage_hit_query: req={operation.request_id[:8]}, "
                     f"hit_count={storage_hit_count}, threshold={self.prefetch_threshold}, "
@@ -1058,7 +1163,18 @@ class HiCacheController:
                     )
                     storage_hit_count = storage_hit_count_tensor.item()
 
-                self.storage_prefetch_queries += 1
+                # FLAT_MEMORY: thread-safe stats update
+                with self._prefetch_stats_lock:
+                    self.storage_prefetch_queries += 1
+                    local_queries = self.storage_prefetch_queries
+                    if storage_hit_count < self.prefetch_threshold:
+                        pass  # stats only, decision below
+                    else:
+                        self.storage_prefetch_hits += 1
+                        self.storage_prefetch_tokens_hit += storage_hit_count
+                        local_hits = self.storage_prefetch_hits
+                        local_tokens_hit = self.storage_prefetch_tokens_hit
+
                 if storage_hit_count < self.prefetch_threshold:
                     # not to prefetch if not enough benefits
                     self.prefetch_revoke_queue.put(operation.request_id)
@@ -1067,8 +1183,6 @@ class HiCacheController:
                         f"Revoking prefetch for request {operation.request_id} due to insufficient hits ({storage_hit_count})."
                     )
                 else:
-                    self.storage_prefetch_hits += 1
-                    self.storage_prefetch_tokens_hit += storage_hit_count
                     operation.hash_value = hash_value[
                         : (storage_hit_count // self.page_size)
                     ]
@@ -1080,8 +1194,8 @@ class HiCacheController:
                     logger.info(
                         f"[STORAGE-HIT] Prefetching {len(operation.hash_value)} pages "
                         f"({storage_hit_count} tokens) from storage for req {operation.request_id[:8]}. "
-                        f"Total: {self.storage_prefetch_hits}/{self.storage_prefetch_queries} queries hit, "
-                        f"{self.storage_prefetch_tokens_hit} tokens prefetched from storage."
+                        f"Total: {local_hits}/{local_queries} queries hit, "
+                        f"{local_tokens_hit} tokens prefetched from storage."
                     )
                     self.prefetch_buffer.put(operation)
 

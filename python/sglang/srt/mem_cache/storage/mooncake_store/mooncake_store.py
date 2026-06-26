@@ -23,6 +23,10 @@ from sglang.srt.mem_cache.hicache_storage import (
 )
 from sglang.srt.mem_cache.pool_host import HostKVCache, HostTensorAllocator
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
+from sglang.srt.observability.flat_memory_metrics import (
+    MooncakeClientIOStats,
+    native_mooncake_bandwidth,
+)
 from sglang.srt.observability.metrics_collector import StorageMetrics
 
 DEFAULT_LOCAL_BUFFER_SIZE = 16 * 1024 * 1024  # 16 MB
@@ -603,6 +607,9 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             self.backup_pgs = []
             self.prefetch_bandwidth = []
             self.backup_bandwidth = []
+            # FLAT_MEMORY: Older/Dummy clients may not implement native tier stats.
+            self._client_io_stats = MooncakeClientIOStats()
+            self._native_io_stats = getattr(self.store, "get_and_reset_io_stats", None)
 
         except ValueError as e:
             logger.error("Configuration loading failed: %s", e)
@@ -1327,26 +1334,47 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             config = self._replicate_config_cls()
             config.group_ids = group_ids
 
+        started = time.perf_counter_ns()
         if self._uses_multi_buffer(buffer_ptrs):
             config = config or self._replicate_config_cls()
-            return self.store.batch_put_from_multi_buffers(
+            results = self.store.batch_put_from_multi_buffers(
                 key_strs, buffer_ptrs, buffer_sizes, config
             )
         elif config is not None:
-            return self.store.batch_put_from(
+            results = self.store.batch_put_from(
                 key_strs, buffer_ptrs, buffer_sizes, config
             )
         else:
-            return self.store.batch_put_from(key_strs, buffer_ptrs, buffer_sizes)
+            results = self.store.batch_put_from(key_strs, buffer_ptrs, buffer_sizes)
+        # FLAT_MEMORY: RPC completions do not reveal DRAM versus SSD placement.
+        completed_bytes = sum(
+            sum(size) if isinstance(size, (list, tuple)) else size
+            for size, result in zip(buffer_sizes, results)
+            if result == 0
+        )
+        self._client_io_stats.record(
+            operation="write",
+            completed_bytes=completed_bytes,
+            elapsed_ns=time.perf_counter_ns() - started,
+        )
+        return results
 
     def _get_batch_zero_copy_impl(
         self, key_strs: List[str], buffer_ptrs: List[Any], buffer_sizes: List[Any]
     ) -> List[int]:
+        started = time.perf_counter_ns()
         if self._uses_multi_buffer(buffer_ptrs):
-            return self.store.batch_get_into_multi_buffers(
+            results = self.store.batch_get_into_multi_buffers(
                 key_strs, buffer_ptrs, buffer_sizes
             )
-        return self.store.batch_get_into(key_strs, buffer_ptrs, buffer_sizes)
+        else:
+            results = self.store.batch_get_into(key_strs, buffer_ptrs, buffer_sizes)
+        self._client_io_stats.record(
+            operation="read",
+            completed_bytes=sum(value for value in results if value > 0),
+            elapsed_ns=time.perf_counter_ns() - started,
+        )
+        return results
 
     def _batch_exist(self, key_strs: List[str]) -> List[int]:
         return self.store.batch_is_exist(key_strs)
@@ -1357,14 +1385,31 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         storage_metrics.backup_pgs.extend(self.backup_pgs)
         storage_metrics.prefetch_bandwidth.extend(self.prefetch_bandwidth)
         storage_metrics.backup_bandwidth.extend(self.backup_bandwidth)
-        # Debug: log when bandwidth data is available
-        if self.backup_bandwidth or self.prefetch_bandwidth:
-            logger.info(
-                f"[BANDWIDTH-DEBUG] get_stats: backup_bw={len(self.backup_bandwidth)} samples, "
-                f"prefetch_bw={len(self.prefetch_bandwidth)} samples"
-            )
         self.prefetch_pgs.clear()
         self.backup_pgs.clear()
         self.prefetch_bandwidth.clear()
         self.backup_bandwidth.clear()
+        storage_metrics.mooncake_client_io = self._client_io_stats.snapshot_and_reset()
+        if self._native_io_stats is not None:
+            try:
+                native = self._native_io_stats()
+                if native:
+                    bandwidth = native_mooncake_bandwidth(native)
+                    native_bytes = sum(
+                        value
+                        for key, value in bandwidth.items()
+                        if key.endswith("_total_bytes")
+                    )
+                    client_bytes = (
+                        storage_metrics.mooncake_client_io["read_bytes"]
+                        + storage_metrics.mooncake_client_io["write_bytes"]
+                    )
+                    # FLAT_MEMORY: Dummy-client zeroes cannot identify an active RPC's medium.
+                    if native_bytes > 0 or client_bytes == 0:
+                        storage_metrics.flat_memory_bandwidth = bandwidth
+            except Exception:
+                logger.debug(
+                    "Native Mooncake I/O stats unavailable; using RPC metrics",
+                    exc_info=True,
+                )
         return storage_metrics

@@ -1853,6 +1853,7 @@ class StorageMetrics:
     backup_bandwidth: List[float] = field(default_factory=list)
     # FLAT_MEMORY: C++ level per-backend bandwidth report
     flat_memory_bandwidth: Optional[Dict[str, Any]] = None
+    mooncake_client_io: Optional[Dict[str, Any]] = None
 
 
 class StorageMetricsCollector(_StatLoggerDIMixin):
@@ -2097,6 +2098,17 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
             labelnames=labels.keys(),
         )
 
+        self.mooncake_client_io_bytes = Gauge(
+            name="sglang:mooncake_client_io_bytes",
+            documentation="Caller-visible Mooncake RPC bytes, storage medium unknown.",
+            labelnames=[*labels, "operation"],
+        )
+        self.mooncake_client_io_ns = Gauge(
+            name="sglang:mooncake_client_io_ns",
+            documentation="Caller-visible Mooncake RPC elapsed nanoseconds.",
+            labelnames=[*labels, "operation"],
+        )
+
     def log_prefetched_tokens(self, prefetched_tokens: int):
         if prefetched_tokens > 0:
             self.prefetched_tokens_total.labels(**self.labels).inc(prefetched_tokens)
@@ -2140,6 +2152,14 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
             return
 
         assert isinstance(storage_metrics, StorageMetrics)
+        if storage_metrics.mooncake_client_io is not None:
+            for operation in ("read", "write"):
+                self.mooncake_client_io_bytes.labels(**self.labels, operation=operation).set(
+                    storage_metrics.mooncake_client_io[f"{operation}_bytes"]
+                )
+                self.mooncake_client_io_ns.labels(**self.labels, operation=operation).set(
+                    storage_metrics.mooncake_client_io[f"{operation}_ns"]
+                )
 
         for v in storage_metrics.prefetch_pgs:
             self._log_histogram(self.histogram_prefetch_pgs, v)

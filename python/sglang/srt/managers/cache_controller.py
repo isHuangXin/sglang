@@ -477,21 +477,16 @@ class HiCacheController:
             # FLAT_MEMORY: Separate read and write batch sizes.
             # - READ batch size: large (8192) so C++ BatchReadByKeys sees all ~15 buckets
             #   in a single call, enabling parallel pread via io_pool_ (4-5 GB/s).
-            # - WRITE batch size: small (512) so each batch_set_v1 call creates a small
-            #   bucket file (~32-64MB), matching Mooncake's design of many small files.
-            # Other backends use the same batch size for both read and write.
-            if self.storage_backend_type == "flat_memory":
-                self.storage_batch_size = int(
-                    os.environ.get("SGLANG_STORAGE_READ_BATCH_SIZE", "8192")
-                )
-                self.storage_write_batch_size = int(
-                    os.environ.get("SGLANG_STORAGE_WRITE_BATCH_SIZE", "512")
-                )
-            else:
-                self.storage_batch_size = int(
-                    os.environ.get("SGLANG_STORAGE_BATCH_SIZE", "512")
-                )
-                self.storage_write_batch_size = self.storage_batch_size
+            # Batch sizes for storage read/write, controllable via env vars.
+            # Default: 128 (original SGLang baseline). Set higher values for optimization:
+            #   SGLANG_STORAGE_READ_BATCH_SIZE=8192  (large read batch, fewer RPC round-trips)
+            #   SGLANG_STORAGE_WRITE_BATCH_SIZE=512  (small write batch, smaller bucket files)
+            self.storage_batch_size = int(
+                os.environ.get("SGLANG_STORAGE_READ_BATCH_SIZE", "128")
+            )
+            self.storage_write_batch_size = int(
+                os.environ.get("SGLANG_STORAGE_WRITE_BATCH_SIZE", "128")
+            )
             logger.info(
                 f"Storage batch size: read={self.storage_batch_size}, write={self.storage_write_batch_size} pages "
                 f"(backend={self.storage_backend_type})"

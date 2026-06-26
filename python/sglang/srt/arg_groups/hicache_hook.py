@@ -34,6 +34,12 @@ def handle_hicache(server_args: Any):
     ):
         return
 
+    if cfg.hicache_storage_backend == "flat_memory":
+        declare_resolution(
+            server_args,
+            "_resolve_flat_memory_staging",
+            hicache_host_memory_mode="buffer_only",
+        )
     validate_hicache_host_memory_mode(server_args)
 
     # Step 1: Initial layout-io compatibility normalization.

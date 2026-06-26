@@ -103,6 +103,12 @@ class HiRadixCache(RadixCache):
         self.enable_storage = server_args.hicache_storage_backend is not None
         self.enable_storage_metrics = self.enable_storage and params.enable_metrics
         self.extra_metric_labels = server_args.extra_metric_labels
+        # FLAT_MEMORY: In flat memory mode, DRAM is a bounce buffer only —
+        # host_value is freed immediately after load_back() copies to GPU.
+        # SSD is the authoritative storage; DRAM is not a persistent cache layer.
+        self.flat_memory_mode = (
+            server_args.hicache_storage_backend == "flat_memory"
+        )
 
         (
             extra_config,
@@ -889,6 +895,10 @@ class HiRadixCache(RadixCache):
         return num_evicted
 
     def evict_host(self, num_tokens: int):
+        # FLAT_MEMORY: In flat memory mode, host_value is freed eagerly after
+        # load_back(). evict_host() may be called during prefetch_from_storage()
+        # to make room for new bounce buffers — but there's likely nothing to evict.
+        # Let it proceed normally; if evictable_host_leaves is empty, it exits fast.
         leaves = list(self.evictable_host_leaves)
         eviction_heap = [
             (self.eviction_strategy.get_priority(node), node) for node in leaves
@@ -979,6 +989,20 @@ class HiRadixCache(RadixCache):
             offset += len(node.host_value)
         self.evictable_size_ += len(device_indices)
         self.inc_lock_ref(last_hit_node)
+
+        # FLAT_MEMORY: Release DRAM bounce buffer after GPU load — SSD is the
+        # authoritative storage, DRAM is not a persistent cache layer.
+        # After data is on GPU (node.value), free host memory immediately.
+        if self.flat_memory_mode:
+            for node in nodes_to_load:
+                if node.host_value is not None:
+                    self.cache_controller.mem_pool_host.free(node.host_value)
+                    node.host_value = None
+                    if node in self.evictable_host_leaves:
+                        self.evictable_host_leaves.remove(node)
+            # Update parent's host leaf status since children lost host_value
+            if nodes_to_load:
+                self._update_host_leaf_status(nodes_to_load[0].parent)
 
         if self.metrics_collector is not None:
             self.metrics_collector.observe_load_back_duration(

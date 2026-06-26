@@ -626,12 +626,8 @@ class HiCacheController:
                 self.prefetch_capacity_limit = int(0.5 * self.mem_pool_host.size)
             # tracking the number of tokens locked in prefetching, updated by the main scheduler thread
             self.prefetch_tokens_occupied = 0
-            if self.storage_backend_type == "flat_memory":
-                self.storage_batch_size = envs.SGLANG_STORAGE_READ_BATCH_SIZE.get()
-                self.storage_write_batch_size = envs.SGLANG_STORAGE_WRITE_BATCH_SIZE.get()
-            else:
-                self.storage_batch_size = envs.SGLANG_STORAGE_BATCH_SIZE.get()
-                self.storage_write_batch_size = self.storage_batch_size
+            self.storage_batch_size = envs.SGLANG_STORAGE_READ_BATCH_SIZE.get()
+            self.storage_write_batch_size = envs.SGLANG_STORAGE_WRITE_BATCH_SIZE.get()
             self.prefetch_io_workers = envs.SGLANG_PREFETCH_IO_WORKERS.get()
             self.prefetch_query_workers = envs.SGLANG_PREFETCH_QUERY_WORKERS.get()
 

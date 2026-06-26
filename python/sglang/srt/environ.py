@@ -712,9 +712,8 @@ class Envs:
     # ===================================================================
     # Per-call cudaHostRegister limit in GB.
     SGLANG_PREFETCH_THRESHOLD = EnvInt(None)
-    SGLANG_STORAGE_READ_BATCH_SIZE = EnvInt(8192)
-    SGLANG_STORAGE_WRITE_BATCH_SIZE = EnvInt(512)
-    SGLANG_STORAGE_BATCH_SIZE = EnvInt(512)
+    SGLANG_STORAGE_READ_BATCH_SIZE = EnvInt(128)
+    SGLANG_STORAGE_WRITE_BATCH_SIZE = EnvInt(128)
     SGLANG_PREFETCH_IO_WORKERS = EnvInt(4)
     SGLANG_PREFETCH_QUERY_WORKERS = EnvInt(4)
     SGLANG_HICACHE_HOST_REGISTER_CHUNK_GB = EnvInt(256)

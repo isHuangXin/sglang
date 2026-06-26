@@ -2943,8 +2943,32 @@ async def benchmark(
             prefill_host=fm_host,
             prefill_port=getattr(args, 'prefill_metrics_port', 30000),
         )
+    # FLAT_MEMORY: For Mooncake, merge eviction data into flat_memory_metrics
+    # SSD writes happen in mooncake_client process (not SGLang), so SSD write stats
+    # from Prometheus are always 0. Use Master's eviction metrics as SSD write proxy.
+    if flat_memory_metrics and mooncake_eviction:
+        evicted_bytes = mooncake_eviction.get("evicted_size_bytes", 0)
+        evicted_keys = mooncake_eviction.get("evicted_key_count", 0)
+        if evicted_bytes > 0 and benchmark_duration > 0:
+            # SSD write bandwidth = total evicted bytes / benchmark duration
+            ssd_write_bw = evicted_bytes / (benchmark_duration * 1e9)  # GB/s
+            flat_memory_metrics["ssd_write_bw_gbps"] = ssd_write_bw
+            flat_memory_metrics["ssd_write_total_bytes"] = evicted_bytes
+            flat_memory_metrics["ssd_write_ops"] = evicted_keys
+        # SSD used = total evicted to SSD
+        if evicted_bytes > 0:
+            flat_memory_metrics["ssd_used_bytes"] = evicted_bytes
+        # DRAM used: use HICACHE_SIZE env var (GB) or default 20GB
+        hicache_gb = int(os.environ.get("HICACHE_SIZE", "20"))
+        flat_memory_metrics["dram_used_bytes"] = hicache_gb * (1024**3)
     if flat_memory_metrics:
-        print("{s:{c}^{n}}".format(s="Flat Memory System Statistics", n=50, c="-"))
+        # FLAT_MEMORY: Detect backend type for section header
+        hicache_storage = os.environ.get("SGLANG_HICACHE_STORAGE", "").lower()
+        if hicache_storage == "mooncake":
+            section_title = "Mooncake Storage I/O Statistics"
+        else:
+            section_title = "Flat Memory System Statistics"
+        print("{s:{c}^{n}}".format(s=section_title, n=50, c="-"))
         # Storage usage
         dram_used = flat_memory_metrics.get("dram_used_bytes", 0)
         ssd_used = flat_memory_metrics.get("ssd_used_bytes", 0)

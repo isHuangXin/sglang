@@ -386,6 +386,21 @@ class MooncakeStore(HiCacheStorage):
             self.prefetch_bandwidth = []
             self.backup_bandwidth = []
 
+            # FLAT_MEMORY: Python-level I/O stats for DummyClient (thin client) mode.
+            # When standalone_storage=True, SGLang uses DummyClient which forwards RPCs
+            # to mooncake_client. The C++ io_stats_ only accumulates in mooncake_client's
+            # RealClient, not in our DummyClient. So we track at the Python layer.
+            self._io_stats_dram_write_bytes = 0
+            self._io_stats_dram_write_ns = 0
+            self._io_stats_dram_write_ops = 0
+            self._io_stats_dram_read_bytes = 0
+            self._io_stats_dram_read_ns = 0
+            self._io_stats_dram_read_ops = 0
+            self._io_stats_ssd_read_bytes = 0
+            self._io_stats_ssd_read_ns = 0
+            self._io_stats_ssd_read_ops = 0
+            self._is_standalone_storage = getattr(self.config, "standalone_storage", False)
+
         except ValueError as e:
             logger.error("Configuration loading failed: %s", e)
             raise
@@ -714,12 +729,40 @@ class MooncakeStore(HiCacheStorage):
     def _put_batch_zero_copy_impl(
         self, key_strs: List[str], buffer_ptrs: List[int], buffer_sizes: List[int]
     ) -> List[int]:
-        return self.store.batch_put_from(key_strs, buffer_ptrs, buffer_sizes)
+        # FLAT_MEMORY: Track write I/O at Python layer.
+        # Always track timing for Python-level stats (used as fallback if C++ stats
+        # are unavailable, e.g., when dynamic_pointer_cast<RealClient> fails).
+        t0 = time.perf_counter_ns()
+        results = self.store.batch_put_from(key_strs, buffer_ptrs, buffer_sizes)
+        elapsed_ns = time.perf_counter_ns() - t0
+        # Count successful writes (result == 0 means success)
+        total_bytes = sum(
+            sz for sz, rc in zip(buffer_sizes, results) if rc == 0
+        )
+        if total_bytes > 0:
+            self._io_stats_dram_write_bytes += total_bytes
+            self._io_stats_dram_write_ns += elapsed_ns
+            self._io_stats_dram_write_ops += 1
+        return results
 
     def _get_batch_zero_copy_impl(
         self, key_strs: List[str], buffer_ptrs: List[int], buffer_sizes: List[int]
     ) -> List[int]:
-        return self.store.batch_get_into(key_strs, buffer_ptrs, buffer_sizes)
+        # FLAT_MEMORY: Track read I/O at Python layer.
+        t0 = time.perf_counter_ns()
+        results = self.store.batch_get_into(key_strs, buffer_ptrs, buffer_sizes)
+        elapsed_ns = time.perf_counter_ns() - t0
+        # batch_get_into returns bytes read per key (>0 = success, -1 = fail)
+        total_bytes = sum(r for r in results if r > 0)
+        if total_bytes > 0:
+            # Note: We can't distinguish DRAM vs SSD reads at the Python layer,
+            # since the mooncake_client transparently handles routing.
+            # We report all reads as "DRAM read" — the actual SSD read portion
+            # is estimated separately from eviction stats in bench_serving.py.
+            self._io_stats_dram_read_bytes += total_bytes
+            self._io_stats_dram_read_ns += elapsed_ns
+            self._io_stats_dram_read_ops += 1
+        return results
 
     def _batch_exist(self, key_strs: List[str]) -> List[int]:
         return self.store.batch_is_exist(key_strs)
@@ -740,4 +783,92 @@ class MooncakeStore(HiCacheStorage):
         self.backup_pgs.clear()
         self.prefetch_bandwidth.clear()
         self.backup_bandwidth.clear()
+
+        # FLAT_MEMORY: Get per-backend I/O stats.
+        # Strategy: Try C++ io_stats_ first (works when store_ is RealClient).
+        # Fall back to Python-level tracking if C++ returns empty/zero (which
+        # happens when: DummyClient mode, or .so mismatch, or other edge cases).
+        try:
+            use_python_stats = False
+
+            if not self._is_standalone_storage:
+                # Try C++ io_stats_ first (RealClient mode)
+                io_stats = self.store.get_and_reset_io_stats()
+                if io_stats:
+                    dram_write_bytes = io_stats.get("dram_write_bytes", 0)
+                    dram_write_ns = io_stats.get("dram_write_ns", 0)
+                    dram_write_ops = io_stats.get("dram_write_ops", 0)
+                    dram_read_bytes = io_stats.get("dram_read_bytes", 0)
+                    dram_read_ns = io_stats.get("dram_read_ns", 0)
+                    dram_read_ops = io_stats.get("dram_read_ops", 0)
+                    ssd_write_bytes = io_stats.get("ssd_write_bytes", 0)
+                    ssd_write_ns = io_stats.get("ssd_write_ns", 0)
+                    ssd_write_ops = io_stats.get("ssd_write_ops", 0)
+                    ssd_read_bytes = io_stats.get("ssd_read_bytes", 0)
+                    ssd_read_ns = io_stats.get("ssd_read_ns", 0)
+                    ssd_read_ops = io_stats.get("ssd_read_ops", 0)
+                    # If all C++ stats are zero but Python stats have data, use Python
+                    if (dram_write_bytes == 0 and dram_read_bytes == 0
+                            and ssd_read_bytes == 0
+                            and (self._io_stats_dram_write_bytes > 0
+                                 or self._io_stats_dram_read_bytes > 0)):
+                        use_python_stats = True
+                else:
+                    use_python_stats = True
+            else:
+                use_python_stats = True
+
+            if use_python_stats:
+                # Use Python-level stats accumulated in _put/_get_batch_zero_copy_impl
+                dram_write_bytes = self._io_stats_dram_write_bytes
+                dram_write_ns = self._io_stats_dram_write_ns
+                dram_write_ops = self._io_stats_dram_write_ops
+                dram_read_bytes = self._io_stats_dram_read_bytes
+                dram_read_ns = self._io_stats_dram_read_ns
+                dram_read_ops = self._io_stats_dram_read_ops
+                ssd_write_bytes = 0  # SSD writes happen in mooncake_client; use eviction stats
+                ssd_write_ns = 0
+                ssd_write_ops = 0
+                ssd_read_bytes = self._io_stats_ssd_read_bytes
+                ssd_read_ns = self._io_stats_ssd_read_ns
+                ssd_read_ops = self._io_stats_ssd_read_ops
+
+            has_stats = (dram_write_bytes > 0 or dram_read_bytes > 0
+                         or ssd_read_bytes > 0)
+
+            if has_stats:
+                bw_dict = {}
+
+                bw_dict["dram_write_bw_gbps"] = (
+                    dram_write_bytes / dram_write_ns if dram_write_ns > 0 else 0.0
+                )
+                bw_dict["dram_read_bw_gbps"] = (
+                    dram_read_bytes / dram_read_ns if dram_read_ns > 0 else 0.0
+                )
+                bw_dict["ssd_write_bw_gbps"] = (
+                    ssd_write_bytes / ssd_write_ns if ssd_write_ns > 0 else 0.0
+                )
+                bw_dict["ssd_read_bw_gbps"] = (
+                    ssd_read_bytes / ssd_read_ns if ssd_read_ns > 0 else 0.0
+                )
+
+                bw_dict["dram_write_total_bytes"] = dram_write_bytes
+                bw_dict["dram_read_total_bytes"] = dram_read_bytes
+                bw_dict["ssd_write_total_bytes"] = ssd_write_bytes
+                bw_dict["ssd_read_total_bytes"] = ssd_read_bytes
+
+                bw_dict["dram_write_count"] = dram_write_ops
+                bw_dict["dram_read_count"] = dram_read_ops
+                bw_dict["ssd_write_count"] = ssd_write_ops
+                bw_dict["ssd_read_count"] = ssd_read_ops
+
+                # Mooncake doesn't expose used bytes via IoStats; set 0
+                bw_dict["dram_used_bytes"] = 0
+                bw_dict["ssd_used_bytes"] = 0
+                bw_dict["total_blocks"] = 0
+
+                storage_metrics.flat_memory_bandwidth = bw_dict
+        except Exception as e:
+            logger.warning(f"[MOONCAKE-IOSTATS] Failed to get io stats: {e}")
+
         return storage_metrics

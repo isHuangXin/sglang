@@ -2264,6 +2264,14 @@ def fetch_flat_memory_metrics(
         "sglang:flat_memory_dram_used_bytes",
         "sglang:flat_memory_ssd_used_bytes",
         "sglang:flat_memory_total_blocks",
+        "sglang:flat_memory_dram_overflow_count",
+        "sglang:flat_memory_dram_overflow_bytes",
+        "sglang:flat_memory_duplicate_key_skips",
+        "sglang:flat_memory_delete_count",
+        "sglang:flat_memory_delete_bytes",
+        "sglang:flat_memory_put_failures",
+        "sglang:flat_memory_dram_utilization_pct",
+        "sglang:flat_memory_ssd_utilization_pct",
     ]
 
     for metric_name in gauge_names:
@@ -3003,6 +3011,36 @@ async def benchmark(
             print("{:<40} {:<10.2f}".format(
                 "SSD read total (GB):", ssd_read_bytes / (1024**3)
             ))
+        # Flat Memory Capacity Management Statistics
+        overflow_count = int(flat_memory_metrics.get("dram_overflow_count", 0))
+        overflow_bytes = flat_memory_metrics.get("dram_overflow_bytes", 0)
+        dup_skips = int(flat_memory_metrics.get("duplicate_key_skips", 0))
+        del_count = int(flat_memory_metrics.get("delete_count", 0))
+        del_bytes = flat_memory_metrics.get("delete_bytes", 0)
+        put_fails = int(flat_memory_metrics.get("put_failures", 0))
+        dram_util = flat_memory_metrics.get("dram_utilization_pct", 0)
+        ssd_util = flat_memory_metrics.get("ssd_utilization_pct", 0)
+        if overflow_count > 0 or dup_skips > 0 or del_count > 0:
+            print("{s:{c}^{n}}".format(
+                s="Flat Memory Capacity Statistics", n=50, c="-"))
+            print("{:<40} {:<10}".format(
+                "DRAM overflow events:", overflow_count))
+            print("{:<40} {:<10.2f}".format(
+                "DRAM overflow size (GB):", overflow_bytes / (1024**3)))
+            print("{:<40} {:<10}".format(
+                "Duplicate key skips:", dup_skips))
+            if del_count > 0:
+                print("{:<40} {:<10}".format(
+                    "Delete operations:", del_count))
+                print("{:<40} {:<10.2f}".format(
+                    "Deleted size (GB):", del_bytes / (1024**3)))
+            if put_fails > 0:
+                print("{:<40} {:<10}".format(
+                    "Put failures (no space):", put_fails))
+            print("{:<40} {:<10.1f}".format(
+                "DRAM utilization (%):", dram_util))
+            print("{:<40} {:<10.1f}".format(
+                "SSD utilization (%):", ssd_util))
     if accept_length:
         print("{:<40} {:<10.2f}".format("Accept length:", accept_length))
     print("{s:{c}^{n}}".format(s="End-to-End Latency", n=50, c="-"))

@@ -1664,14 +1664,19 @@ class Scheduler(
             logger.info(
                 f"[PREFETCH-DEBUG] req={req.rid[:8]}, "
                 f"backuped={req.last_node.backuped}, "
+                f"fm_stored={getattr(req.last_host_node, 'fm_stored', False)}, "
                 f"prefix_indices={len(req.prefix_indices)}, "
                 f"host_hit={req.host_hit_length}, "
                 f"fill_ids={len(req.fill_ids)}"
             )
-            if req.last_node.backuped or req.last_node is self.tree_cache.root_node:
+            if req.last_node.backuped or req.last_node is self.tree_cache.root_node or getattr(req.last_host_node, 'fm_stored', False):
                 # Initiate prefetch if the last node is backuped, or if all nodes
-                # have been evicted (last_node == root). In the root case, hash chain
-                # is recomputed from scratch using token_ids. (upstream fix: PR #19663)
+                # have been evicted (last_node == root), or if the last_host_node's
+                # data is in Flat Memory storage (fm_stored). In the fm_stored case,
+                # the node was preserved in the tree after GPU evict (no host_value),
+                # and we can trigger prefetch using the stored hash chain.
+                # In the root case, hash chain is recomputed from scratch using
+                # token_ids. (upstream fix: PR #19663)
                 last_hash = req.last_host_node.get_last_hash_value()
                 matched_len = len(req.prefix_indices) + req.host_hit_length
                 new_input_tokens = req.fill_ids[matched_len:]

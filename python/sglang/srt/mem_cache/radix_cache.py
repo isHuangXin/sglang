@@ -117,6 +117,12 @@ class TreeNode:
         self.hash_value: Optional[List[str]] = None
         # priority for priority-aware eviction
         self.priority = priority
+        # FLAT_MEMORY: Permanent flag indicating data exists in Flat Memory storage.
+        # Once set True (after write_through to FM completes), stays True forever.
+        # Used to:
+        # 1. Prevent _evict_regular() from deleting the node (use _evict_backuped path)
+        # 2. Trigger prefetch from storage when node is on GPU but host_value is None
+        self.fm_stored = False
 
         self.id = TreeNode.counter if id is None else id
         TreeNode.counter += 1

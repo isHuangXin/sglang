@@ -700,6 +700,12 @@ class HiRadixCache(RadixCache):
         )
         self.ongoing_backup[operation_id] = node
         node.protect_host()
+        # FLAT_MEMORY: Mark node as permanently stored in Flat Memory.
+        # After this point, even if host_value is freed (load_back sets it to None),
+        # the node will NOT be deleted from RadixTree on next GPU evict.
+        # The data is authoritative in FM storage (DRAM/SSD).
+        if self.flat_memory_mode:
+            node.fm_stored = True
         # FLAT_MEMORY: track storage write token count
         self._storage_write_total_tokens += len(node.host_value)
         self._storage_write_total_ops += 1
@@ -847,7 +853,13 @@ class HiRadixCache(RadixCache):
                 continue
 
             if not x.backuped:
-                if self.cache_controller.write_policy == "write_back":
+                # FLAT_MEMORY: If data is already in Flat Memory storage (fm_stored=True),
+                # just free the GPU slot without deleting the node from RadixTree.
+                # This preserves the index so match_prefix() can still find this node,
+                # enabling correct prefetch triggering on the next request.
+                if self.flat_memory_mode and x.fm_stored:
+                    num_evicted += self._evict_backuped(x)
+                elif self.cache_controller.write_policy == "write_back":
                     # write to host if the node is not backuped
                     num_evicted += self.write_backup(x, write_back=True)
                     write_back_nodes.append(x)
@@ -1273,9 +1285,18 @@ class HiRadixCache(RadixCache):
         host_hit_length = 0
         last_host_node = last_node
         while last_node.evicted:
-            host_hit_length += len(last_node.host_value)
+            # FLAT_MEMORY: If node has fm_stored=True but host_value=None (freed after
+            # load_back), we can't count host_hit_length from this node. The data is
+            # in Flat Memory storage, not in host DRAM. Skip this node and continue
+            # walking up to find the boundary of GPU-resident data.
+            if last_node.host_value is not None:
+                host_hit_length += len(last_node.host_value)
             last_node = last_node.parent
         while not last_host_node.backuped:
+            # FLAT_MEMORY: Stop walking up if we hit an fm_stored node — it's the best
+            # anchor point for prefetch (has hash_value for storage lookup).
+            if last_host_node.fm_stored:
+                break
             last_host_node = last_host_node.parent
 
         return MatchResult(

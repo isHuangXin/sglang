@@ -387,6 +387,9 @@ class FlatMemoryStore(HiCacheStorage):
         bw_report["dram_used_bytes"] = stats.get("dram_used", 0)
         bw_report["ssd_used_bytes"] = stats.get("ssd_used", 0)
         bw_report["total_blocks"] = stats.get("total_blocks", 0)
+        # FLAT_MEMORY: Include capacity management stats (overflow/dedup/delete)
+        cap_stats = self.manager.get_capacity_stats()
+        bw_report.update(cap_stats)
         storage_metrics.flat_memory_bandwidth = bw_report
         return storage_metrics
 
@@ -399,9 +402,12 @@ class FlatMemoryStore(HiCacheStorage):
         """
         storage_stats = self.manager.get_stats()
         bandwidth_report = self.manager.get_bandwidth_report()
+        capacity_stats = self.manager.get_capacity_stats()
         return {
             # Storage capacity / usage
             "storage": storage_stats,
             # Per-backend bandwidth (from C++ atomic counters)
             "bandwidth": bandwidth_report,
+            # Capacity management (overflow/dedup/delete)
+            "capacity": capacity_stats,
         }

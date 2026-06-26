@@ -1586,6 +1586,47 @@ class StorageMetricsCollector:
             documentation="Flat Memory total stored blocks.",
             labelnames=labels.keys(),
         )
+        # FLAT_MEMORY: Capacity management statistics
+        self.flat_memory_dram_overflow_count = Gauge(
+            name="sglang:flat_memory_dram_overflow_count",
+            documentation="Flat Memory DRAM overflow events (blocks placed on SSD because DRAM full).",
+            labelnames=labels.keys(),
+        )
+        self.flat_memory_dram_overflow_bytes = Gauge(
+            name="sglang:flat_memory_dram_overflow_bytes",
+            documentation="Flat Memory DRAM overflow total bytes.",
+            labelnames=labels.keys(),
+        )
+        self.flat_memory_duplicate_key_skips = Gauge(
+            name="sglang:flat_memory_duplicate_key_skips",
+            documentation="Flat Memory duplicate key skip count.",
+            labelnames=labels.keys(),
+        )
+        self.flat_memory_delete_count = Gauge(
+            name="sglang:flat_memory_delete_count",
+            documentation="Flat Memory delete operation count.",
+            labelnames=labels.keys(),
+        )
+        self.flat_memory_delete_bytes = Gauge(
+            name="sglang:flat_memory_delete_bytes",
+            documentation="Flat Memory deleted bytes total.",
+            labelnames=labels.keys(),
+        )
+        self.flat_memory_put_failures = Gauge(
+            name="sglang:flat_memory_put_failures",
+            documentation="Flat Memory put failures (no space).",
+            labelnames=labels.keys(),
+        )
+        self.flat_memory_dram_utilization_pct = Gauge(
+            name="sglang:flat_memory_dram_utilization_pct",
+            documentation="Flat Memory DRAM utilization percentage.",
+            labelnames=labels.keys(),
+        )
+        self.flat_memory_ssd_utilization_pct = Gauge(
+            name="sglang:flat_memory_ssd_utilization_pct",
+            documentation="Flat Memory SSD utilization percentage.",
+            labelnames=labels.keys(),
+        )
 
     def log_prefetched_tokens(self, prefetched_tokens: int):
         if prefetched_tokens > 0:
@@ -1659,6 +1700,15 @@ class StorageMetricsCollector:
             self.flat_memory_dram_used_bytes.labels(**self.labels).set(bw.get("dram_used_bytes", 0))
             self.flat_memory_ssd_used_bytes.labels(**self.labels).set(bw.get("ssd_used_bytes", 0))
             self.flat_memory_total_blocks.labels(**self.labels).set(bw.get("total_blocks", 0))
+            # FLAT_MEMORY: Capacity management stats
+            self.flat_memory_dram_overflow_count.labels(**self.labels).set(bw.get("dram_overflow_count", 0))
+            self.flat_memory_dram_overflow_bytes.labels(**self.labels).set(bw.get("dram_overflow_bytes", 0))
+            self.flat_memory_duplicate_key_skips.labels(**self.labels).set(bw.get("duplicate_key_skips", 0))
+            self.flat_memory_delete_count.labels(**self.labels).set(bw.get("delete_count", 0))
+            self.flat_memory_delete_bytes.labels(**self.labels).set(bw.get("delete_bytes", 0))
+            self.flat_memory_put_failures.labels(**self.labels).set(bw.get("put_failures", 0))
+            self.flat_memory_dram_utilization_pct.labels(**self.labels).set(bw.get("dram_utilization_pct", 0))
+            self.flat_memory_ssd_utilization_pct.labels(**self.labels).set(bw.get("ssd_utilization_pct", 0))
 
 
 class ExpertDispatchCollector:

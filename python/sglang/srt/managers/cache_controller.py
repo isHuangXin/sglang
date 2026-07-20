@@ -1061,8 +1061,14 @@ class HiCacheController:
         # FLAT_MEMORY: lock for shared stats counters across query workers
         self._prefetch_stats_lock = threading.Lock()
 
+        # Backup wait timeout: how long prefetch waits for backup writes to complete.
+        # Default 10.0s (original SGLang baseline). Set SGLANG_BACKUP_WAIT_TIMEOUT=0.1 for optimization.
+        self._backup_wait_timeout = float(
+            os.environ.get("SGLANG_BACKUP_WAIT_TIMEOUT", "10.0")
+        )
+
         # FLAT_MEMORY: spawn multiple IO workers for parallel SSD prefetch reads.
-        num_io_workers = int(os.environ.get("SGLANG_PREFETCH_IO_WORKERS", "8"))
+        num_io_workers = int(os.environ.get("SGLANG_PREFETCH_IO_WORKERS", "1"))
         self.prefetch_io_aux_threads = []
         for i in range(num_io_workers):
             t = threading.Thread(
@@ -1077,7 +1083,7 @@ class HiCacheController:
         # Each query takes ~1s (SHA256 hash chain + batch_exists Python→C++ loop).
         # With 1 worker and concurrency=4, average queue wait is 2.2s (max 11s).
         # With 4 workers, queue wait drops to ~0.3s, cutting SSD→Host latency 5x.
-        num_query_workers = int(os.environ.get("SGLANG_PREFETCH_QUERY_WORKERS", "4"))
+        num_query_workers = int(os.environ.get("SGLANG_PREFETCH_QUERY_WORKERS", "1"))
         self.prefetch_query_threads = []
         for i in range(num_query_workers):
             t = threading.Thread(
@@ -1124,7 +1130,7 @@ class HiCacheController:
                 # data. A short 100ms wait is sufficient to let the backup thread pick
                 # up new operations without starving prefetch reads.
                 t_backup_wait_start = time.perf_counter()
-                self.backup_idle_event.wait(timeout=0.1)
+                self.backup_idle_event.wait(timeout=self._backup_wait_timeout)
                 t_backup_wait_end = time.perf_counter()
                 backup_wait_ms = (t_backup_wait_end - t_backup_wait_start) * 1000
 

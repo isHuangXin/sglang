@@ -630,6 +630,7 @@ class HiCacheController:
             self.storage_write_batch_size = envs.SGLANG_STORAGE_WRITE_BATCH_SIZE.get()
             self.prefetch_io_workers = envs.SGLANG_PREFETCH_IO_WORKERS.get()
             self.prefetch_query_workers = envs.SGLANG_PREFETCH_QUERY_WORKERS.get()
+            self._backup_wait_timeout = envs.SGLANG_BACKUP_WAIT_TIMEOUT.get()
 
             # Use dedicated gloo groups so storage prefetch sync is isolated
             # from other collectives and consistent across CPxTP participants.
@@ -1284,7 +1285,7 @@ class HiCacheController:
                 self.prefetch_hit_queue.put(operation)
 
     def _query_prefetch_local(self, operation):
-        self.backup_idle_event.wait(timeout=10.0)
+        self.backup_idle_event.wait(timeout=self._backup_wait_timeout)
         if operation.is_terminated():
             return [], 0
         return self._storage_hit_query(operation)

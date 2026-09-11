@@ -1654,6 +1654,16 @@ class Scheduler(
             self.handle_generate_request(tokenized_req)
 
     def _prefetch_kvcache(self, req: Req):
+        # FLAT_MEMORY: Preserve arrival order across SSD preparation and requeueing.
+        if self.enable_hicache_storage and getattr(
+            self.tree_cache, "flat_gpu_mode", False
+        ):
+            if not hasattr(req, "flat_arrival_time"):
+                req.flat_arrival_time = time.monotonic()
+            self.tree_cache.check_hicache_events()
+            req.init_next_round_input(self.tree_cache)
+            self.tree_cache.prefetch_gpu(req)
+            return
         if self.enable_hicache_storage:
             # Flush pending GPU→Host→Storage backup pipeline before querying storage.
             # Without this, prefetch queries race with async backup writes and miss
@@ -2002,6 +2012,8 @@ class Scheduler(
             for req in ready_grammar_requests:
                 self._add_request_to_queue(req)
 
+        if getattr(self.tree_cache, "flat_gpu_mode", False):
+            self.tree_cache.check_hicache_events()
         if self.try_preemption:
             # Reset batch_is_full to try preemption with a prefill adder.
             self.running_batch.batch_is_full = False
@@ -2028,8 +2040,19 @@ class Scheduler(
         if self.enable_hierarchical_cache:
             self.tree_cache.check_hicache_events()
 
-        # Get priority queue
-        self.policy.calc_priority(self.waiting_queue, self.running_batch)
+        # FLAT_MEMORY: Ready requests are FCFS by original arrival, not I/O completion.
+        if getattr(self.tree_cache, "flat_gpu_mode", False):
+            self.flat_dram_ready = []
+            preparing = []
+            for req in self.waiting_queue:
+                if self.tree_cache.check_prefetch_progress(req.rid):
+                    self.flat_dram_ready.append(req)
+                else:
+                    preparing.append(req)
+            self.flat_dram_ready.sort(key=lambda req: req.flat_arrival_time)
+            self.waiting_queue = self.flat_dram_ready + preparing
+        else:
+            self.policy.calc_priority(self.waiting_queue, self.running_batch)
 
         if TEST_RETRACT and running_bs > TEST_RETRACT_NO_PREFILL_BS:
             # If we are testing retraction and the running batch size exceeds
@@ -2107,15 +2130,20 @@ class Scheduler(
                     # skip staging requests that are ongoing prefetch
                     continue
                 # Pop the number of tokens loaded from storage (L3 hits)
-                req.storage_hit_length = self.tree_cache.pop_prefetch_loaded_tokens(
-                    req.rid
-                )
+                loaded_tokens = self.tree_cache.pop_prefetch_loaded_tokens(req.rid)
+                if getattr(self.tree_cache, "flat_gpu_mode", False):
+                    req.storage_hit_length += loaded_tokens
+                else:
+                    req.storage_hit_length = loaded_tokens
                 # FLAT_MEMORY: Pop prefetch latency and token count for this request
                 latency_ms, read_tokens = self.tree_cache.pop_prefetch_latency(
                     req.rid
                 )
-                req.storage_read_latency_ms = latency_ms
-                req.storage_read_tokens = read_tokens
+                if latency_ms > 0 or not getattr(
+                    self.tree_cache, "flat_gpu_mode", False
+                ):
+                    req.storage_read_latency_ms = latency_ms
+                    req.storage_read_tokens = read_tokens
 
             req.init_next_round_input(self.tree_cache)
             res = adder.add_one_req(

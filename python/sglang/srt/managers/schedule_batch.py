@@ -1565,6 +1565,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     storage_portion = min(host_total, req.storage_hit_length)
                     host_portion = host_total - storage_portion
                     device_portion = max(0, len(req.prefix_indices) - host_total)
+                    # FLAT_MEMORY: Direct storage hits reach GPU without a host-cache hit.
+                    if getattr(self.tree_cache, "flat_gpu_mode", False):
+                        storage_portion = min(
+                            len(req.prefix_indices), req.storage_hit_length
+                        )
+                        host_portion = 0
+                        device_portion = len(req.prefix_indices) - storage_portion
 
                     req.cached_tokens_device = device_portion
                     req.cached_tokens_host = host_portion

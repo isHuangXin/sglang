@@ -252,6 +252,32 @@ class PrefetchOperation(StorageOperation):
         return self._terminated_flag
 
 
+# FLAT_MEMORY: Completion owns GPU pages until the scheduler consumes it.
+class GPUStorageOperation(StorageOperation):
+    def __init__(
+        self,
+        indices,
+        token_ids,
+        hash_value,
+        request_id="",
+        arrival_time=None,
+        addresses=None,
+    ):
+        super().__init__(None, token_ids, hash_value=hash_value)
+        self.device_indices = indices
+        self.request_id = request_id
+        self.addresses = addresses or []
+        self.arrival_time = time.monotonic() if arrival_time is None else arrival_time
+        self.done = threading.Event()
+        self.cancelled = False
+        self.error = None
+        self.start_event = torch.cuda.Event()
+        self.finish_event = torch.cuda.Event()
+        self.start_event.record()
+        self.anchor = None
+        self.extra_key = None
+
+
 class HiCacheController:
 
     def __init__(
@@ -280,6 +306,7 @@ class HiCacheController:
         self.enable_storage = False
         self.storage_backend = None
         self.storage_backend_type = None
+        self.flat_gpu_mode = False
         self.pp_rank = pp_rank
         self.pp_size = pp_size
 
@@ -361,8 +388,112 @@ class HiCacheController:
         self.ack_backup_queue = Queue()
         self.host_mem_release_queue = Queue()
 
-        self.prefetch_thread.start()
+        if self.flat_gpu_mode:
+            self._start_flat_io_workers()
+        else:
+            self.prefetch_thread.start()
         self.backup_thread.start()
+
+    # FLAT_MEMORY: Separate workers prevent slow SSD I/O blocking DRAM copies.
+    def _start_flat_io_workers(self):
+        self.flat_condition = threading.Condition()
+        self.flat_dram_pending = []
+        self.flat_ssd_preparing = []
+        self.prefetch_capacity_limit = (
+            self.mem_pool_device.size // 2 // self.page_size * self.page_size
+        )
+        self.flat_completed_reads = 0
+        self.prefetch_io_aux_threads = []
+        for medium in (0, 1, 1):
+            worker = threading.Thread(
+                target=self._flat_io_worker,
+                args=(medium,),
+                daemon=True,
+                name=f"flat-prefetch-{medium}-{len(self.prefetch_io_aux_threads)}",
+            )
+            worker.start()
+            self.prefetch_io_aux_threads.append(worker)
+
+    def enqueue_gpu_prefetch(self, operation):
+        with self.flat_condition:
+            queue = (
+                self.flat_ssd_preparing
+                if any(address >> 60 == 1 for address in operation.addresses)
+                else self.flat_dram_pending
+            )
+            queue.append(operation)
+            self.flat_condition.notify_all()
+
+    def _flat_io_worker(self, medium):
+        torch.cuda.set_device(self.storage_backend.manager.config.gpu_id)
+        stream = torch.cuda.Stream()
+        queue = self.flat_ssd_preparing if medium else self.flat_dram_pending
+        while True:
+            with self.flat_condition:
+                self.flat_condition.wait_for(
+                    lambda: queue or self.storage_stop_event.is_set()
+                )
+                if not queue:
+                    return
+                now = time.monotonic()
+                if medium:
+                    index = max(
+                        range(len(queue)),
+                        key=lambda i: (
+                            1
+                            + (now - queue[i].arrival_time)
+                            / max(
+                                len(queue[i].addresses)
+                                * self.storage_backend.gpu_slot_bytes,
+                                1,
+                            ),
+                            -queue[i].arrival_time,
+                        ),
+                    )
+                else:
+                    index = min(range(len(queue)), key=lambda i: queue[i].arrival_time)
+                operation = queue.pop(index)
+            started = time.monotonic()
+            try:
+                if not operation.cancelled:
+                    with torch.cuda.stream(stream), torch.cuda.nvtx.range(
+                        "FC-MAS SSD prefetch" if medium else "FC-MAS DRAM prepare"
+                    ):
+                        stream.wait_event(operation.start_event)
+                        operation.completed_tokens = (
+                            self.storage_backend.read_gpu_pages(
+                                operation.addresses, operation.device_indices
+                            )
+                        )
+                        operation.finish_event.record(stream)
+                        operation.finish_event.synchronize()
+            except Exception as error:
+                operation.error = str(error)
+                logger.exception("GDS (compat) prefetch failed")
+            finally:
+                stream.synchronize()
+                operation.done.set()
+                with self.flat_condition:
+                    self.flat_completed_reads += 1
+                logger.info(
+                    "[FC-MAS] req=%s medium=%s arrival=%.6f io_start=%.6f io_end=%.6f tokens=%d",
+                    operation.request_id,
+                    "SSD" if medium else "DRAM",
+                    operation.arrival_time,
+                    started,
+                    time.monotonic(),
+                    operation.completed_tokens,
+                )
+
+    def write_gpu_storage(self, device_indices, token_ids, hash_value):
+        operation = GPUStorageOperation(
+            device_indices.clone(), list(token_ids), list(hash_value)
+        )
+        with self.pending_backup_lock:
+            self.pending_backup_count += 1
+            self.backup_idle_event.clear()
+        self.backup_queue.put(operation)
+        return operation.id
 
     def _stop_storage_threads(self):
         """Stop storage prefetch/backup threads and drain internal queues.
@@ -375,6 +506,9 @@ class HiCacheController:
         # NOTE: do NOT clear stop_event unless threads have fully stopped; otherwise
         # a still-alive thread may resume and touch released state.
         self.storage_stop_event.set()
+        if hasattr(self, "flat_condition"):
+            with self.flat_condition:
+                self.flat_condition.notify_all()
 
         # Best-effort wakeups so threads exit promptly even if blocked on queues.
         try:
@@ -464,6 +598,19 @@ class HiCacheController:
                 storage_backend, self.storage_config, self.mem_pool_host
             )
             self.storage_backend.register_mem_pool_host(self.mem_pool_host)
+            # FLAT_MEMORY: The GPU path must not dispatch to host-pointer APIs.
+            self.flat_gpu_mode = (
+                storage_backend == "flat_memory" and self.storage_backend.gpu_direct
+            )
+            if self.flat_gpu_mode:
+                if self.write_policy != "write_through":
+                    raise ValueError("GDS (compat) requires write_through")
+                if (
+                    torch.distributed.get_world_size(group=self.tp_group) != 1
+                    or self.pp_size != 1
+                ):
+                    raise ValueError("GDS (compat) currently supports TP=1, PP=1")
+                self.storage_backend.register_mem_pool_device(self.mem_pool_device)
 
             self.enable_storage = True
             # todo: threshold policy for prefetching
@@ -634,6 +781,13 @@ class HiCacheController:
         )
 
     def reset(self):
+        # FLAT_MEMORY: Direct I/O uses medium workers instead of the host coordinator.
+        if self.flat_gpu_mode:
+            self._stop_storage_threads()
+            self.layer_done_counter.reset()
+            self.storage_stop_event.clear()
+            self._start_storage_threads()
+            return
         self.stop_event.set()
         self.storage_stop_event.set()
 
@@ -1307,14 +1461,36 @@ class HiCacheController:
         """
         Manage backup operations from host memory to storage backend.
         """
-        while not self.storage_stop_event.is_set():
+        if self.flat_gpu_mode:
+            torch.cuda.set_device(self.storage_backend.manager.config.gpu_id)
+            gpu_stream = torch.cuda.Stream()
+        while not self.storage_stop_event.is_set() or (
+            self.flat_gpu_mode and not self.backup_queue.empty()
+        ):
             try:
                 operation = self.backup_queue.get(block=True, timeout=1)
                 if operation is None:
                     continue
 
                 self.backup_idle_event.clear()
-                if not self.backup_skip:
+                if self.flat_gpu_mode:
+                    try:
+                        with torch.cuda.stream(gpu_stream):
+                            gpu_stream.wait_event(operation.start_event)
+                            operation.completed_tokens = (
+                                self.storage_backend.write_gpu_pages(
+                                    operation.hash_value, operation.device_indices
+                                )
+                            )
+                            operation.finish_event.record(gpu_stream)
+                            operation.finish_event.synchronize()
+                    except Exception as error:
+                        operation.error = str(error)
+                        logger.exception("GDS (compat) backup failed")
+                    finally:
+                        gpu_stream.synchronize()
+                        operation.done.set()
+                elif not self.backup_skip:
                     self._page_backup(operation)
                 self.ack_backup_queue.put(operation)
                 # Decrement pipeline counter and signal idle only when fully drained

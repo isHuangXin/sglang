@@ -12,7 +12,11 @@ from typing import TYPE_CHECKING, Dict, List, Optional
 
 import torch
 
-from sglang.srt.managers.cache_controller import HiCacheController, PrefetchOperation
+from sglang.srt.managers.cache_controller import (
+    HiCacheController,
+    PrefetchOperation,
+    GPUStorageOperation,
+)
 from sglang.srt.mem_cache.base_prefix_cache import (
     EvictParams,
     EvictResult,
@@ -157,6 +161,9 @@ class HiRadixCache(RadixCache):
         # record the ongoing prefetch requests
         self.ongoing_prefetch = {}
         self.ongoing_backup = {}
+        self.flat_prefetch = {}
+        self.flat_pending_backup = set()
+        self.flat_gpu_mode = self.cache_controller.flat_gpu_mode
         # track per-request tokens loaded from storage (L3 hits)
         # key: request_id, value: number of tokens actually loaded from storage
         self.prefetch_loaded_tokens_by_reqid: dict[str, int] = {}
@@ -212,6 +219,8 @@ class HiRadixCache(RadixCache):
         )
 
         self.enable_storage = enable_storage
+        self.flat_gpu_mode = enable_storage and self.cache_controller.flat_gpu_mode
+        self.flat_memory_mode = enable_storage and storage_backend == "flat_memory"
         self.prefetch_threshold = prefetch_threshold
         self.prefetch_timeout_base = prefetch_timeout_base
         self.prefetch_timeout_per_page = prefetch_timeout_per_page
@@ -387,6 +396,8 @@ class HiRadixCache(RadixCache):
 
         self.enable_storage = False
         self.enable_storage_metrics = False
+        self.flat_gpu_mode = False
+        self.cache_controller.flat_gpu_mode = False
         return True, "Detached HiCache storage backend successfully."
 
     def _force_release_pending_storage_ops(self):
@@ -397,6 +408,15 @@ class HiRadixCache(RadixCache):
         to these structures should happen.
         """
         cc = self.cache_controller
+        if self.flat_gpu_mode:
+            for req_id, operation in list(self.flat_prefetch.items()):
+                operation.cancelled = True
+                self._finish_gpu_prefetch(req_id)
+            for node in self.ongoing_backup.values():
+                self.dec_lock_ref(node)
+            self.ongoing_backup.clear()
+            self.flat_pending_backup.clear()
+            return
 
         # Force release leftover prefetch ops: free pre-allocated host pages and
         # drop the host protection on the matched prefix node.
@@ -495,7 +515,15 @@ class HiRadixCache(RadixCache):
                 ack_id = operation.id
                 entry = self.ongoing_backup.pop(ack_id, None)
                 if entry is not None:
-                    entry.release_host()
+                    # FLAT_MEMORY: Enqueueing a write does not make its data readable.
+                    if self.flat_gpu_mode:
+                        entry.fm_stored = operation.completed_tokens == len(
+                            operation.token_ids
+                        )
+                        self.flat_pending_backup.discard(entry.id)
+                        self.dec_lock_ref(entry)
+                    else:
+                        entry.release_host()
                 if log_metrics and self.enable_storage_metrics:
                     self.storage_metrics_collector.log_backuped_tokens(
                         operation.completed_tokens
@@ -591,6 +619,9 @@ class HiRadixCache(RadixCache):
         )
 
     def reset(self):
+        if self.flat_gpu_mode:
+            self.cache_controller._stop_storage_threads()
+            self._force_release_pending_storage_ops()
         TreeNode.counter = 0
         # Flush the full GPU→Host→Storage pipeline before clearing queues.
         # Pipeline: ongoing_write_through (D2H) → writing_check → backup_queue → Storage
@@ -649,6 +680,17 @@ class HiRadixCache(RadixCache):
             return False
 
     def write_backup(self, node: TreeNode, write_back=False):
+        # FLAT_MEMORY: Hold source GPU pages through storage completion.
+        if self.flat_gpu_mode:
+            if node.fm_stored or node.id in self.flat_pending_backup:
+                return 0
+            self.inc_lock_ref(node)
+            self.flat_pending_backup.add(node.id)
+            operation_id = self.cache_controller.write_gpu_storage(
+                node.value, node.key.token_ids, node.hash_value
+            )
+            self.ongoing_backup[operation_id] = node
+            return len(node.value)
         # Track pipeline entry: increment before any async work begins
         if self.enable_storage:
             with self.cache_controller.pending_backup_lock:
@@ -713,6 +755,11 @@ class HiRadixCache(RadixCache):
             self.storage_metrics_collector.log_storage_write_tokens(len(node.host_value))
 
     def _inc_hit_count(self, node: TreeNode, chunked=False):
+        # FLAT_MEMORY: Restored immutable data must not be written again.
+        if self.flat_gpu_mode and (
+            node.fm_stored or node.id in self.flat_pending_backup
+        ):
+            return
         # skip the hit count update for chunked requests
         if self.cache_controller.write_policy == "write_back" or chunked:
             return
@@ -821,6 +868,9 @@ class HiRadixCache(RadixCache):
         return delta
 
     def _update_host_leaf_status(self, node: TreeNode):
+        if self.flat_gpu_mode and node.host_value is None:
+            self.evictable_host_leaves.discard(node)
+            return
         if not node.evicted or node.lock_ref > 0:
             if node in self.evictable_host_leaves:
                 self.evictable_host_leaves.remove(node)
@@ -1055,6 +1105,10 @@ class HiRadixCache(RadixCache):
         return self.cache_controller.start_loading()
 
     def check_hicache_events(self):
+        if self.flat_gpu_mode:
+            for req_id, operation in list(self.flat_prefetch.items()):
+                if operation.cancelled:
+                    self._finish_gpu_prefetch(req_id)
         self.writing_check()
         self.loading_check()
         if self.enable_storage:
@@ -1141,6 +1195,8 @@ class HiRadixCache(RadixCache):
         return can_terminate
 
     def check_prefetch_progress(self, req_id: str) -> bool:
+        if self.flat_gpu_mode:
+            return self._finish_gpu_prefetch(req_id)
         if req_id not in self.ongoing_prefetch:
             # there is no ongoing prefetch for this request or it has been revoked
             return True
@@ -1221,6 +1277,12 @@ class HiRadixCache(RadixCache):
         return True
 
     def terminate_prefetch(self, req_id: str):
+        if self.flat_gpu_mode:
+            operation = self.flat_prefetch.get(req_id)
+            if operation is not None:
+                operation.cancelled = True
+                self._finish_gpu_prefetch(req_id)
+            return
         if req_id not in self.ongoing_prefetch:
             return
 
@@ -1305,6 +1367,131 @@ class HiRadixCache(RadixCache):
             last_host_node=last_host_node,
             host_hit_length=host_hit_length,
         )
+
+    # FLAT_MEMORY: Page allocation and radix mutation stay on the scheduler thread.
+    def prefetch_gpu(self, req):
+        if req.rid in self.flat_prefetch:
+            return
+        cc = self.cache_controller
+        prefix_len = len(req.prefix_indices)
+        end = (len(req.fill_ids) - 1) // self.page_size * self.page_size
+        if end - prefix_len < self.prefetch_threshold:
+            return
+        hashes = []
+        last_hash = None
+        for start in range(0, end, self.page_size):
+            last_hash = cc.get_hash_str(
+                req.fill_ids[start : start + self.page_size], last_hash
+            )
+            if start >= prefix_len:
+                hashes.append(last_hash)
+        addresses, hit_pages = cc.storage_backend.resolve_gpu_prefix(hashes)
+        budget = max(0, cc.prefetch_capacity_limit - cc.prefetch_tokens_occupied)
+        count = (
+            min(hit_pages * self.page_size, budget) // self.page_size * self.page_size
+        )
+        if count < self.prefetch_threshold:
+            return
+        anchor = req.last_node
+        self.inc_lock_ref(anchor)
+        allocator = cc.mem_pool_device_allocator
+        reserve = 2 * self.page_size
+        missing = count + reserve - allocator.available_size()
+        if missing > 0:
+            self.evict(EvictParams(num_tokens=missing))
+        count = (
+            min(count, max(0, allocator.available_size() - reserve))
+            // self.page_size
+            * self.page_size
+        )
+        indices = allocator.alloc(count) if count >= self.prefetch_threshold else None
+        if indices is None:
+            self.dec_lock_ref(anchor)
+            return
+        count_pages = count // self.page_size
+        selected = [
+            address
+            for slot in range(len(cc.storage_backend.gpu_buffers))
+            for address in addresses[slot * hit_pages : slot * hit_pages + count_pages]
+        ]
+        operation = GPUStorageOperation(
+            indices,
+            req.fill_ids[prefix_len : prefix_len + count],
+            hashes[:count_pages],
+            req.rid,
+            req.flat_arrival_time,
+            selected,
+        )
+        operation.anchor = anchor
+        operation.extra_key = req.extra_key
+        self.flat_prefetch[req.rid] = operation
+        self.protected_size_ += count
+        cc.prefetch_tokens_occupied += count
+        cc.enqueue_gpu_prefetch(operation)
+
+    def _finish_gpu_prefetch(self, req_id):
+        operation = self.flat_prefetch.get(req_id)
+        if operation is None:
+            return True
+        if not operation.done.is_set():
+            return False
+        cc = self.cache_controller
+        self.protected_size_ -= len(operation.device_indices)
+        if operation.cancelled or operation.error:
+            cc.mem_pool_device_allocator.free(operation.device_indices)
+            loaded = 0
+        else:
+            completed = operation.completed_tokens
+            key = RadixKey(
+                token_ids=operation.token_ids[:completed], extra_key=operation.extra_key
+            )
+            value = operation.device_indices[:completed]
+            hashes = operation.hash_value[: completed // self.page_size]
+            node = operation.anchor
+            loaded = 0
+            while len(key):
+                child_key = self.get_child_key_fn(key)
+                child = node.children.get(child_key)
+                if child is None:
+                    child = TreeNode(priority=node.priority)
+                    child.parent = node
+                    child.key = key
+                    child.value = value.clone()
+                    child.hash_value = hashes
+                    child.fm_stored = True
+                    node.children[child_key] = child
+                    self.evictable_size_ += len(value)
+                    loaded += len(value)
+                    self._update_leaf_status(node)
+                    self._update_leaf_status(child)
+                    break
+                length = self.key_match_fn(child.key, key)
+                if length < len(child.key):
+                    child = self._split_node(child.key, child, length)
+                if child.evicted:
+                    child.value = value[:length].clone()
+                    self.evictable_size_ += length
+                    loaded += length
+                else:
+                    cc.mem_pool_device_allocator.free(value[:length])
+                child.fm_stored = True
+                self._update_leaf_status(child)
+                self._update_leaf_status(node)
+                self._update_host_leaf_status(child)
+                node = child
+                key, value = key[length:], value[length:]
+                hashes = hashes[length // self.page_size :]
+            cc.mem_pool_device_allocator.free(operation.device_indices[completed:])
+        self.dec_lock_ref(operation.anchor)
+        cc.prefetch_tokens_occupied -= len(operation.device_indices)
+        del self.flat_prefetch[req_id]
+        if not operation.cancelled:
+            self.prefetch_loaded_tokens_by_reqid[req_id] = loaded
+            self._prefetch_latency_by_reqid[req_id] = (
+                (time.monotonic() - operation.arrival_time) * 1000,
+                loaded,
+            )
+        return True
 
     def prefetch_from_storage(
         self,
@@ -1403,6 +1590,9 @@ class HiRadixCache(RadixCache):
 
         while len(key) > 0 and child_key in node.children.keys():
             child = node.children[child_key]
+            # FLAT_MEMORY: A GPU prefix cannot skip an evicted ancestor.
+            if self.flat_gpu_mode and child.evicted:
+                break
             child.last_access_time = time.monotonic()
             prefix_len = self.key_match_fn(child.key, key)
             if prefix_len < len(child.key):
@@ -1430,6 +1620,8 @@ class HiRadixCache(RadixCache):
         new_node.lock_ref = child.lock_ref
         new_node.key = child.key[:split_len]
         new_node.hit_count = child.hit_count
+        # FLAT_MEMORY: Splitting radix metadata does not change immutable placement.
+        new_node.fm_stored = child.fm_stored
 
         # split value and host value if exists
         if child.evicted:
@@ -1531,6 +1723,11 @@ class HiRadixCache(RadixCache):
         return InsertResult(prefix_len=total_prefix_length)
 
     def release_aborted_request(self, rid: str):
+        if self.flat_gpu_mode:
+            self.terminate_prefetch(rid)
+            self.prefetch_loaded_tokens_by_reqid.pop(rid, None)
+            self._prefetch_latency_by_reqid.pop(rid, None)
+            return
         # Clean up storage hit tracking for aborted request
         self.prefetch_loaded_tokens_by_reqid.pop(rid, None)
 

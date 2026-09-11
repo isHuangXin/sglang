@@ -87,6 +87,145 @@ class FlatMemoryStore(HiCacheStorage):
         self.prefetch_bandwidth = []
         self.backup_bandwidth = []
 
+    # FLAT_MEMORY: GPU-file payloads never use the HiCache host pool.
+    @property
+    def gpu_direct(self) -> bool:
+        return self.manager.config.gds_mode == "compat"
+
+    def register_mem_pool_device(self, pool):
+        from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+
+        if type(pool) is not MHATokenToKVPool or self.is_mla_backend:
+            raise ValueError(
+                "GDS (compat) currently supports standard MHA/GQA KV pools"
+            )
+        if pool.store_dtype not in (torch.float16, torch.bfloat16):
+            raise ValueError("GDS (compat) requires FP16/BF16 KV data")
+        self.mem_pool_device = pool
+        self.gpu_buffers = [
+            buffer
+            for layer in range(pool.start_layer, pool.start_layer + pool.layer_num)
+            for buffer in (pool._get_key_buffer(layer), pool._get_value_buffer(layer))
+        ]
+        self.gpu_page_bytes = [
+            buffer[0].nbytes * pool.page_size for buffer in self.gpu_buffers
+        ]
+        if len(set(self.gpu_page_bytes)) != 1:
+            raise ValueError("GDS (compat) requires equal K/V page sizes")
+        self.gpu_slot_bytes = (self.gpu_page_bytes[0] + 4095) // 4096 * 4096
+        self.gpu_stage_bytes = 128 * 1024 * 1024
+        self.gpu_batch_pages = max(
+            1, self.gpu_stage_bytes // (len(self.gpu_buffers) * self.gpu_slot_bytes)
+        )
+        self.gb_per_page = sum(self.gpu_page_bytes) / (1 << 30)
+
+    def _gpu_keys(self, keys: List[str]) -> List[str]:
+        return [
+            f"{key}_{self.mha_suffix}_l{layer}_{kind}"
+            for layer in range(
+                self.mem_pool_device.start_layer,
+                self.mem_pool_device.start_layer + self.mem_pool_device.layer_num,
+            )
+            for kind in ("k", "v")
+            for key in keys
+        ]
+
+    def resolve_gpu_prefix(self, keys: List[str]):
+        if not keys:
+            return [], 0
+        addresses = self.manager.lookup_addresses(self._gpu_keys(keys))
+        pages = len(keys)
+        hit = pages
+        for slot in range(len(self.gpu_buffers)):
+            for page, address in enumerate(
+                addresses[slot * pages : (slot + 1) * pages]
+            ):
+                if address == 0:
+                    hit = min(hit, page)
+                    break
+        return [
+            address
+            for slot in range(len(self.gpu_buffers))
+            for address in addresses[slot * pages : slot * pages + hit]
+        ], hit
+
+    def write_gpu_pages(self, keys: List[str], device_indices: torch.Tensor) -> int:
+        page_size = self.mem_pool_device.page_size
+        completed = 0
+        for start in range(0, len(keys), self.gpu_batch_pages):
+            batch = keys[start : start + self.gpu_batch_pages]
+            indices = device_indices[
+                start * page_size : (start + len(batch)) * page_size
+            ]
+            packed = torch.zeros(
+                (len(self.gpu_buffers), len(batch), self.gpu_slot_bytes),
+                dtype=torch.uint8,
+                device=indices.device,
+            )
+            for slot, buffer in enumerate(self.gpu_buffers):
+                data = (
+                    buffer.index_select(0, indices)
+                    .view(torch.uint8)
+                    .reshape(len(batch), -1)
+                )
+                packed[slot, :, : self.gpu_page_bytes[slot]].copy_(data)
+            torch.cuda.current_stream().synchronize()
+            pointers = [part.data_ptr() for part in packed.flatten(0, 1)]
+            results = self.manager.put_gpu_file(
+                self._gpu_keys(batch), pointers, [self.gpu_slot_bytes] * len(pointers)
+            )
+            if not all(results):
+                break
+            completed += len(batch) * page_size
+        return completed
+
+    def read_gpu_pages(self, addresses: List[int], device_indices: torch.Tensor) -> int:
+        page_size = self.mem_pool_device.page_size
+        pages = len(device_indices) // page_size
+        completed = 0
+        for start in range(0, pages, self.gpu_batch_pages):
+            count = min(self.gpu_batch_pages, pages - start)
+            packed = torch.empty(
+                (len(self.gpu_buffers), count, self.gpu_slot_bytes),
+                dtype=torch.uint8,
+                device=device_indices.device,
+            )
+            selected = [
+                address
+                for slot in range(len(self.gpu_buffers))
+                for address in addresses[
+                    slot * pages + start : slot * pages + start + count
+                ]
+            ]
+            pointers = [part.data_ptr() for part in packed.flatten(0, 1)]
+            results = self.manager.read_gpu(
+                selected, pointers, [self.gpu_slot_bytes] * len(pointers)
+            )
+            good = next(
+                (
+                    page
+                    for page in range(count)
+                    if not all(
+                        results[slot * count + page]
+                        for slot in range(len(self.gpu_buffers))
+                    )
+                ),
+                count,
+            )
+            indices = device_indices[start * page_size : (start + good) * page_size]
+            if good:
+                for slot, buffer in enumerate(self.gpu_buffers):
+                    data = packed[slot, :good, : self.gpu_page_bytes[slot]].contiguous()
+                    data = data.view(buffer.dtype).reshape(
+                        good * page_size, *buffer.shape[1:]
+                    )
+                    buffer.index_copy_(0, indices, data)
+                torch.cuda.current_stream().synchronize()
+                completed += good * page_size
+            if good != count:
+                break
+        return completed
+
     # ---- Memory pool registration (same pattern as MooncakeStore) ----
 
     def register_mem_pool_host(self, mem_pool_host: HostKVCache):
@@ -326,6 +465,9 @@ class FlatMemoryStore(HiCacheStorage):
         keys: List[str],
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> int:
+        # FLAT_MEMORY: A page is visible only when every layer is committed.
+        if self.gpu_direct:
+            return self.resolve_gpu_prefix(keys)[1]
         if self.is_mla_backend:
             query_keys = [f"{key}_{self.mla_suffix}_k" for key in keys]
             key_multiplier = 1
@@ -410,4 +552,5 @@ class FlatMemoryStore(HiCacheStorage):
             "bandwidth": bandwidth_report,
             # Capacity management (overflow/dedup/delete)
             "capacity": capacity_stats,
+            "cio": self.manager.get_cio_stats(),
         }

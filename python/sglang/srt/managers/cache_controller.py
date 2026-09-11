@@ -313,6 +313,32 @@ class PrefetchOperation(StorageOperation):
             return self._terminated_flag
 
 
+class GPUStorageOperation(StorageOperation):
+    def __init__(
+        self,
+        indices,
+        token_ids,
+        hash_value,
+        request_id="",
+        arrival_time=None,
+        addresses=None,
+    ):
+        super().__init__(None, token_ids, hash_value=hash_value)
+        self.device_indices = indices
+        self.request_id = request_id
+        self.addresses = addresses or []
+        self.arrival_time = time.monotonic() if arrival_time is None else arrival_time
+        self.done = threading.Event()
+        self.cancelled = False
+        self.error = None
+        self.start_event = torch.cuda.Event()
+        self.finish_event = torch.cuda.Event()
+        self.start_event.record()
+        self.anchor = None
+        self.extra_key = None
+
+
+
 class HiCacheController:
 
     def __init__(

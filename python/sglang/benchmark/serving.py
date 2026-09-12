@@ -112,6 +112,9 @@ class RequestFuncOutput:
     cached_tokens_host: int = 0
     cached_tokens_storage: int = 0
     cached_tokens_details: Optional[Dict[str, Any]] = None
+    server_prompt_tokens: Optional[int] = None
+    server_completion_tokens: Optional[int] = None
+    server_cached_tokens: Optional[int] = None
     spec_accept_length: float = 0.0
     spec_cap_length: float = 0.0
     spec_block_accept_length: float = 0.0
@@ -733,57 +736,45 @@ async def async_request_sglang_generate(
                         else:
                             data = orjson.loads(sse_data)
 
-                            _meta_info = data.get("meta_info") or {}
-                            if _meta_info.get("spec_accept_length") is not None:
-                                output.spec_accept_length = _meta_info[
-                                    "spec_accept_length"
-                                ]
-
-                            output.cached_tokens = _meta_info.get("cached_tokens", 0)
-                            output.cached_tokens_details = _meta_info.get(
-                                "cached_tokens_details"
-                            )
-                            details = output.cached_tokens_details or {}
-                            output.cached_tokens_device = details.get("device", 0)
-                            output.cached_tokens_host = details.get("host", 0)
-                            output.cached_tokens_storage = details.get("storage", 0)
-
-                            # A final usage-only response does not contain a new token.
-                            if "text" in data and data["text"]:
-                                timestamp = time.perf_counter()
+                            meta_info = data.get("meta_info") or {}
+                            if meta_info.get("spec_accept_length") is not None:
+                                output.spec_accept_length = meta_info["spec_accept_length"]
+                            if "text" in data:
                                 generated_text = data["text"]
-                                output_len = data["meta_info"]["completion_tokens"]
-                                output.cached_tokens = data["meta_info"].get("cached_tokens", 0)
-                                details = data["meta_info"].get("cached_tokens_details")
-                                if details:
-                                    output.cached_tokens_device = details.get("device", 0)
-                                    output.cached_tokens_host = details.get("host", 0)
-                                    output.cached_tokens_storage = details.get("storage", 0)
-                                    # KVCache block granularity
-                                    output.kvcache_page_size = details.get("page_size", 0)
-                                    output.kvcache_bytes_per_page = details.get("bytes_per_page", 0)
-                                    # Transfer metrics
-                                    output.storage_read_latency_ms = details.get("storage_read_latency_ms", 0.0)
-                                    output.storage_read_tokens = details.get("storage_read_tokens", 0)
-                                    output.d2h_tokens = details.get("d2h_tokens", 0)
-                                    output.storage_write_tokens = details.get("storage_write_tokens", 0)
-
-                                # First token
-                                if ttft == 0.0:
-                                    ttft = time.perf_counter() - st
-                                    output.ttft = ttft
-
-                                # Decoding phase
+                            if "prompt_tokens" in meta_info:
+                                output.server_prompt_tokens = meta_info["prompt_tokens"]
+                            if "cached_tokens" in meta_info:
+                                output.server_cached_tokens = meta_info["cached_tokens"]
+                                output.cached_tokens = output.server_cached_tokens
+                            details = meta_info.get("cached_tokens_details")
+                            if details is not None:
+                                output.cached_tokens_details = details
+                                output.cached_tokens_device = details.get("device", 0)
+                                output.cached_tokens_host = details.get("host", 0)
+                                output.cached_tokens_storage = details.get("storage", 0)
+                                output.kvcache_page_size = details.get("page_size", 0)
+                                output.kvcache_bytes_per_page = details.get("bytes_per_page", 0)
+                                output.storage_read_latency_ms = details.get("storage_read_latency_ms", 0.0)
+                                output.storage_read_tokens = details.get("storage_read_tokens", 0)
+                                output.d2h_tokens = details.get("d2h_tokens", 0)
+                                output.storage_write_tokens = details.get("storage_write_tokens", 0)
+                            completion_tokens = meta_info.get("completion_tokens")
+                            if completion_tokens is not None:
+                                output.server_completion_tokens = completion_tokens
+                                output_len = completion_tokens
+                                if completion_tokens <= last_output_len:
+                                    continue
+                                timestamp = time.perf_counter()
+                                if last_output_len == 0:
+                                    output.ttft = timestamp - st
                                 else:
-                                    num_new_tokens = output_len - last_output_len
-                                    if num_new_tokens == 0:
-                                        continue
-                                    chunk_gap = timestamp - most_recent_timestamp
-                                    adjust_itl = chunk_gap / num_new_tokens
-                                    output.itl.extend([adjust_itl] * num_new_tokens)
-
+                                    num_new_tokens = completion_tokens - last_output_len
+                                    output.itl.extend(
+                                        [(timestamp - most_recent_timestamp) / num_new_tokens]
+                                        * num_new_tokens
+                                    )
                                 most_recent_timestamp = timestamp
-                                last_output_len = output_len
+                                last_output_len = completion_tokens
 
                     output.generated_text = generated_text
                     output.success = True
@@ -2364,6 +2355,9 @@ async def benchmark(
         "cached_tokens_device": [output.cached_tokens_device for output in outputs],
         "cached_tokens_host": [output.cached_tokens_host for output in outputs],
         "cached_tokens_storage": [output.cached_tokens_storage for output in outputs],
+        "server_prompt_tokens": [output.server_prompt_tokens for output in outputs],
+        "server_completion_tokens": [output.server_completion_tokens for output in outputs],
+        "server_cached_tokens": [output.server_cached_tokens for output in outputs],
     }
 
     if args.cache_report:

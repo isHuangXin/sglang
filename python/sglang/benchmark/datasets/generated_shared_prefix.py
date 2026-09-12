@@ -17,6 +17,7 @@ from sglang.benchmark.datasets.common import (
     DatasetRow,
     compute_random_lens,
     gen_prompt,
+    get_available_tokens,
 )
 
 
@@ -51,10 +52,18 @@ class GeneratedSharedPrefixDataset(BaseDataset):
     ordered: bool
     group_distribution: str = "uniform"
     zipf_alpha: Optional[float] = None
+    tokenize_prompt: bool = False
 
     @classmethod
     def from_args(cls, args: Namespace) -> "GeneratedSharedPrefixDataset":
-        assert not getattr(args, "tokenize_prompt", False)
+        tokenize_prompt = getattr(args, "tokenize_prompt", False)
+        if tokenize_prompt:
+            if args.backend != "sglang":
+                raise ValueError("Token-ID GSP requires --backend sglang")
+            if getattr(args, "gsp_num_turns", 1) != 1:
+                raise ValueError("Token-ID GSP supports one turn only")
+            if getattr(args, "gsp_fast_prepare", False):
+                raise ValueError("Token-ID GSP is incompatible with --gsp-fast-prepare")
         group_distribution = getattr(args, "gsp_group_distribution", "uniform")
         zipf_alpha = getattr(args, "gsp_zipf_alpha", None)
 
@@ -97,6 +106,7 @@ class GeneratedSharedPrefixDataset(BaseDataset):
             ordered=getattr(args, "gsp_ordered", False),
             group_distribution=group_distribution,
             zipf_alpha=zipf_alpha,
+            tokenize_prompt=tokenize_prompt,
         )
 
     def load(
@@ -117,6 +127,7 @@ class GeneratedSharedPrefixDataset(BaseDataset):
             ordered=self.ordered,
             group_distribution=self.group_distribution,
             zipf_alpha=self.zipf_alpha,
+            tokenize_prompt=self.tokenize_prompt,
         )
 
 
@@ -131,6 +142,8 @@ def get_gen_prefix_cache_path(
     group_distribution: str = "uniform",
     zipf_alpha: Optional[float] = None,
     num_turns: int = 1,
+    ordered: bool = False,
+    fast_prepare: bool = False,
 ):
     """Create cache directory under ~/.cache/sglang/benchmark.
 
@@ -143,11 +156,18 @@ def get_gen_prefix_cache_path(
     suffix = ""
     if group_distribution != "uniform":
         suffix = f"_{group_distribution}_{zipf_alpha}"
+    # FLAT_MEMORY: Cached ordering, turn shape and estimated lengths are distinct payloads.
+    if num_turns != 1:
+        suffix += f"_turns{num_turns}"
+    if ordered:
+        suffix += "_ordered"
+    if fast_prepare:
+        suffix += "_fast"
 
     cache_key = (
         f"gen_shared_prefix_{seed}_{num_groups}_{prompts_per_group}_"
         f"{system_prompt_len}_{question_len}_{output_len}{suffix}_"
-        f"{num_turns}_{tokenizer.__class__.__name__}.pkl"
+        f"{tokenizer.__class__.__name__}.pkl"
     )
     return cache_dir / cache_key
 
@@ -167,6 +187,7 @@ def sample_generated_shared_prefix_requests(
     ordered: bool = False,
     group_distribution: str = "uniform",
     zipf_alpha: Optional[float] = None,
+    tokenize_prompt: bool = False,
 ) -> List[DatasetRow]:
     """Generate benchmark requests with shared system prompts using random tokens and caching.
 
@@ -181,20 +202,26 @@ def sample_generated_shared_prefix_requests(
     Zipf mode is cached on disk under a distinct key per (group_distribution,
     zipf_alpha) value.
     """
-    cache_path = get_gen_prefix_cache_path(
-        seed,
-        num_groups,
-        prompts_per_group,
-        system_prompt_len,
-        question_len,
-        output_len,
-        tokenizer,
-        group_distribution=group_distribution,
-        zipf_alpha=zipf_alpha,
-        num_turns=num_turns,
-    )
-    # Routing keys embed per-run identity and cannot be cached.
-    should_cache = range_ratio == 1 and not send_routing_key
+    if tokenize_prompt and (num_turns != 1 or fast_prepare):
+        raise ValueError("Token-ID GSP requires one turn and exact preparation")
+    # FLAT_MEMORY: Token IDs must never consult or populate the decoded-text cache.
+    should_cache = not tokenize_prompt and range_ratio == 1 and not send_routing_key
+    cache_path = None
+    if should_cache:
+        cache_path = get_gen_prefix_cache_path(
+            seed,
+            num_groups,
+            prompts_per_group,
+            system_prompt_len,
+            question_len,
+            output_len,
+            tokenizer,
+            group_distribution=group_distribution,
+            zipf_alpha=zipf_alpha,
+            num_turns=num_turns,
+            ordered=ordered,
+            fast_prepare=fast_prepare,
+        )
 
     if should_cache and cache_path.exists():
         print(f"\nLoading cached generated input data from {cache_path}")
@@ -233,17 +260,29 @@ def sample_generated_shared_prefix_requests(
     ).reshape(num_groups, prompts_per_group)
     del system_prompt_len, question_len, output_len
 
-    system_prompts = [
-        gen_prompt(tokenizer, system_prompt_lens[i]) for i in range(num_groups)
-    ]
+    if tokenize_prompt:
+        special_ids = set(tokenizer.all_special_ids)
+        tokens = [
+            token
+            for token in get_available_tokens(tokenizer)
+            if token not in special_ids
+        ]
+        if not tokens:
+            raise ValueError("Token-ID GSP requires a non-special tokenizer vocabulary")
+
+    def make_prompt(length):
+        return (
+            random.choices(tokens, k=int(length))
+            if tokenize_prompt
+            else gen_prompt(tokenizer, int(length))
+        )
+
+    system_prompts = [make_prompt(system_prompt_lens[i]) for i in range(num_groups)]
 
     # shape: (num_groups, prompts_per_group, num_turns)
     questions = [
         [
-            [
-                gen_prompt(tokenizer, int(question_lens[g, p, t]))
-                for t in range(num_turns)
-            ]
+            [make_prompt(question_lens[g, p, t]) for t in range(num_turns)]
             for p in range(prompts_per_group)
         ]
         for g in range(num_groups)
@@ -281,9 +320,15 @@ def sample_generated_shared_prefix_requests(
             else None
         )
         turn_questions = questions[src_g][src_p]
-        turn_prompts = [f"{system_prompt}\n\n{turn_questions[0]}"] + turn_questions[1:]
-        full_prompt = turn_prompts[0] if num_turns == 1 else turn_prompts
-        prompt_len = 1 if fast_prepare else len(tokenizer.encode(turn_prompts[0]))
+        if tokenize_prompt:
+            full_prompt = system_prompt + turn_questions[0]
+            prompt_len = len(full_prompt)
+        else:
+            turn_prompts = [f"{system_prompt}\n\n{turn_questions[0]}"] + turn_questions[
+                1:
+            ]
+            full_prompt = turn_prompts[0] if num_turns == 1 else turn_prompts
+            prompt_len = 1 if fast_prepare else len(tokenizer.encode(turn_prompts[0]))
         output_len_val = int(output_lens[src_g, src_p])
 
         input_requests.append(
@@ -311,12 +356,15 @@ def sample_generated_shared_prefix_requests(
     if not fast_prepare:
         print(f"Total input tokens: {total_input_tokens}")
         print(f"Total output tokens: {total_output_tokens}")
+        prompt_length = (
+            len if tokenize_prompt else lambda value: len(tokenizer.encode(value))
+        )
         print(
-            f"Average system prompt length: {sum(len(tokenizer.encode(sp)) for sp in system_prompts) / len(system_prompts):.1f} tokens"
+            f"Average system prompt length: {sum(prompt_length(sp) for sp in system_prompts) / len(system_prompts):.1f} tokens"
         )
         all_questions = [q for group in questions for conv in group for q in conv]
         print(
-            f"Average question length: {sum(len(tokenizer.encode(q)) for q in all_questions) / len(all_questions):.1f} tokens\n"
+            f"Average question length: {sum(prompt_length(q) for q in all_questions) / len(all_questions):.1f} tokens\n"
         )
 
     if should_cache:

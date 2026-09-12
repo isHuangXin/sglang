@@ -115,6 +115,10 @@ class RequestFuncOutput:
     d2h_tokens: int = 0
     storage_write_tokens: int = 0
     start_time: float = 0.0
+    # FLAT_MEMORY: Preserve missing server usage metadata as None.
+    server_prompt_tokens: Optional[int] = None
+    server_completion_tokens: Optional[int] = None
+    server_cached_tokens: Optional[int] = None
 
     @staticmethod
     def init_new(request_func_input: RequestFuncInput):
@@ -632,7 +636,6 @@ async def async_request_sglang_generate(
 
         generated_text = ""
         output_len = request_func_input.output_len
-        ttft = 0.0
         st = time.perf_counter()
         output.start_time = st
         most_recent_timestamp = st
@@ -654,38 +657,46 @@ async def async_request_sglang_generate(
                         else:
                             data = json.loads(chunk)
 
-                            # NOTE: Some completion API might have a last
-                            # usage summary response without a token so we
-                            # want to check a token was generated
                             if "text" in data and data["text"]:
-                                timestamp = time.perf_counter()
                                 generated_text = data["text"]
-                                output_len = data["meta_info"]["completion_tokens"]
-                                output.cached_tokens = data["meta_info"].get("cached_tokens", 0)
-                                details = data["meta_info"].get("cached_tokens_details")
-                                if details:
-                                    output.cached_tokens_device = details.get("device", 0)
-                                    output.cached_tokens_host = details.get("host", 0)
-                                    output.cached_tokens_storage = details.get("storage", 0)
-                                    # KVCache block granularity
-                                    output.kvcache_page_size = details.get("page_size", 0)
-                                    output.kvcache_bytes_per_page = details.get("bytes_per_page", 0)
-                                    # Transfer metrics
-                                    output.storage_read_latency_ms = details.get("storage_read_latency_ms", 0.0)
-                                    output.storage_read_tokens = details.get("storage_read_tokens", 0)
-                                    output.d2h_tokens = details.get("d2h_tokens", 0)
-                                    output.storage_write_tokens = details.get("storage_write_tokens", 0)
+
+                            # FLAT_MEMORY: Read usage even for empty-text metadata chunks.
+                            meta_info = data.get("meta_info", {})
+                            if "prompt_tokens" in meta_info:
+                                output.server_prompt_tokens = meta_info["prompt_tokens"]
+                            if "cached_tokens" in meta_info:
+                                output.server_cached_tokens = meta_info["cached_tokens"]
+                                output.cached_tokens = output.server_cached_tokens
+                            details = meta_info.get("cached_tokens_details")
+                            if details:
+                                output.cached_tokens_device = details.get("device", 0)
+                                output.cached_tokens_host = details.get("host", 0)
+                                output.cached_tokens_storage = details.get("storage", 0)
+                                # KVCache block granularity
+                                output.kvcache_page_size = details.get("page_size", 0)
+                                output.kvcache_bytes_per_page = details.get("bytes_per_page", 0)
+                                # Transfer metrics
+                                output.storage_read_latency_ms = details.get("storage_read_latency_ms", 0.0)
+                                output.storage_read_tokens = details.get("storage_read_tokens", 0)
+                                output.d2h_tokens = details.get("d2h_tokens", 0)
+                                output.storage_write_tokens = details.get("storage_write_tokens", 0)
+
+                            completion_tokens = meta_info.get("completion_tokens")
+                            if completion_tokens is not None:
+                                output.server_completion_tokens = completion_tokens
+                                output_len = completion_tokens
+                                # FLAT_MEMORY: Only new tokens advance TTFT and ITL.
+                                if output_len <= last_output_len:
+                                    continue
+                                timestamp = time.perf_counter()
 
                                 # First token
-                                if ttft == 0.0:
-                                    ttft = time.perf_counter() - st
-                                    output.ttft = ttft
+                                if last_output_len == 0:
+                                    output.ttft = timestamp - st
 
                                 # Decoding phase
                                 else:
                                     num_new_tokens = output_len - last_output_len
-                                    if num_new_tokens == 0:
-                                        continue
                                     chunk_gap = timestamp - most_recent_timestamp
                                     adjust_itl = chunk_gap / num_new_tokens
                                     output.itl.extend([adjust_itl] * num_new_tokens)
@@ -910,7 +921,6 @@ def get_dataset(args, tokenizer, model_id=None):
             random_image_count=args.random_image_count,
         )
     elif args.dataset_name == "generated-shared-prefix":
-        assert not tokenize_prompt
         input_requests = sample_generated_shared_prefix_requests(
             num_groups=args.gsp_num_groups,
             prompts_per_group=args.gsp_prompts_per_group,
@@ -1957,12 +1967,31 @@ def sample_generated_shared_prefix_requests(
     """Generate benchmark requests with shared system prompts using random tokens and caching."""
     send_routing_key = getattr(args, "gsp_send_routing_key", False)
     num_turns = getattr(args, "gsp_num_turns", 1)
+    tokenize_prompt = getattr(args, "tokenize_prompt", False)
 
-    cache_path = get_gen_prefix_cache_path(args, tokenizer)
-    should_cache = (range_ratio == 1) and not send_routing_key
+    # FLAT_MEMORY: Exact-token GSP supports native single-turn requests only.
+    if tokenize_prompt:
+        if args.backend != "sglang":
+            raise ValueError("--tokenize-prompt requires --backend sglang")
+        if num_turns != 1:
+            raise ValueError("--tokenize-prompt requires --gsp-num-turns 1")
+        if getattr(args, "gsp_fast_prepare", False):
+            raise ValueError("--tokenize-prompt is incompatible with --gsp-fast-prepare")
+        special_token_ids = set(tokenizer.all_special_ids)
+        available_token_ids = [
+            token_id
+            for token_id in get_available_tokens(tokenizer)
+            if token_id not in special_token_ids
+        ]
+        if not available_token_ids:
+            raise ValueError("Tokenizer has no non-special token IDs for GSP")
+
+    # FLAT_MEMORY: Token-ID prompts never read or write the text pickle cache.
+    cache_path = None if tokenize_prompt else get_gen_prefix_cache_path(args, tokenizer)
+    should_cache = (range_ratio == 1) and not send_routing_key and not tokenize_prompt
 
     # Try to load from cache first
-    if cache_path.exists() and should_cache:
+    if should_cache and cache_path.exists():
         print(f"\nLoading cached generated input data from {cache_path}")
         with open(cache_path, "rb") as f:
             return pickle.load(f)
@@ -1996,18 +2025,22 @@ def sample_generated_shared_prefix_requests(
     ).reshape(num_groups, prompts_per_group)
     del system_prompt_len, question_len, output_len
 
+    # FLAT_MEMORY: Reuse generation and statistics without token round-trips.
+    def generate_prompt(token_num):
+        if tokenize_prompt:
+            return random.choices(available_token_ids, k=token_num)
+        return gen_prompt(tokenizer, token_num)
+
+    def get_prompt_len(prompt):
+        return len(prompt) if tokenize_prompt else len(tokenizer.encode(prompt))
+
     # Generate system prompts for each group
-    system_prompts = [
-        gen_prompt(tokenizer, system_prompt_lens[i]) for i in range(num_groups)
-    ]
+    system_prompts = [generate_prompt(system_prompt_lens[i]) for i in range(num_groups)]
 
     # Generate questions: shape (num_groups, prompts_per_group, num_turns)
     questions = [
         [
-            [
-                gen_prompt(tokenizer, int(question_lens[g, p, t]))
-                for t in range(num_turns)
-            ]
+            [generate_prompt(int(question_lens[g, p, t])) for t in range(num_turns)]
             for p in range(prompts_per_group)
         ]
         for g in range(num_groups)
@@ -2029,14 +2062,16 @@ def sample_generated_shared_prefix_requests(
             range(prompts_per_group), desc="Generating questions", leave=False
         ):
             turn_questions = questions[group_idx][prompt_idx]
-            turn_prompts = [f"{system_prompt}\n\n{turn_questions[0]}"] + turn_questions[
-                1:
-            ]
+            turn_prompts = (
+                [system_prompt + turn_questions[0]]
+                if tokenize_prompt
+                else [f"{system_prompt}\n\n{turn_questions[0]}"] + turn_questions[1:]
+            )
             full_prompt = turn_prompts[0] if num_turns == 1 else turn_prompts
             prompt_len = (
                 1
                 if getattr(args, "gsp_fast_prepare", False)
-                else len(tokenizer.encode(turn_prompts[0]))
+                else get_prompt_len(turn_prompts[0])
             )
             output_len_val = int(output_lens[group_idx, prompt_idx])
 
@@ -2064,11 +2099,11 @@ def sample_generated_shared_prefix_requests(
         print(f"Total input tokens: {total_input_tokens}")
         print(f"Total output tokens: {total_output_tokens}")
         print(
-            f"Average system prompt length: {sum(len(tokenizer.encode(sp)) for sp in system_prompts) / len(system_prompts):.1f} tokens"
+            f"Average system prompt length: {sum(get_prompt_len(sp) for sp in system_prompts) / len(system_prompts):.1f} tokens"
         )
         all_questions = [q for group in questions for conv in group for q in conv]
         print(
-            f"Average question length: {sum(len(tokenizer.encode(q)) for q in all_questions) / len(all_questions):.1f} tokens\n"
+            f"Average question length: {sum(get_prompt_len(q) for q in all_questions) / len(all_questions):.1f} tokens\n"
         )
 
     # Save to cache
@@ -3209,6 +3244,12 @@ async def benchmark(
         "cached_tokens_device": [output.cached_tokens_device for output in outputs],
         "cached_tokens_host": [output.cached_tokens_host for output in outputs],
         "cached_tokens_storage": [output.cached_tokens_storage for output in outputs],
+        # FLAT_MEMORY: Keep actual per-request server usage separate from estimates.
+        "server_prompt_tokens": [output.server_prompt_tokens for output in outputs],
+        "server_completion_tokens": [
+            output.server_completion_tokens for output in outputs
+        ],
+        "server_cached_tokens": [output.server_cached_tokens for output in outputs],
     }
 
     # Append results to a JSONL file

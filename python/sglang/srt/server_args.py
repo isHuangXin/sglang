@@ -2775,6 +2775,7 @@ class ServerArgs:
                 "file",
                 "sim",
                 "mooncake",
+                "flat_memory",  # FLAT_MEMORY: Host storage and GPU-file compat backend.
                 "hf3fs",
                 "nixl",
                 "aibrix",
@@ -2783,7 +2784,6 @@ class ServerArgs:
                 "simm",
                 "mori",
                 "shm",
-                "flat_memory",
             ],
         ),
         NS("memory"),

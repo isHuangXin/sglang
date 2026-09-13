@@ -1,12 +1,10 @@
 from __future__ import annotations
 
-import json
 import logging
-import os
 import threading
 import time
 from dataclasses import replace
-from queue import Empty, Queue
+from queue import Queue
 from typing import TYPE_CHECKING, Any, Callable, List, Optional
 
 import torch
@@ -35,6 +33,7 @@ from sglang.srt.mem_cache.hicache_storage import (
 from sglang.srt.mem_cache.l2_transfer import L2Transfer
 from sglang.srt.mem_cache.pool_host import HostPoolGroup, PoolEntry
 from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
+from sglang.srt.mem_cache.storage_config import load_storage_extra_config
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
@@ -181,28 +180,8 @@ class HybridCacheController(BaseHiCacheController):
     def parse_storage_backend_extra_config(
         storage_backend_extra_config: Optional[str],
     ) -> tuple[dict, int, float, float, bool]:
-        extra_config = {}
-        if storage_backend_extra_config:
-            if storage_backend_extra_config.startswith("@"):
-                path = storage_backend_extra_config[1:]
-                ext = os.path.splitext(path)[1].lower()
-                with open(path, "rb" if ext == ".toml" else "r") as f:
-                    if ext == ".json":
-                        extra_config = json.load(f)
-                    elif ext == ".toml":
-                        import tomllib
-
-                        extra_config = tomllib.load(f)
-                    elif ext in (".yaml", ".yml"):
-                        import yaml
-
-                        extra_config = yaml.safe_load(f)
-                    else:
-                        raise ValueError(
-                            f"Unsupported config file {path} (config format: {ext})"
-                        )
-            else:
-                extra_config = json.loads(storage_backend_extra_config)
+        # FLAT_MEMORY: Startup, runtime attach, and direct-linker validation share one parser.
+        extra_config = load_storage_extra_config(storage_backend_extra_config)
 
         prefetch_threshold = extra_config.pop("prefetch_threshold", 256)
         prefetch_timeout_base = extra_config.pop("prefetch_timeout_base", 1)
@@ -572,10 +551,17 @@ class HybridCacheController(BaseHiCacheController):
             prefix_keys=prefix_keys,
             pool_transfers=extra_pools,
         )
-        self.backup_queue.put(operation)
+        self._enqueue_storage_operation(operation)
         return operation.id
 
     def _storage_hit_query(self, operation) -> tuple[list[str], int]:
+        if not operation.pool_transfers:
+            # FLAT_MEMORY: Plain host KV retains independently configured query/read batches.
+            hash_values, hit_tokens = super()._storage_hit_query(operation)
+            operation.pool_storage_result.update_kv_hit_pages(
+                hit_tokens // self.page_size
+            )
+            return hash_values, hit_tokens
         hash_value = self.get_hash_str(
             operation.token_ids, operation.last_hash, page_size=self.page_size
         )
@@ -584,15 +570,9 @@ class HybridCacheController(BaseHiCacheController):
         extra_info = HiCacheStorageExtraInfo(
             prefix_keys=operation.prefix_keys.copy() if operation.prefix_keys else None
         )
-        if operation.pool_transfers:
-            hit_result = self.storage_backend.batch_exists_v2(
-                hash_value, operation.pool_transfers, extra_info
-            )
-        else:
-            kv_hit_count = self.storage_backend.batch_exists(hash_value, extra_info)
-            hit_result = PoolTransferResult(
-                kv_hit_pages=kv_hit_count, extra_pool_hit_pages={}
-            )
+        hit_result = self.storage_backend.batch_exists_v2(
+            hash_value, operation.pool_transfers, extra_info
+        )
 
         kv_hit_pages = hit_result.kv_hit_pages
         operation.pool_storage_result.update_kv_hit_pages(kv_hit_pages)
@@ -690,6 +670,14 @@ class HybridCacheController(BaseHiCacheController):
             results = self.storage_backend.batch_set_v2(backup_transfers)
             pool_hits = count_pool_hits(results)
             operation.pool_storage_result.update_extra_pool_hit_pages(pool_hits)
+            if self.storage_backend_type == "flat_memory" and any(
+                pool_hits.get(transfer.name, pool_hits.get(transfer.name.value, 0))
+                != len(transfer.keys or [])
+                for transfer in backup_transfers
+            ):
+                # FLAT_MEMORY: A main-KV success cannot commit a missing trailing state.
+                operation.error = "Incomplete Flat sidecar backup"
+                return
 
         if not self.backup_skip:
             super()._page_backup(operation)
@@ -735,23 +723,6 @@ class HybridCacheController(BaseHiCacheController):
             )
 
         return False
-
-    def backup_thread_func(self):
-        """Back up rank-sharded sidecars on every TP rank.
-
-        The base implementation skips the entire operation on non-zero MLA TP
-        ranks. That optimization is valid for replicated MLA KV, but not for
-        hybrid rank-sharded pools such as Kimi-K3 Mamba state.
-        """
-        while not self.storage_stop_event.is_set():
-            try:
-                operation = self.backup_queue.get(block=True, timeout=1)
-                if operation is None:
-                    continue
-                self._page_backup(operation)
-                self.ack_backup_queue.put(operation)
-            except Empty:
-                continue
 
     def _resolve_sidecar_kv_derived_pool_transfers(self, operation):
         for transfer in operation.pool_transfers:

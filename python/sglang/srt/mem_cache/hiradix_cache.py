@@ -210,17 +210,6 @@ class HiRadixCache(RadixCache):
             1 if get_memory().hicache_write_policy == "write_through" else 2
         )
         self.load_back_threshold = 10
-
-        # FLAT_MEMORY: Aggregate counters for KVCache transfer metrics
-        self._d2h_total_tokens = 0  # GPU HBM → Host DRAM tokens
-        self._d2h_total_ops = 0
-        self._storage_write_total_tokens = 0  # Host DRAM → Mooncake tokens
-        self._storage_write_total_ops = 0
-        self._host_eviction_total_tokens = 0  # Host DRAM eviction tokens
-        self._host_eviction_total_ops = 0
-        # Per-request prefetch latency: {req_id: (latency_ms, completed_tokens)}
-        self._prefetch_latency_by_reqid: dict[str, tuple[float, int]] = {}
-
         # Detach storage backend automatically on process shutdown
         atexit.register(self.shutdown)
 
@@ -805,13 +794,6 @@ class HiRadixCache(RadixCache):
 
     def reset(self):
         TreeNode.counter = 0
-        if self.enable_storage:
-            for ack in self.cache_controller.ack_write_queue:
-                ack.finish_event.synchronize()
-                for ack_id in ack.node_ids:
-                    self._finish_write_through_ack(ack_id, release_lock=True)
-                self._log_write_ack_metrics(ack)
-            self.cache_controller.ack_write_queue.clear()
         self.cache_controller.reset()
         self.token_to_kv_pool_host.clear()
         # Clear per-request tracking dicts
@@ -883,11 +865,6 @@ class HiRadixCache(RadixCache):
         ):
             return 0
 
-        if self.enable_storage:
-            with self.cache_controller.pending_backup_lock:
-                self.cache_controller.pending_backup_count += 1
-                self.cache_controller.backup_idle_event.clear()
-
         host_indices = self.cache_controller.write(
             device_indices=node.value,
             node_id=node.id,
@@ -906,18 +883,7 @@ class HiRadixCache(RadixCache):
             self._track_write_through_node(node, len(node.key))
             if not write_back:
                 self.inc_lock_ref(node)
-            # FLAT_MEMORY: track D2H token count
-            self._d2h_total_tokens += len(host_indices)
-            self._d2h_total_ops += 1
-            if self.enable_storage_metrics:
-                self.storage_metrics_collector.log_d2h_tokens(len(host_indices))
         else:
-            # Host alloc failed — decrement pipeline counter
-            if self.enable_storage:
-                with self.cache_controller.pending_backup_lock:
-                    self.cache_controller.pending_backup_count -= 1
-                    if self.cache_controller.pending_backup_count == 0:
-                        self.cache_controller.backup_idle_event.set()
             return 0
 
         return len(host_indices)
@@ -992,11 +958,6 @@ class HiRadixCache(RadixCache):
         )
         self.ongoing_backup[operation_id] = node
         node.protect_host()
-        # FLAT_MEMORY: track storage write token count
-        self._storage_write_total_tokens += len(node.host_value)
-        self._storage_write_total_ops += 1
-        if self.enable_storage_metrics:
-            self.storage_metrics_collector.log_storage_write_tokens(len(node.host_value))
 
     def _concat_split_chain(self, node: TreeNode, backup_len: int):
         """Recover enqueue-time key/hash/host by walking the split chain."""
@@ -1402,7 +1363,6 @@ class HiRadixCache(RadixCache):
         heapq.heapify(eviction_heap)
 
         num_evicted = 0
-        evict_ops = 0
         while num_evicted < num_tokens and len(eviction_heap):
             _, x = heapq.heappop(eviction_heap)
             if x == self.root_node:
@@ -1418,7 +1378,6 @@ class HiRadixCache(RadixCache):
             # emit remove(CPU) so the router drops the host-tier entry.
             self.kv_events.record_remove(x, medium=StorageMedium.CPU)
             num_evicted += self.cache_controller.evict_host(x.host_value)
-            evict_ops += 1
 
             key = x.key.child_key(self.page_size)
             v = x.parent.children.pop(key, None)
@@ -1430,13 +1389,6 @@ class HiRadixCache(RadixCache):
             if len(x.parent.children) == 0 and x.parent.evicted:
                 new_priority = self.eviction_strategy.get_priority(x.parent)
                 heapq.heappush(eviction_heap, (new_priority, x.parent))
-
-        # FLAT_MEMORY: track host eviction metrics
-        if num_evicted > 0:
-            self._host_eviction_total_tokens += num_evicted
-            self._host_eviction_total_ops += evict_ops
-            if self.enable_storage_metrics:
-                self.storage_metrics_collector.log_host_eviction(evict_ops, num_evicted)
 
     def load_back(
         self, node: TreeNode, mem_quota: Optional[int] = None
@@ -1714,10 +1666,6 @@ class HiRadixCache(RadixCache):
         # All PP/TP ranks will get the same `min_completed_tokens`, because `completed_tokens`
         # and `pool_hits` in their operations are same.  No need to sync cross-rank here.
         min_completed_tokens = self._clamp_prefetch_result(operation)
-        latency_ms = (time.monotonic() - operation.start_time) * 1000
-        self._prefetch_latency_by_reqid[req_id] = (latency_ms, min_completed_tokens)
-        if self.enable_storage_metrics:
-            self.storage_metrics_collector.log_prefetch_latency_ms(latency_ms)
         logger.debug(
             f"Prefetch {req_id} completed with {operation.completed_tokens} tokens"
         )
@@ -1739,12 +1687,6 @@ class HiRadixCache(RadixCache):
         # Track tokens actually loaded from storage for this request (L3 hits)
         loaded_from_storage = min_completed_tokens - matched_length
         self.prefetch_loaded_tokens_by_reqid[req_id] = loaded_from_storage
-
-        logger.info(
-            f"[PREFETCH-DEBUG] check_prefetch_progress: req={req_id[:8]}, "
-            f"completed_tokens={completed_tokens}, min_completed={min_completed_tokens}, "
-            f"matched_length={matched_length}, loaded_from_storage={loaded_from_storage}"
-        )
 
         if self.enable_storage_metrics:
             self.storage_metrics_collector.log_prefetched_tokens(loaded_from_storage)
@@ -1791,29 +1733,6 @@ class HiRadixCache(RadixCache):
         """Storage prefetch miss markers are not tracked on the dense path;
         the scheduler's paced availability-check retry is inert here."""
         return False
-    def pop_prefetch_latency(self, req_id: str) -> tuple:
-        """
-        Pop and return (latency_ms, completed_tokens) for a request's prefetch.
-        Returns (0.0, 0) if no prefetch was done.
-        This should be called after check_prefetch_progress() returns True.
-        """
-        return self._prefetch_latency_by_reqid.pop(req_id, (0.0, 0))
-
-    def get_transfer_stats(self) -> dict:
-        """
-        Return aggregate transfer statistics for all KVCache operations.
-        Called by server info endpoint or benchmark metrics.
-        """
-        return {
-            "d2h_total_tokens": self._d2h_total_tokens,
-            "d2h_total_ops": self._d2h_total_ops,
-            "storage_write_total_tokens": self._storage_write_total_tokens,
-            "storage_write_total_ops": self._storage_write_total_ops,
-            "host_eviction_total_tokens": self._host_eviction_total_tokens,
-            "host_eviction_total_ops": self._host_eviction_total_ops,
-            "page_size": self.page_size,
-        }
-
 
     def match_prefix(self, params: MatchPrefixParams):
         if self.disable:
@@ -1871,12 +1790,10 @@ class HiRadixCache(RadixCache):
         # align the number of fetching tokens to the page size
         prefetch_key = prefetch_key.page_aligned(self.page_size)
         prefetch_length = len(prefetch_key)
-        rate_limited = self.cache_controller.prefetch_rate_limited()
-        logger.debug("Storage prefetch: tokens=%d, limited=%s", prefetch_length, rate_limited)
         if (
             not self.enable_storage
             or prefetch_length < self.prefetch_threshold
-            or rate_limited
+            or self.cache_controller.prefetch_rate_limited()
         ):
             return
 

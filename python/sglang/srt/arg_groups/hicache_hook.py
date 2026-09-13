@@ -23,6 +23,22 @@ def handle_hicache(server_args: Any):
     2) Storage <-> layout compatibility (may rewrite layout).
     """
     cfg = resolving_view(server_args)
+    # FLAT_MEMORY: Compat uses device pools, never an application host payload tier.
+    from sglang.srt.mem_cache.storage_config import is_flat_memory_direct
+
+    if is_flat_memory_direct(
+        cfg.hicache_storage_backend, cfg.hicache_storage_backend_extra_config
+    ):
+        from sglang.srt.mem_cache.flat_memory_config import validate_flat_memory_direct
+
+        validate_flat_memory_direct(cfg)
+        declare_resolution(
+            server_args,
+            "_handle_hicache_flat_memory",
+            enable_hierarchical_cache=False,
+            radix_cache_backend="flat_memory",
+        )
+        return
     # Skip all normalization when neither hicache nor decode-offload path is active.
     if not (
         cfg.enable_hierarchical_cache
@@ -146,7 +162,7 @@ def resolve_layout_io_compatibility(server_args: Any):
 def resolve_storage_layout_compatibility(server_args: Any):
     cfg = resolving_view(server_args)
     if (
-        cfg.hicache_storage_backend != "mooncake"
+        cfg.hicache_storage_backend not in ("mooncake", "flat_memory")
         or cfg.hicache_mem_layout != "layer_first"
     ):
         return

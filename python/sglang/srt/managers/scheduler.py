@@ -275,6 +275,7 @@ from sglang.srt.managers.utils import (
     validate_input_length,
 )
 from sglang.srt.mem_cache import kv_cache_builder
+from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.mem_cache.common import (
     maybe_cache_unfinished_req,
     release_kv_cache,
@@ -591,6 +592,7 @@ class Scheduler(
         self.token_to_kv_pool_allocator = result.token_to_kv_pool_allocator
         self.disable_radix_cache = result.disable_radix_cache
         self.tree_cache = result.tree_cache
+        self.init_flat_memory_cache()
         if self.enable_hierarchical_cache:
             cache_controller = self.tree_cache.cache_controller
             if cache_controller is not None:
@@ -817,6 +819,15 @@ class Scheduler(
             )
         except Exception as e:
             logger.warning("load snapshot writer init failed: %s", e)
+
+    def init_flat_memory_cache(self) -> None:
+        """Wire controller-independent Flat completion and admission handling."""
+        # FLAT_MEMORY: A direct linker deliberately has no HiCache controller.
+        from sglang.srt.mem_cache.flat_memory_cache import get_flat_memory_cache
+
+        self.flat_memory_cache = get_flat_memory_cache(self.tree_cache)
+        if self.flat_memory_cache is not None:
+            self.enable_hierarchical_cache = False
 
     def init_idle_sleeper(self) -> None:
         if (
@@ -2098,11 +2109,31 @@ class Scheduler(
             draft_worker=self.draft_worker,
             tp_cpu_group=self.tp_cpu_group,
             memory_saver_adapter=self.memory_saver_adapter,
-            flush_cache=self.flush_cache,
+            flush_cache=self.flush_cache_after_weight_update,
             is_fully_idle=self.is_fully_idle,
             scheduler=self,
             metrics_collector=self.metrics_collector,
+            validate_cache_mutation=self.validate_flat_cache_mutation,
         )
+
+    def validate_flat_cache_mutation(self, operation: str, req) -> None:
+        """Keep live Flat payloads consistent with weights and physical pool addresses."""
+        flat = self.flat_memory_cache
+        if flat is None:
+            return
+        flat.validate_mutation(
+            operation,
+            flush_requested=operation == "weights" and req.flush_cache,
+            requests_idle=self.is_fully_idle(include_storage=False),
+        )
+
+    def flush_cache_after_weight_update(self, empty_cache: bool = True) -> bool:
+        """Invalidate stored KV after a weight mutation; ordinary GPU flush preserves it."""
+        if self.flat_memory_cache is not None:
+            return self.flat_memory_cache.flush_after_weight_update(
+                flush_gpu=lambda: self.flush_cache(empty_cache=empty_cache)
+            )
+        return self.flush_cache(empty_cache=empty_cache)
 
     def init_lora_drainer(self) -> None:
         if get_lora().lora_drain_wait_threshold > 0.0:
@@ -2938,9 +2969,11 @@ class Scheduler(
             self.handle_generate_request(tokenized_req)
 
     def _prefetch_kvcache(self, req: Req):
+        if self.flat_memory_cache is not None:
+            self.flat_memory_cache.register_request(req)
+            req.init_next_round_input(self.tree_cache, cow_mamba=False)
+            return
         if self.enable_hicache_storage:
-            if self.enable_hierarchical_cache:
-                self.tree_cache.check_hicache_events()
             req.init_next_round_input(self.tree_cache, cow_mamba=False)
             tree_cache = self.tree_cache
             buffer_mode = get_memory().hicache_host_memory_mode == "buffer_only"
@@ -3541,7 +3574,12 @@ class Scheduler(
             for req in ready_grammar_requests:
                 self._add_request_to_queue(req)
 
-        if self.enable_hierarchical_cache or get_memory().enable_flexkv:
+        if self.flat_memory_cache is not None:
+            self.flat_memory_cache.poll()
+            self.flat_memory_cache.release_ready_holds()
+            if running_batch.is_empty():
+                running_batch.batch_is_full = False
+        elif self.enable_hierarchical_cache or get_memory().enable_flexkv:
             self.tree_cache.check_hicache_events()
             if self.enable_hicache_storage:
                 self._retry_missed_storage_prefetches()
@@ -3584,6 +3622,10 @@ class Scheduler(
 
         # Get priority queue
         self.policy.calc_priority(self.waiting_queue, running_batch)
+        if self.flat_memory_cache is not None:
+            self.waiting_queue = self.flat_memory_cache.order_ready_requests(
+                self.waiting_queue
+            )
 
         if TEST_RETRACT and running_bs > TEST_RETRACT_NO_PREFILL_BS:
             # If we are testing retraction and the running batch size exceeds
@@ -3674,25 +3716,26 @@ class Scheduler(
                 ):
                     break
 
-            if self.enable_hicache_storage:
+            if self.flat_memory_cache is not None:
+                if not self.flat_memory_cache.is_ready(req.rid):
+                    continue
+            elif self.enable_hicache_storage:
                 prefetch_done = self.tree_cache.check_prefetch_progress(req.rid)
                 if not prefetch_done:
                     # skip staging requests that are ongoing prefetch
                     continue
                 # Pop the number of tokens loaded from storage (L3 hits)
-                from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
-
                 loaded_tokens = self.tree_cache.pop_prefetch_loaded_tokens(req.rid)
                 if loaded_tokens > 0:
                     req.storage_hit_length = loaded_tokens
-                if isinstance(self.tree_cache, HiRadixCache):
-                    req.storage_read_latency_ms, req.storage_read_tokens = (
-                        self.tree_cache.pop_prefetch_latency(req.rid)
+                if isinstance(self.tree_cache, UnifiedRadixCache):
+                    latency_ms, page_bytes = self.tree_cache.pop_prefetch_read_metrics(
+                        req.rid
                     )
-                    req.kvcache_bytes_per_page = (
-                        self.tree_cache.token_to_kv_pool_host.get_size_per_token()
-                        * self.tree_cache.page_size
-                    )
+                    req.kvcache_page_size = self.page_size
+                    req.kvcache_bytes_per_page = page_bytes
+                    req.storage_read_tokens = loaded_tokens
+                    req.storage_read_latency_ms = latency_ms
 
             req.init_next_round_input(self.tree_cache)
             if (
@@ -3725,7 +3768,10 @@ class Scheduler(
 
             if res != AddReqResult.CONTINUE:
                 if res == AddReqResult.NO_TOKEN:
-                    if self.enable_hierarchical_cache:
+                    if (
+                        self.enable_hierarchical_cache
+                        or self.flat_memory_cache is not None
+                    ):
                         # Set batch_is_full after making sure there are requests that can be served
                         running_batch.batch_is_full = len(adder.can_run_list) > 0 or (
                             not running_batch.is_empty()
@@ -3757,6 +3803,8 @@ class Scheduler(
         if len(can_run_list) == 0:
             return None, running_batch
 
+        if self.flat_memory_cache is not None:
+            self.flat_memory_cache.on_admitted(can_run_list)
         can_run_set = set(can_run_list)
         self.waiting_queue = [x for x in self.waiting_queue if x not in can_run_set]
         if adder.preempt_list:
@@ -4483,6 +4531,14 @@ class Scheduler(
         return self.external_corpus_manager.list(recv_req)
 
     def clear_hicache_storage_wrapped(self, recv_req: ClearHiCacheReqInput):
+        if self.flat_memory_cache is not None:
+            flat = self.flat_memory_cache
+            if not flat.can_clear(
+                requests_idle=self.is_fully_idle(include_storage=False)
+            ) or not self.flush_cache(empty_cache=False):
+                return ClearHiCacheReqOutput(success=False)
+            flat.clear()
+            return ClearHiCacheReqOutput(success=True)
         if self.enable_hierarchical_cache:
             self.tree_cache.clear_storage_backend()
             logger.info("Hierarchical cache cleared successfully!")
@@ -4494,6 +4550,9 @@ class Scheduler(
 
     def on_idle(self):
         """Idle housekeeping: guard, check, metrics, reset, sleep."""
+        # FLAT_MEMORY: Idle offloads still own device pages and must be reaped.
+        if self.flat_memory_cache is not None:
+            self.flat_memory_cache.poll()
         # Flush any health-check signal deferred while the engine was busy.
         self.maybe_send_health_check_signal()
 
@@ -4566,7 +4625,7 @@ class Scheduler(
         # sleep until next event
         self.maybe_sleep_on_idle()
 
-    def is_fully_idle(self, for_health_check=False) -> bool:
+    def is_fully_idle(self, for_health_check=False, *, include_storage=True) -> bool:
         # Health check piggybacks on running requests in process_output.
         # Only running_batch + waiting_queue guarantee active GPU processing;
         # disagg queues (bootstrap/prealloc/transfer) may have items without
@@ -4614,7 +4673,9 @@ class Scheduler(
 
             # HiCache: in-flight async ops (GPU↔Host↔L3) must drain before
             # destructive operations like attach/detach/flush_cache.
-            if self.enable_hierarchical_cache:
+            if include_storage and self.flat_memory_cache is not None:
+                idle &= self.flat_memory_cache.is_idle()
+            if include_storage and self.enable_hierarchical_cache:
                 tc = self.tree_cache
                 idle &= len(tc.ongoing_write_through) == 0
                 idle &= len(tc.ongoing_load_back) == 0
@@ -4639,6 +4700,14 @@ class Scheduler(
     def attach_hicache_storage_wrapped(
         self, recv_req: AttachHiCacheStorageReqInput
     ) -> AttachHiCacheStorageReqOutput:
+        if self.flat_memory_cache is not None or (
+            not self.enable_hierarchical_cache
+            and get_memory().radix_cache_backend == "flat_memory"
+        ):
+            return AttachHiCacheStorageReqOutput(
+                success=False,
+                message="Changing Flat direct device pools requires a server restart.",
+            )
         if not self.enable_hierarchical_cache:
             return AttachHiCacheStorageReqOutput(
                 success=False, message="Hierarchical cache is not enabled."
@@ -4695,6 +4764,42 @@ class Scheduler(
     def detach_hicache_storage_wrapped(
         self, recv_req: DetachHiCacheStorageReqInput
     ) -> DetachHiCacheStorageReqOutput:
+        if self.flat_memory_cache is not None:
+            flat = self.flat_memory_cache
+            if not flat.can_clear(
+                requests_idle=self.is_fully_idle(include_storage=False)
+            ):
+                return DetachHiCacheStorageReqOutput(
+                    success=False,
+                    message="Flat requests or an I/O window are still active.",
+                )
+            if not self.flush_cache(empty_cache=False):
+                return DetachHiCacheStorageReqOutput(
+                    success=False,
+                    message="Flat I/O did not drain; resources remain attached.",
+                )
+            flat.close()
+            self.tree_cache.linker = None
+            self.tree_cache.flat_memory = None
+            self.tree_cache.tree_core.enable_external_cache_linker = False
+            self.flat_memory_cache = None
+            self.enable_hicache_storage = False
+            get_context().override(
+                "scheduler.detach_flat_memory",
+                hicache_storage_backend=None,
+                hicache_storage_backend_extra_config=None,
+            )
+            return DetachHiCacheStorageReqOutput(
+                success=True,
+                message="Flat direct storage detached; restart to reattach.",
+            )
+        if (
+            not self.enable_hierarchical_cache
+            and get_memory().radix_cache_backend == "flat_memory"
+        ):
+            return DetachHiCacheStorageReqOutput(
+                success=True, message="Flat storage is already detached."
+            )
         if not self.enable_hierarchical_cache:
             return DetachHiCacheStorageReqOutput(
                 success=False, message="Hierarchical cache is not enabled."
@@ -4741,6 +4846,17 @@ class Scheduler(
 
     def flush_cache(self, empty_cache: bool = True):
         """Flush memory pools (e.g., KV cache, Mamba cache) and optionally empty device allocator cache."""
+        if self.is_fully_idle(include_storage=False):
+            if self.flat_memory_cache is not None:
+                if not self.flat_memory_cache.drain():
+                    return False
+            elif self.enable_hierarchical_cache and isinstance(
+                self.tree_cache, UnifiedRadixCache
+            ):
+                if not self.tree_cache.drain_storage(
+                    envs.SGLANG_BACKUP_WAIT_TIMEOUT.get()
+                ):
+                    return False
         if self.is_fully_idle():
             self.cur_batch_for_debug = None
             self.last_batch = None
@@ -4794,6 +4910,28 @@ class Scheduler(
             draft_graph_memory_usage=draft_graph_memory_usage,
         )
         ret["startup_time"] = self.startup_time
+        # FLAT_MEMORY: All scheduler ranks execute the same control transaction.
+        if self.flat_memory_cache is not None:
+            from sglang.srt.managers.flat_memory_io_window import (
+                collect_flat_memory_state,
+            )
+
+            flat = self.flat_memory_cache
+            ret.update(
+                collect_flat_memory_state(
+                    manager=flat.manager,
+                    tp_rank=self.ps.tp_rank,
+                    tp_size=self.ps.tp_size,
+                    gather=flat.gather,
+                    snapshot=flat.snapshot,
+                    idle=self.is_fully_idle(include_storage=False),
+                    drain=flat.drain,
+                    action=recv_req.flat_io_action,
+                    window_id=recv_req.flat_io_window_id,
+                )
+            )
+        elif recv_req.flat_io_action is not None:
+            ret["flat_io_control"] = {"error": "Flat direct cache is not enabled"}
         ret["effective_max_running_requests_per_dp"] = self.max_running_requests
 
         if get_exec().moe.elastic_ep_backend is not None:
@@ -5630,6 +5768,8 @@ def run_scheduler_process(
             # Graceful path only: on the exception path the GPU may be wedged
             # and the synchronize() in destroy() could itself hang.
             if scheduler.gracefully_exit:
+                # FLAT_MEMORY: Export jobs retain profiler state until fully written.
+                scheduler.profiler_manager.close()
                 scheduler.release_host_resources()
 
 

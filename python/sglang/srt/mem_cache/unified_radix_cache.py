@@ -244,6 +244,8 @@ class UnifiedRadixCache(BasePrefixCache):
         # Owns the storage backend lifecycle; built by init_hicache.
         self._storage_attachment: Optional[StorageAttachment] = None
         self.linker: Optional[UnifiedCacheLinkerWrapper] = None
+        # FLAT_MEMORY: Direct storage has no HiCache controller or host payload pool.
+        self.flat_memory = None
         self.prefetch_stop_policy = "best_effort"
         self.prefetch_threshold = 256
         self.prefetch_timeout_base = 1.0
@@ -359,6 +361,9 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def _reset_full(self) -> None:
         """Full reset: destroy entire tree and all state."""
+        # FLAT_MEMORY: Quiesce DMA/storage before destroying the pages they still own.
+        if self.cache_controller is not None:
+            self.cache_controller.reset()
         self.tree_core.reset()
         self.session_refs.reset()
 
@@ -368,6 +373,8 @@ class UnifiedRadixCache(BasePrefixCache):
         self.ongoing_load_back: dict[int, _OngoingLoadBack] = {}
         self.enable_storage = False
         self.prefetch_loaded_tokens_by_reqid: dict[str, int] = {}
+        # FLAT_MEMORY: Request telemetry lives until scheduler-side consumption.
+        self.prefetch_read_latency_by_reqid: dict[str, float] = {}
         self.ongoing_prefetch: dict[str, _OngoingPrefetch] = {}
         # Rids whose storage prefetch resolved without a usable result;
         # popped by the scheduler to pace availability-check retries.
@@ -377,7 +384,6 @@ class UnifiedRadixCache(BasePrefixCache):
             self.buffer_pipeline.reset()
 
         if self.cache_controller is not None:
-            self.cache_controller.reset()
             self.cache_controller.mem_pool_host.clear()
             self.enable_storage = self.cache_controller.enable_storage
 
@@ -838,6 +844,8 @@ class UnifiedRadixCache(BasePrefixCache):
     def cache_finished_req(
         self, req: Req, is_insert: bool = True, *, kv_len_to_handle: int, **kwargs
     ) -> None:
+        if self.flat_memory is not None:
+            self.flat_memory.release_request(req.rid)
         if self.session.try_cache_finished_req(req, is_insert=is_insert, **kwargs):
             return
 
@@ -1118,7 +1126,10 @@ class UnifiedRadixCache(BasePrefixCache):
             return 0
         result = self.tree_core.drive_host_eviction(component_type, num_tokens)
         self._free_values(result.device_frees, result.host_frees)
-        return result.tracker.get(component_type, 0)
+        evicted = result.tracker.get(component_type, 0)
+        if self.enable_storage_metrics and self.storage_metrics_collector is not None:
+            self.storage_metrics_collector.log_host_eviction(int(evicted > 0), evicted)
+        return evicted
 
     # ---- Decode retraction ----
 
@@ -1918,6 +1929,12 @@ class UnifiedRadixCache(BasePrefixCache):
             # Hybrid all-or-nothing check failed; result already discarded.
             return
 
+        self.prefetch_read_latency_by_reqid[req_id] = operation.io_elapsed_ms
+        if self.enable_storage_metrics and self.storage_metrics_collector is not None:
+            self.storage_metrics_collector.log_prefetch_latency_ms(
+                operation.io_elapsed_ms
+            )
+
         if self.buffer_pipeline is not None:
             # No graft: release the rank-local tail beyond the synced usable
             # length, then park the bounce for admission-time consumption.
@@ -2076,6 +2093,22 @@ class UnifiedRadixCache(BasePrefixCache):
         self._storage_prefetch_missed_rids.discard(req_id)
         return self.prefetch_loaded_tokens_by_reqid.pop(req_id, 0)
 
+    def pop_prefetch_read_metrics(self, req_id: str) -> tuple[float, int | None]:
+        # FLAT_MEMORY: This is consumed in scheduler request order on all TP ranks.
+        latency = self.prefetch_read_latency_by_reqid.pop(req_id, 0.0)
+        elapsed = torch.tensor([latency], dtype=torch.float64, device="cpu")
+        self._all_reduce_attn_groups(elapsed, torch.distributed.ReduceOp.MAX)
+        page_bytes = None
+        if (
+            self.host_pool_group is not None
+            and len(self.host_pool_group.entry_map) == 1
+        ):
+            page_bytes = (
+                self.cache_controller.mem_pool_host.get_size_per_token()
+                * self.page_size
+            )
+        return float(elapsed.item()), page_bytes
+
     def pop_storage_prefetch_miss(self, req_id: str) -> bool:
         """True once per resolved storage-prefetch miss for a live request;
         the scheduler uses it to arm the paced availability-check retry."""
@@ -2105,6 +2138,7 @@ class UnifiedRadixCache(BasePrefixCache):
         if self.linker is not None:
             self.linker.release_request(rid)
         self.prefetch_loaded_tokens_by_reqid.pop(rid, None)
+        self.prefetch_read_latency_by_reqid.pop(rid, None)
         self._storage_prefetch_missed_rids.discard(rid)
         if (
             self.buffer_pipeline is not None
@@ -2396,9 +2430,20 @@ class UnifiedRadixCache(BasePrefixCache):
             drained = 0
             for operation in _drain_queue(cc.ack_backup_queue, n_backup):
                 drained += 1
+                completed_tokens = operation.completed_tokens
+                if cc.storage_backend_type == "flat_memory":
+                    # FLAT_MEMORY: Local shutdown may release staging, never publish hits.
+                    completed_tokens = 0 if n_backup is None else completed_tokens
+                    if n_backup is not None:
+                        completed = torch.tensor([completed_tokens], dtype=torch.int)
+                        self._all_reduce_attn_groups(
+                            completed, torch.distributed.ReduceOp.MIN
+                        )
+                        completed_tokens = int(completed.item())
                 if buffer_mode:
-                    # Storage write acked: free the staging.
-                    self.buffer_pipeline.finish_storage_write_ack(operation.id)
+                    self.buffer_pipeline.finish_storage_write_ack(
+                        operation.id, completed_tokens=completed_tokens
+                    )
                 else:
                     entry = self.ongoing_backup.pop(operation.id, None)
                     if entry is not None:
@@ -2409,8 +2454,9 @@ class UnifiedRadixCache(BasePrefixCache):
                     and self.enable_storage_metrics
                     and self.storage_metrics_collector is not None
                 ):
-                    self.storage_metrics_collector.log_backuped_tokens(
-                        operation.completed_tokens
+                    self.storage_metrics_collector.log_backuped_tokens(completed_tokens)
+                    self.storage_metrics_collector.log_storage_write_tokens(
+                        completed_tokens
                     )
             return drained
 
@@ -2663,6 +2709,10 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def _log_write_ack_metrics(self, ack: HiCacheAck) -> None:
         """Record D->H backup volume and duration for a completed write ack."""
+        if self.enable_storage_metrics and self.storage_metrics_collector is not None:
+            self.storage_metrics_collector.log_d2h_tokens(
+                (ack.num_tokens_by_pool or {}).get(PoolName.KV, 0)
+            )
         if self.metrics_collector is None:
             return
         for pool, num_tokens in (ack.num_tokens_by_pool or {}).items():
@@ -2780,6 +2830,9 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def check_hicache_events(self) -> None:
         """Called per scheduler step to poll async HiCache events."""
+        if self.flat_memory is not None:
+            self.flat_memory.poll()
+            return
         if self.linker is not None:
             finish_counts = torch.tensor(
                 [
@@ -2858,6 +2911,37 @@ class UnifiedRadixCache(BasePrefixCache):
                 storage_metrics = StorageMetrics()
             storage_metrics.prefetch_stats = self.prefetch_outcome_stats_snapshot()
             self.storage_metrics_collector.log_storage_metrics(storage_metrics)
+
+    def drain_storage(self, timeout: float = 10.0) -> bool:
+        # FLAT_MEMORY: No rank may leave while peers still enter progress collectives.
+        import time
+
+        deadline = time.monotonic() + timeout
+        while True:
+            self.check_hicache_events()
+            busy = bool(
+                self.ongoing_write_through
+                or self.ongoing_load_back
+                or self.ongoing_prefetch
+                or self.ongoing_backup
+                or (
+                    self.buffer_pipeline is not None
+                    and not self.buffer_pipeline.is_idle()
+                )
+                or (
+                    self.cache_controller is not None
+                    and self.cache_controller.has_pending_backups()
+                )
+            )
+            status = torch.tensor(
+                [int(busy), int(time.monotonic() >= deadline)], dtype=torch.int
+            )
+            self._all_reduce(status, torch.distributed.ReduceOp.MAX)
+            if not status[0].item():
+                return True
+            if status[1].item():
+                return False
+            time.sleep(0.001)
 
     def ready_to_load_host_cache(self) -> int:
         """Notify the cache controller to start the KV cache loading."""

@@ -280,8 +280,14 @@ class BufferModePipeline:
     def is_idle(self) -> bool:
         """No queued writes, staged prefetches, or storage writes in flight
         (all of which hold host staging or would re-trigger IO)."""
+        # FLAT_MEMORY: An empty storage queue does not mean D2H/H2D owners are idle.
         return not (
-            self.pending_write_queue or self.staged_prefetches or self.ongoing_backup
+            self.pending_write_queue
+            or self.ongoing_write_through
+            or self.ongoing_backup
+            or self.staged_prefetches
+            or self.ongoing_buffer_load_back
+            or self.pending_hit_allocs
         )
 
     # ---- backup pipeline (device -> staging -> storage) ----
@@ -643,19 +649,32 @@ class BufferModePipeline:
             extra_pools=storage_xfers or None,
         )
         self.ongoing_backup[operation_id] = entry
+        if self._cache.cache_controller.storage_backend_type == "flat_memory":
+            # FLAT_MEMORY: Keep the D2H owner until the storage operation owns the bytes.
+            self._cache.cache_controller._complete_storage_d2h(snapshot.node_id)
 
-    def finish_storage_write_ack(self, operation_id: int) -> None:
-        """Storage write acked (rank-synced drain): free the entry's staging
-        outright. Existence entries are added unconditionally
-        (completed_tokens can diverge across ranks under backend failure) to
-        keep admission decisions TP-deterministic. No-op for operations this
-        pipeline does not own (e.g. acks for already-reset state)."""
+    def finish_storage_write_ack(
+        self, operation_id: int, *, completed_tokens: Optional[int] = None
+    ) -> None:
+        """Release completed staging, recording only the common durable Flat prefix."""
+        flat_storage = (
+            self._cache.cache_controller.storage_backend_type == "flat_memory"
+        )
+        if flat_storage and completed_tokens is None:
+            raise ValueError(
+                "Flat storage ACK requires a rank-reduced completed_tokens count"
+            )
         entry = self.ongoing_backup.pop(operation_id, None)
         if entry is None:
             return
         intent = entry.intent
         snapshot = intent.snapshot
-        self._cache.storage_existence_cache.add(PoolName.KV, snapshot.hash_values)
+        hashes = snapshot.hash_values
+        if flat_storage:
+            # FLAT_MEMORY: A failed or partial write is not a durable existence certificate.
+            pages = max(0, completed_tokens) // self._cache.page_size
+            hashes = hashes[:pages]
+        self._cache.storage_existence_cache.add(PoolName.KV, hashes)
         self._free_staging_now(entry.host_indices, entry.aux_xfers)
         self.write_staged_tokens_ -= len(entry.host_indices)
         self.inflight_backup_node_ids.discard(snapshot.node_id)

@@ -12,6 +12,7 @@ startup, the admin API, and the atexit hook -- one implementation.
 from __future__ import annotations
 
 import logging
+import time
 from typing import TYPE_CHECKING, Optional
 
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
@@ -160,6 +161,8 @@ class StorageAttachment:
             return False, "HiCache storage backend is not initialized."
 
         try:
+            if controller.storage_backend_type == "flat_memory":
+                self._drain_flat_backups_locally()
             cache.drain_storage_control_queues_local()
             # Idempotent: ask the controller to clean up even when `enable_storage`
             # is already False, since that may be leftover state from an earlier
@@ -181,6 +184,33 @@ class StorageAttachment:
         cache.enable_storage = False
         cache.enable_storage_metrics = False
         return True, "Detached HiCache storage backend successfully."
+
+    def _drain_flat_backups_locally(self) -> None:
+        # FLAT_MEMORY: Shutdown must not insert collectives into an exiting peer's schedule.
+        cache = self._cache
+        controller = cache.cache_controller
+        deadline = time.monotonic() + 10.0
+        while True:
+            cache.writing_check(
+                finish_count=cache._count_ready_acks(controller.ack_write_queue)
+            )
+            cache.loading_check(
+                finish_count=cache._count_ready_acks(controller.ack_load_queue)
+            )
+            cache.drain_storage_control_queues_local()
+            pipeline = cache.buffer_pipeline
+            if pipeline is not None:
+                pipeline.flush_pending_writes()
+            pending_intents = pipeline is not None and bool(
+                pipeline.pending_write_queue
+            )
+            if not pending_intents and not controller.has_pending_backups():
+                return
+            if time.monotonic() >= deadline:
+                raise RuntimeError(
+                    "Flat backup drain timed out; storage remains attached"
+                )
+            time.sleep(0.01)
 
     def shutdown(self) -> None:
         """Best-effort auto-detach on process shutdown.
@@ -238,6 +268,9 @@ class StorageAttachment:
                 )
 
         cache.enable_storage = enable_storage
+        if enable_storage and cache.cache_controller is not None:
+            # FLAT_MEMORY: Runtime and tree admission must share the resolved env override.
+            prefetch_threshold = cache.cache_controller.prefetch_threshold
         cache.prefetch_threshold = prefetch_threshold
         cache.prefetch_timeout_base = prefetch_timeout_base
         cache.prefetch_timeout_per_page = (

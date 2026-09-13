@@ -82,6 +82,15 @@ def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
     server_args = ctx.server_args
     params = ctx.params
 
+    # FLAT_MEMORY: Legacy storage flags select the direct factory without a host tier.
+    from sglang.srt.mem_cache.storage_config import is_flat_memory_direct
+
+    if is_flat_memory_direct(
+        get_memory().hicache_storage_backend,
+        get_memory().hicache_storage_backend_extra_config,
+    ):
+        return _flat_memory_factory(ctx)
+
     if (
         ctx.disable_radix_cache
         and get_disagg().disaggregation_decode_retraction_backup == "host_pool"
@@ -147,6 +156,8 @@ def _create_unified_radix_cache(
     ctx: TreeCacheBuildContext,
     server_args: ServerArgs,
     params: CacheInitParams,
+    *,
+    attach_hicache: bool = True,
 ) -> BasePrefixCache:
     """Initialize a UnifiedRadixCache with proper components and optional HiCache."""
     if get_disagg().disaggregation_decode_retraction_backup == "host_pool":
@@ -185,7 +196,7 @@ def _create_unified_radix_cache(
             ComponentType.MAMBA: MlxAuxiliaryStateComponent,
         }
     cache = UnifiedRadixCache(params)
-    if (
+    if attach_hicache and (
         ctx.enable_hierarchical_cache
         or get_disagg().disaggregation_decode_retraction_backup == "host_pool"
     ):
@@ -194,6 +205,16 @@ def _create_unified_radix_cache(
             cache.cache_controller.layer_done_counter
         )
     return cache
+
+
+# FLAT_MEMORY: Registration is lazy; non-Flat launches do not import the native binding.
+def _flat_memory_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
+    from sglang.srt.mem_cache.flat_memory_factory import create_flat_memory_cache
+
+    return create_flat_memory_cache(ctx)
+
+
+register_radix_cache_backend("flat_memory", _flat_memory_factory)
 
 
 def create_tree_cache(ctx: TreeCacheBuildContext) -> BasePrefixCache:

@@ -23,6 +23,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, NamedTuple
 
+import msgspec
 import torch
 
 from sglang.srt.mem_cache.base_prefix_cache import (
@@ -123,6 +124,16 @@ class ExternalCacheHitMarker(NamedTuple):
     prefix_key: RadixKey
     tail_hashes: list[str]
     device_hit_len: int
+
+
+# FLAT_MEMORY: Private allocations are not visible to radix readers until committed.
+class PreparedLinkerLoad(msgspec.Struct, kw_only=True):
+    req: object
+    hit: ExternalCacheHitMarker
+    prefix_indices: torch.Tensor
+    anchor: object
+    component_transfers: list
+    prefix_len: int
 
 
 class _PendingOffload(NamedTuple):
@@ -242,9 +253,11 @@ class UnifiedCacheLinkerWrapper:
         if device_hit_len > 0:
             last_hash = self.cache.get_last_hash_value(result.last_device_node)
             if last_hash is None:
-                # Without the anchor the tail would hash as if it started at the
-                # sequence head, yielding keys that can never match.
-                return []
+                # FLAT_MEMORY: Rebuild a missing anchor from the complete request prefix.
+                prefix_hashes = get_hash_str(
+                    key[:device_hit_len], page_size=self.cache.page_size
+                )
+                last_hash = prefix_hashes[-1]
         page = self.cache.page_size
         tail_len = (len(key) - device_hit_len) // page * page
         if tail_len == 0:
@@ -258,44 +271,77 @@ class UnifiedCacheLinkerWrapper:
     # ---- init_load_back: remote -> device, then insert ----
 
     def load_back(self, req: Req) -> tuple[torch.Tensor, NodeId]:
-        cache = self.cache
-        empty_indices = cache.tree_core.empty_match_result.device_indices
+        prepared = self.prepare_load(req)
+        if prepared is None:
+            return self.cache.tree_core.empty_match_result.device_indices, req.last_node
+        return self.commit_prepared_load(prepared)
+
+    def prepare_load(
+        self,
+        req: Req,
+        *,
+        prefix_indices: torch.Tensor | None = None,
+        anchor: NodeId | None = None,
+    ) -> PreparedLinkerLoad | None:
+        # FLAT_MEMORY: Allocation and publication are separate transaction phases.
         hit = self.hit_markers.pop(req.rid, None)
         if hit is None:
-            return empty_indices, req.last_node
-
-        device_hit_len = hit.device_hit_len
-        tail_hashes = hit.tail_hashes
-        prefix_len = device_hit_len + len(tail_hashes) * cache.page_size
-
-        # Build per-component linker transfers.
-        component_transfers: list[tuple[TreeComponent, PoolTransfer]] = []
-        for component in cache._components_tuple:
-            transfer = component.build_external_linker_transfer(
-                LinkerTransferPhase.LOAD, None, tail_hashes
-            )
-            if transfer is None:
-                self._update_load(
-                    ExternalLinkerLoadPhase.ABORT,
-                    req,
-                    component_transfers,
-                    prefix_len,
+            return None
+        prefix_len = hit.device_hit_len + len(hit.tail_hashes) * self.cache.page_size
+        component_transfers = []
+        try:
+            for component in self.cache._components_tuple:
+                transfer = component.build_external_linker_transfer(
+                    LinkerTransferPhase.LOAD, None, hit.tail_hashes
                 )
-                return empty_indices, req.last_node
-            component_transfers.append((component, transfer))
-
-        full_transfer = component_transfers[0][1]
-        assert full_transfer.name == PoolName.KV
-        self._update_load(
-            ExternalLinkerLoadPhase.PREPARE,
-            req,
-            component_transfers,
-            prefix_len,
+                if transfer is None:
+                    self._update_load(
+                        ExternalLinkerLoadPhase.ABORT,
+                        req,
+                        component_transfers,
+                        prefix_len,
+                    )
+                    return None
+                component_transfers.append((component, transfer))
+            assert component_transfers[0][1].name == PoolName.KV
+            self._update_load(
+                ExternalLinkerLoadPhase.PREPARE, req, component_transfers, prefix_len
+            )
+        except BaseException:
+            self._update_load(
+                ExternalLinkerLoadPhase.ABORT, req, component_transfers, prefix_len
+            )
+            raise
+        return PreparedLinkerLoad(
+            req=req,
+            hit=hit,
+            prefix_indices=(
+                req.prefix_indices if prefix_indices is None else prefix_indices
+            ).to(torch.int64),
+            anchor=req.last_node if anchor is None else anchor,
+            component_transfers=component_transfers,
+            prefix_len=prefix_len,
         )
 
-        # Insert the newly loaded tail into the tree.
+    def abort_prepared_load(self, prepared: PreparedLinkerLoad) -> None:
+        self._update_load(
+            ExternalLinkerLoadPhase.ABORT,
+            prepared.req,
+            prepared.component_transfers,
+            prepared.prefix_len,
+        )
+
+    def commit_prepared_load(
+        self, prepared: PreparedLinkerLoad, *, queue_io: bool = True
+    ) -> tuple[torch.Tensor, NodeId]:
+        cache = self.cache
+        req, hit = prepared.req, prepared.hit
+        component_transfers = prepared.component_transfers
+        device_hit_len, tail_hashes = hit.device_hit_len, hit.tail_hashes
+        prefix_len = prepared.prefix_len
+        full_transfer = component_transfers[0][1]
         prefix_indices = torch.cat(
-            [req.prefix_indices.to(torch.int64), full_transfer.device_indices]
+            [prepared.prefix_indices, full_transfer.device_indices]
         )
         mamba_transfer = next(
             (
@@ -329,7 +375,7 @@ class UnifiedCacheLinkerWrapper:
             )
 
         canonical_tail = cache.tree_core.collect_full_device_indices(
-            insert_result.last_device_node, req.last_node
+            insert_result.last_device_node, prepared.anchor
         )
         assert canonical_tail.numel() == len(tail_hashes) * cache.page_size
         load_transfers = self._update_load(
@@ -341,10 +387,11 @@ class UnifiedCacheLinkerWrapper:
             canonical_full=canonical_tail,
         )
 
-        self._queue_load(req.rid, insert_result.last_device_node, load_transfers)
+        if queue_io:
+            self._queue_load(req.rid, insert_result.last_device_node, load_transfers)
 
         node = cache.resolve_node_handle(insert_result.last_device_node)
-        while node.id != req.last_node:
+        while node.id != prepared.anchor:
             node.external_cache_stored = True
             node = node.parent
         return canonical_tail, insert_result.last_device_node
@@ -379,6 +426,14 @@ class UnifiedCacheLinkerWrapper:
         if not component_transfers:
             return []
         full = component_transfers[0][1]
+        if self.cache.is_swa_enabled and phase in (
+            ExternalLinkerLoadPhase.PREPARE,
+            ExternalLinkerLoadPhase.ABORT,
+        ):
+            # FLAT_MEMORY: Private full slots must never retain freed SWA associations.
+            self.cache.token_to_kv_pool_allocator.clear_full_to_swa_mapping(
+                full.device_indices
+            )
         result = []
         transfers = (
             reversed(component_transfers)
@@ -464,7 +519,7 @@ class UnifiedCacheLinkerWrapper:
             if not self.cache.resolve_node_handle(node_id).external_cache_stored:
                 self._offload_node(node_id)
 
-    def _offload_node(self, node_id: NodeId) -> None:
+    def _offload_node(self, node_id: NodeId, *, key_namespace: str = "") -> None:
         cache = self.cache
         node = cache.resolve_node_handle(node_id)
         transfers = []
@@ -473,6 +528,8 @@ class UnifiedCacheLinkerWrapper:
                 LinkerTransferPhase.OFFLOAD, node, None
             )
             if transfer is not None:
+                if key_namespace:
+                    transfer.keys = [key_namespace + key for key in transfer.keys]
                 transfers.append(transfer)
 
         lock_params = cache.inc_lock_ref(node_id).to_dec_params()

@@ -82,6 +82,8 @@ class SchedulerWeightUpdaterManager:
     is_fully_idle: Callable[..., bool]
     scheduler: Optional[Any] = None
     metrics_collector: Optional[Any] = None
+    # FLAT_MEMORY: Validate cache ownership before mutating weights or pool addresses.
+    validate_cache_mutation: Optional[Callable[[str, Any], None]] = None
     offload_tags: set = field(default_factory=set)
     stashed_model_static_state: Any = None
 
@@ -112,6 +114,8 @@ class SchedulerWeightUpdaterManager:
 
     def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
         """In-place update of the weights from disk."""
+        if self.validate_cache_mutation is not None:
+            self.validate_cache_mutation("weights", recv_req)
         with self._observe_weight_load("disk"):
             success, message = self.tp_worker.update_weights_from_disk(recv_req)
             tp_success = success
@@ -145,6 +149,8 @@ class SchedulerWeightUpdaterManager:
         recv_req: UpdateWeightsFromDistributedReqInput,
     ) -> Tuple[bool, str]:
         """Update the online model parameter."""
+        if self.validate_cache_mutation is not None:
+            self.validate_cache_mutation("weights", recv_req)
         with self._observe_weight_load("distributed"):
             success, message = self.tp_worker.update_weights_from_distributed(recv_req)
             if success:
@@ -158,6 +164,8 @@ class SchedulerWeightUpdaterManager:
 
     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
         """Update the online model parameter from tensors."""
+        if self.validate_cache_mutation is not None:
+            self.validate_cache_mutation("weights", recv_req)
         with self._observe_weight_load("tensor"):
             if recv_req.disable_draft_model:
                 worker = self.tp_worker
@@ -174,6 +182,8 @@ class SchedulerWeightUpdaterManager:
 
     def update_weights_from_ipc(self, recv_req: UpdateWeightsFromIPCReqInput):
         """Update the online model parameter from IPC for checkpoint-engine integration."""
+        if self.validate_cache_mutation is not None:
+            self.validate_cache_mutation("weights", recv_req)
         with self._observe_weight_load("ipc"):
             success, message = self.tp_worker.update_weights_from_ipc(recv_req)
             tp_success = success
@@ -209,6 +219,8 @@ class SchedulerWeightUpdaterManager:
             )
 
     def release_memory_occupation(self, recv_req: ReleaseMemoryOccupationReqInput):
+        if self.validate_cache_mutation is not None:
+            self.validate_cache_mutation("memory", recv_req)
         assert (
             self.is_fully_idle()
         ), "release_memory_occupation should be called only when server is idle."

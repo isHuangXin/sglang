@@ -1542,8 +1542,15 @@ class ActiveRanksOutput(BaseReq):
 
 
 @dataclass
+class FlatMemoryIOWindowReq(BaseReq):
+    action: str
+    window_id: str
+
+
+@dataclass
 class GetInternalStateReq(BaseReq):
-    pass
+    flat_io_action: Optional[str] = None
+    flat_io_window_id: Optional[str] = None
 
 
 @dataclass

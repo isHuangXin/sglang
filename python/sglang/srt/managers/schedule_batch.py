@@ -664,6 +664,15 @@ class Req(ReqDllmMixin):
         self.host_hit_length = 0
         # Tokens loaded from storage backend (L3) during prefetch for this request
         self.storage_hit_length = 0
+        self.flat_prefetch_stats = dict.fromkeys(
+            (
+                "flat_dram", "flat_ssd", "flat_mixed",
+                "flat_prefetch_dram_ms", "flat_prefetch_dram_ops",
+                "flat_prefetch_ssd_ms", "flat_prefetch_ssd_ops",
+            ),
+            0,
+        )
+        self.flat_cached_tokens = dict.fromkeys(("flat_dram", "flat_ssd", "flat_mixed"), 0)
         # The node to lock until for swa radix tree lock ref
         self.swa_uuid_for_lock: Optional[int] = None
         # The prefix length that is inserted into the tree cache
@@ -1572,6 +1581,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                         )
                         host_portion = 0
                         device_portion = len(req.prefix_indices) - storage_portion
+                        req.flat_cached_tokens = {
+                            name: req.flat_prefetch_stats[name]
+                            for name in ("flat_dram", "flat_ssd", "flat_mixed")
+                        }
 
                     req.cached_tokens_device = device_portion
                     req.cached_tokens_host = host_portion

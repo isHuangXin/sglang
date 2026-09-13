@@ -145,6 +145,7 @@ class HostKVCache(abc.ABC):
         pin_memory: bool,
         device: str,
         allocator_type: str = "default",
+        allocate_buffer: bool = True,
     ):
         self.device_pool = device_pool
         self.page_size = page_size
@@ -155,6 +156,15 @@ class HostKVCache(abc.ABC):
 
         self.dtype = device_pool.store_dtype
         self.size_per_token = self.get_size_per_token()
+        self.start_layer = device_pool.start_layer
+        self.end_layer = device_pool.end_layer
+        # FLAT_MEMORY: GPU-file I/O has no Host KV payload pool.
+        if not allocate_buffer:
+            self.size = self.page_num = 0
+            self.kv_buffer = None
+            self.lock = threading.RLock()
+            self.clear()
+            return
         if host_size > 0:
             self.size = int(host_size * 1e9 // self.size_per_token)
         else:
@@ -162,8 +172,6 @@ class HostKVCache(abc.ABC):
         # Align up the host memory pool size to the page size
         self.page_num = self.size // self.page_size + 1
         self.size = self.page_num * self.page_size
-        self.start_layer = device_pool.start_layer
-        self.end_layer = device_pool.end_layer
 
         assert (
             self.size > device_pool.size
@@ -284,6 +292,7 @@ class MHATokenToKVPoolHost(HostKVCache):
         pin_memory: bool = True,
         device: str = "cpu",
         allocator_type: str = "default",
+        allocate_buffer: bool = True,
     ):
         super().__init__(
             device_pool,
@@ -294,7 +303,10 @@ class MHATokenToKVPoolHost(HostKVCache):
             pin_memory,
             device,
             allocator_type,
+            allocate_buffer=allocate_buffer,
         )
+        if not allocate_buffer:
+            return
         self.element_dim = self.device_pool.head_num * self.device_pool.head_dim
         self.can_use_jit = _is_cuda and can_use_hicache_jit_kernel(
             element_size=self.element_dim * self.dtype.itemsize

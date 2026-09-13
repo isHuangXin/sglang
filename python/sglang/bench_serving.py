@@ -119,6 +119,15 @@ class RequestFuncOutput:
     server_prompt_tokens: Optional[int] = None
     server_completion_tokens: Optional[int] = None
     server_cached_tokens: Optional[int] = None
+    # FLAT_MEMORY: Missing detail fields are not cold hits; mixed is an SSD subset.
+    server_cached_tokens_device: Optional[int] = None
+    flat_dram: Optional[int] = None
+    flat_ssd: Optional[int] = None
+    flat_mixed: Optional[int] = None
+    flat_prefetch_dram_ms: Optional[float] = None
+    flat_prefetch_dram_ops: Optional[int] = None
+    flat_prefetch_ssd_ms: Optional[float] = None
+    flat_prefetch_ssd_ops: Optional[int] = None
 
     @staticmethod
     def init_new(request_func_input: RequestFuncInput):
@@ -672,6 +681,14 @@ async def async_request_sglang_generate(
                                 output.cached_tokens_device = details.get("device", 0)
                                 output.cached_tokens_host = details.get("host", 0)
                                 output.cached_tokens_storage = details.get("storage", 0)
+                                # FLAT_MEMORY: Streaming details are cumulative, not deltas.
+                                output.server_cached_tokens_device = details.get("device")
+                                for name in (
+                                    "flat_dram", "flat_ssd", "flat_mixed",
+                                    "flat_prefetch_dram_ms", "flat_prefetch_dram_ops",
+                                    "flat_prefetch_ssd_ms", "flat_prefetch_ssd_ops",
+                                ):
+                                    setattr(output, name, details.get(name))
                                 # KVCache block granularity
                                 output.kvcache_page_size = details.get("page_size", 0)
                                 output.kvcache_bytes_per_page = details.get("bytes_per_page", 0)
@@ -1922,7 +1939,7 @@ def sample_image_requests(
 @lru_cache(maxsize=1)
 def get_available_tokens(tokenizer):
     """Get all available token ids from the tokenizer vocabulary."""
-    return list(tokenizer.get_vocab().values())
+    return sorted(tokenizer.get_vocab().values())
 
 
 def gen_prompt(tokenizer, token_num):
@@ -2321,6 +2338,298 @@ def fetch_flat_memory_metrics(
     return result
 
 
+# FLAT_MEMORY: Reporting helpers consume the server contract without inferring I/O.
+def _flat_counter(value):
+    if type(value) is not int or value < 0:
+        raise ValueError(f"Missing or invalid Flat counter: {value!r}")
+    return value
+
+
+def _flat_optional_sum(outputs, name, integer=True):
+    values = [getattr(output, name) for output in outputs]
+    if not values or any(
+        type(value) not in ((int,) if integer else (int, float))
+        or value < 0
+        or not np.isfinite(value)
+        for value in values
+    ):
+        return None
+    return sum(values)
+
+
+def summarize_flat_cache(outputs, total_prompt_tokens):
+    successful = [output for output in outputs if output.success]
+    dram = _flat_optional_sum(successful, "flat_dram")
+    ssd = _flat_optional_sum(successful, "flat_ssd")
+    mixed = _flat_optional_sum(successful, "flat_mixed")
+    total = dram + ssd if dram is not None and ssd is not None else None
+    if total is not None and (
+        total != sum(output.cached_tokens_storage for output in successful)
+        or mixed is None or mixed > ssd
+    ):
+        dram = ssd = mixed = total = None
+    device = _flat_optional_sum(successful, "cached_tokens_device")
+
+    def rate(tokens):
+        return (
+            100 * tokens / total_prompt_tokens
+            if tokens is not None and total_prompt_tokens > 0 else None
+        )
+
+    result = {
+        "flat_cached_tokens_dram": dram,
+        "flat_cached_tokens_ssd": ssd,
+        "flat_cached_tokens_mixed": mixed,
+        "flat_cached_tokens_total": total,
+        "device_hit_rate_pct": rate(device),
+        "flat_dram_hit_rate_pct": rate(dram),
+        "flat_ssd_hit_rate_pct": rate(ssd),
+        "flat_storage_hit_rate_pct": rate(total),
+    }
+    sums, counts = [], []
+    for medium in ("dram", "ssd"):
+        elapsed = _flat_optional_sum(successful, f"flat_prefetch_{medium}_ms", False)
+        ops = _flat_optional_sum(successful, f"flat_prefetch_{medium}_ops")
+        sums.append(elapsed)
+        counts.append(ops)
+        result[f"flat_{medium}_prefetch_latency_ms"] = (
+            elapsed / ops if elapsed is not None and ops else None
+        )
+    result["flat_prefetch_latency_ms"] = (
+        sum(sums) / sum(counts)
+        if all(value is not None for value in sums + counts) and sum(counts)
+        else None
+    )
+    return result
+
+
+def _flat_rank_map(snapshot):
+    ranks = snapshot["ranks"]
+    if not isinstance(ranks, list) or len(ranks) != 4:
+        raise ValueError("Flat I/O requires all four TP rank snapshots")
+    mapped = {}
+    for rank in ranks:
+        tp_rank = _flat_counter(rank["tp_rank"])
+        if tp_rank in mapped or not _flat_counter(rank["pid"]):
+            raise ValueError("Duplicate TP rank or invalid PID")
+        _flat_counter(rank["gpu_id"])
+        mapped[tp_rank] = rank
+    if set(mapped) != set(range(4)) or len({r["pid"] for r in ranks}) != 4:
+        raise ValueError("Incomplete or duplicate Flat TP identities")
+    return mapped
+
+
+_FLAT_WINDOW_COUNTERS = (
+    "read_completed_ops", "read_completed_bytes", "write_completed_ops",
+    "write_completed_bytes", "durable_write_batches", "durable_write_bytes",
+    "io_errors",
+)
+
+
+def _validate_flat_window(snapshot, window_id, active):
+    ranks = _flat_rank_map(snapshot)
+    boundaries = set()
+    for rank in ranks.values():
+        window = rank["io_window"]
+        if (
+            window["enabled"] is not True
+            or window["window_id"] != window_id
+            or window["active"] is not active
+            or window["aborted"] is not False
+            or window["overflowed"] is not False
+            or _flat_counter(window["bucket_ns"]) != 100_000_000
+        ):
+            raise ValueError("Disabled, mismatched, aborted or overflowed Flat window")
+        start = _flat_counter(window["start_ns"])
+        end = _flat_counter(window["end_ns"])
+        if not start or (not active and end <= start):
+            raise ValueError("Invalid Flat window boundaries")
+        boundaries.add((start, end))
+        for name in _FLAT_WINDOW_COUNTERS:
+            value = _flat_counter(window[name])
+            if (active or name == "io_errors") and value:
+                raise ValueError("Nonempty begin window or Flat I/O errors")
+        if not isinstance(window["buckets"], list):
+            raise ValueError("Missing Flat I/O buckets")
+        for name in ("pending_backups", "pending_prefetches"):
+            if _flat_counter(rank[name]):
+                raise ValueError("Flat pipeline was not drained")
+        _flat_counter(rank["flat_io_errors"])
+    if len(boundaries) != 1:
+        raise ValueError("TP ranks do not share Flat window boundaries")
+    return ranks, next(iter(boundaries))
+
+
+def summarize_flat_io(before, after, window_id):
+    first, (start, _) = _validate_flat_window(before, window_id, True)
+    last, (end_start, end) = _validate_flat_window(after, window_id, False)
+    if start != end_start:
+        raise ValueError("Flat begin/end window start mismatch")
+    seconds = (end - start) / 1e9
+    totals = {name: 0 for name in _FLAT_WINDOW_COUNTERS}
+    deltas = {name: 0 for name in (
+        "dram_read_total_bytes", "dram_write_total_bytes", "ssd_write_count"
+    )}
+    buckets = {}
+    for tp_rank, rank in last.items():
+        prior = first[tp_rank]
+        if any(rank[name] != prior[name] for name in ("pid", "gpu_id", "gds_mode")):
+            raise ValueError("Flat TP identity changed during collection")
+        error_delta = _flat_counter(rank["flat_io_errors"] - prior["flat_io_errors"])
+        if error_delta:
+            raise ValueError("Flat pipeline reported I/O errors")
+        for name in deltas:
+            delta = _flat_counter(rank["bandwidth"][name]) - _flat_counter(
+                prior["bandwidth"][name]
+            )
+            deltas[name] += _flat_counter(delta)
+        window = rank["io_window"]
+        for name in totals:
+            totals[name] += window[name]
+        seen = set()
+        read_bytes = write_bytes = 0
+        for bucket in window["buckets"]:
+            index = _flat_counter(bucket["index"])
+            if index in seen or index * 100_000_000 >= end - start:
+                raise ValueError("Duplicate or out-of-window Flat bucket index")
+            seen.add(index)
+            read = _flat_counter(bucket["read_bytes"])
+            write = _flat_counter(bucket["write_bytes"])
+            read_bytes += read
+            write_bytes += write
+            merged = buckets.setdefault(index, [0, 0])
+            merged[0] += read
+            merged[1] += write
+        if (read_bytes != window["read_completed_bytes"]
+                or write_bytes != window["durable_write_bytes"]):
+            raise ValueError("Flat bucket totals do not match completed/durable bytes")
+    return {
+        "flat_io_window_seconds": seconds,
+        "flat_dram_read_bw_gbps": deltas["dram_read_total_bytes"] / seconds / 1e9,
+        "flat_dram_write_bw_gbps": deltas["dram_write_total_bytes"] / seconds / 1e9,
+        "flat_ssd_read_bw_gbps": totals["read_completed_bytes"] / seconds / 1e9,
+        "flat_ssd_write_bw_gbps": totals["durable_write_bytes"] / seconds / 1e9,
+        # Merge by index first; even the last partial bucket has a 0.1s divisor.
+        "flat_ssd_read_peak_bw_gbps": max((b[0] for b in buckets.values()), default=0) / 0.1 / 1e9,
+        "flat_ssd_write_peak_bw_gbps": max((b[1] for b in buckets.values()), default=0) / 0.1 / 1e9,
+        "flat_ssd_read_io_count": totals["read_completed_ops"],
+        "flat_ssd_write_io_count": totals["write_completed_ops"],
+        "flat_ssd_durable_write_batches": totals["durable_write_batches"],
+        "flat_ssd_new_kv_blocks": deltas["ssd_write_count"],
+    }
+
+
+class FlatMemoryIOWindow:
+    """FLAT_MEMORY: Own one UUID window; telemetry must not discard request results."""
+
+    def __init__(self, base_url, enabled):
+        self.base_url = base_url
+        self.enabled = enabled
+        self.window_id = str(uuid.uuid4())
+        self.begin_attempted = False
+        self.ready = False
+        self.result = dict.fromkeys((
+            "flat_io_window_seconds", "flat_dram_read_bw_gbps",
+            "flat_dram_write_bw_gbps", "flat_ssd_read_bw_gbps",
+            "flat_ssd_write_bw_gbps", "flat_ssd_read_peak_bw_gbps",
+            "flat_ssd_write_peak_bw_gbps", "flat_ssd_read_io_count",
+            "flat_ssd_write_io_count", "flat_ssd_durable_write_batches",
+            "flat_ssd_new_kv_blocks",
+        ))
+        self.result.update(
+            flat_io_status="unavailable",
+            flat_io_error="Flat I/O collection was not requested",
+            flat_io_metadata={"before": None, "after": None},
+        )
+
+    async def _request(self, action=None):
+        timeout = float(os.environ.get("HICACHE_FLUSH_TIMEOUT", "150")) if action else 15
+        async with aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=timeout)
+        ) as session:
+            kwargs = {"headers": get_auth_headers()}
+            if action:
+                kwargs["json"] = {"action": action, "window_id": self.window_id}
+            async with session.request(
+                "POST" if action else "GET",
+                self.base_url + ("/flat_memory/io_window" if action else "/server_info"),
+                **kwargs,
+            ) as response:
+                response.raise_for_status()
+                return await response.json()
+
+    async def _wait_idle(self):
+        timeout = float(os.environ.get(
+            "DRAIN_TIMEOUT", os.environ.get("HICACHE_IO_DRAIN_TIMEOUT", "120")
+        ))
+        deadline = time.monotonic() + timeout
+        while True:
+            info = await self._request()
+            ranks = _flat_rank_map(info["internal_states"][0]["flat_memory"])
+            pending = sum(
+                _flat_counter(rank[name])
+                for rank in ranks.values()
+                for name in ("pending_backups", "pending_prefetches")
+            )
+            if not pending:
+                return
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("Flat I/O pipeline drain timed out")
+            # Idle checks only, outside request timing; never sample 100ms bandwidth.
+            await asyncio.sleep(min(1.0, remaining))
+
+    async def _abort(self):
+        if self.begin_attempted:
+            try:
+                await self._request("abort")
+            except Exception as exc:
+                warnings.warn(f"Flat I/O abort for {self.window_id} failed: {exc}")
+            finally:
+                self.begin_attempted = False
+
+    def _unavailable(self, exc):
+        self.result["flat_io_error"] = f"{type(exc).__name__}: {exc}"
+        warnings.warn(f"Flat I/O unavailable: {self.result['flat_io_error']}")
+
+    async def __aenter__(self):
+        if self.enabled:
+            try:
+                await self._wait_idle()
+                # Set ownership before POST: a lost begin response still needs abort.
+                self.begin_attempted = True
+                before = await self._request("begin")
+                self.result["flat_io_metadata"]["before"] = before
+                _validate_flat_window(before, self.window_id, True)
+                self.ready = True
+            except Exception as exc:
+                self._unavailable(exc)
+                await self._abort()
+                raise
+            except BaseException:
+                await self._abort()
+                raise
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        try:
+            if self.ready and exc_type is None:
+                try:
+                    await self._wait_idle()
+                    after = await self._request("end")
+                    self.result["flat_io_metadata"]["after"] = after
+                    metrics = summarize_flat_io(
+                        self.result["flat_io_metadata"]["before"], after, self.window_id
+                    )
+                    self.result.update(metrics, flat_io_status="ok", flat_io_error=None)
+                    self.begin_attempted = False
+                except Exception as error:
+                    self._unavailable(error)
+        finally:
+            await self._abort()
+        return False
+
+
 def calculate_metrics(
     input_requests: Optional[List[DatasetRow]],
     outputs: List[RequestFuncOutput],
@@ -2673,7 +2982,11 @@ async def benchmark(
 
     # Flush cache
     if ("sglang" in backend and _get_bool_env_var("SGLANG_IS_IN_CI")) or flush_cache:
-        requests.post(base_url + "/flush_cache", headers=get_auth_headers())
+        requests.post(
+            base_url + "/flush_cache",
+            headers=get_auth_headers(),
+            timeout=float(os.environ.get("HICACHE_FLUSH_TIMEOUT", "150")),
+        ).raise_for_status()
 
     time.sleep(1.0)
 
@@ -2700,74 +3013,79 @@ async def benchmark(
             if profile_output.success:
                 print("Profiler started")
 
-    # Run all requests
-    benchmark_start_time = time.perf_counter()
-    tasks: List[asyncio.Task] = []
-    pbar_total = len(input_requests)
-    if (
-        backend == "sglang" and args.dataset_name == "mooncake"
-    ):  # Assuming mooncake is mainly for sglang or similar backends
-        print("Using time-based Mooncake request scheduler, ignoring --request-rate.")
-        request_generator = get_mooncake_request_over_time(
-            input_requests, tokenizer, mooncake_slowdown_factor, mooncake_num_rounds
-        )
-        print(
-            f"Starting Mooncake trace replay. Sessions: {len(input_requests)}, Rounds per session: {mooncake_num_rounds}. Slowdown factor: {mooncake_slowdown_factor}"
-        )
-        pbar_total *= args.mooncake_num_rounds
-    else:
-        request_generator = get_request(input_requests, request_rate)
-
-    # Prepare LoRA request distribution parameters
-    if lora_request_distribution == "distinct":
-        lora_idx = 0
-    elif lora_request_distribution == "skewed":
-        weights = np.array([lora_zipf_alpha**-i for i in range(len(lora_names))])
-        lora_probs = weights / np.sum(weights)
-    else:
-        lora_idx = None
-        lora_probs = None
-
-    pbar = None if disable_tqdm else tqdm(total=pbar_total)
-    async for request in request_generator:
-        if lora_names is not None and len(lora_names) != 0:
-            if lora_request_distribution == "uniform":
-                lora_name = random.choice(lora_names)
-            elif lora_request_distribution == "distinct":
-                lora_name = lora_names[lora_idx]
-                lora_idx = (lora_idx + 1) % len(lora_names)
-            else:
-                assert (
-                    lora_request_distribution == "skewed"
-                ), f"Unexpected lora_request_distribution: {lora_request_distribution}. Expected 'skewed'."
-
-                lora_name = np.random.choice(lora_names, p=lora_probs)
-        else:
-            lora_name = None
-
-        # Merge global extra_request_body with per-request extras
-        # Per-request parameters take precedence over global ones
-        merged_extra_body = {**extra_request_body, **request.extra_request_body}
-
-        request_func_input = RequestFuncInput(
-            model=model_id,
-            prompt=request.prompt,
-            api_url=api_url,
-            prompt_len=request.prompt_len,
-            output_len=request.output_len,
-            lora_name=lora_name,
-            image_data=request.image_data,
-            extra_request_body=merged_extra_body,
-            timestamp=request.timestamp,
-            routing_key=request.routing_key,
-        )
-
-        tasks.append(
-            asyncio.create_task(
-                limited_request_func(request_func_input=request_func_input, pbar=pbar)
+    # FLAT_MEMORY: Begin after warmup/flush/idle; end and drain outside this timer.
+    async with FlatMemoryIOWindow(
+        base_url, getattr(args, "collect_flat_memory_io", False)
+    ) as flat_io:
+        # Run all requests
+        benchmark_start_time = time.perf_counter()
+        tasks: List[asyncio.Task] = []
+        pbar_total = len(input_requests)
+        if (
+            backend == "sglang" and args.dataset_name == "mooncake"
+        ):  # Assuming mooncake is mainly for sglang or similar backends
+            print("Using time-based Mooncake request scheduler, ignoring --request-rate.")
+            request_generator = get_mooncake_request_over_time(
+                input_requests, tokenizer, mooncake_slowdown_factor, mooncake_num_rounds
             )
-        )
-    outputs: List[RequestFuncOutput] = await asyncio.gather(*tasks)
+            print(
+                f"Starting Mooncake trace replay. Sessions: {len(input_requests)}, Rounds per session: {mooncake_num_rounds}. Slowdown factor: {mooncake_slowdown_factor}"
+            )
+            pbar_total *= args.mooncake_num_rounds
+        else:
+            request_generator = get_request(input_requests, request_rate)
+
+        # Prepare LoRA request distribution parameters
+        if lora_request_distribution == "distinct":
+            lora_idx = 0
+        elif lora_request_distribution == "skewed":
+            weights = np.array([lora_zipf_alpha**-i for i in range(len(lora_names))])
+            lora_probs = weights / np.sum(weights)
+        else:
+            lora_idx = None
+            lora_probs = None
+
+        pbar = None if disable_tqdm else tqdm(total=pbar_total)
+        async for request in request_generator:
+            if lora_names is not None and len(lora_names) != 0:
+                if lora_request_distribution == "uniform":
+                    lora_name = random.choice(lora_names)
+                elif lora_request_distribution == "distinct":
+                    lora_name = lora_names[lora_idx]
+                    lora_idx = (lora_idx + 1) % len(lora_names)
+                else:
+                    assert (
+                        lora_request_distribution == "skewed"
+                    ), f"Unexpected lora_request_distribution: {lora_request_distribution}. Expected 'skewed'."
+
+                    lora_name = np.random.choice(lora_names, p=lora_probs)
+            else:
+                lora_name = None
+
+            # Merge global extra_request_body with per-request extras
+            # Per-request parameters take precedence over global ones
+            merged_extra_body = {**extra_request_body, **request.extra_request_body}
+
+            request_func_input = RequestFuncInput(
+                model=model_id,
+                prompt=request.prompt,
+                api_url=api_url,
+                prompt_len=request.prompt_len,
+                output_len=request.output_len,
+                lora_name=lora_name,
+                image_data=request.image_data,
+                extra_request_body=merged_extra_body,
+                timestamp=request.timestamp,
+                routing_key=request.routing_key,
+            )
+
+            tasks.append(
+                asyncio.create_task(
+                    limited_request_func(request_func_input=request_func_input, pbar=pbar)
+                )
+            )
+        outputs: List[RequestFuncOutput] = await asyncio.gather(*tasks)
+        benchmark_duration = time.perf_counter() - benchmark_start_time
     if is_multi_turn:
         outputs = [x for output in outputs for x in output]
 
@@ -2788,30 +3106,30 @@ async def benchmark(
     if pbar is not None:
         pbar.close()
 
-    if "sglang" in backend:
-        server_info = requests.get(
-            base_url + "/get_server_info", headers=get_auth_headers()
+    # FLAT_MEMORY: A failed telemetry query must not discard completed requests.
+    server_info = None
+    accept_length = None
+    try:
+        response = requests.get(
+            base_url + "/get_server_info", headers=get_auth_headers(), timeout=15
         )
-        if server_info.status_code == 200:
-            server_info_json = server_info.json()
+        response.raise_for_status()
+        server_info = response.json()
+        if not isinstance(server_info, dict):
+            raise ValueError("Server info is not a JSON object")
+        if "sglang" in backend:
+            server_info_json = server_info
             if "decode" in server_info_json:
                 server_info_json = server_info_json["decode"][0]
-            if (
-                "internal_states" in server_info_json
-                and server_info_json["internal_states"]
-            ):
+            if server_info_json.get("internal_states"):
                 accept_length = server_info_json["internal_states"][0].get(
                     "avg_spec_accept_length", None
                 )
-            else:
-                accept_length = None
-        else:
-            accept_length = None
-    else:
-        accept_length = None
+    except Exception as exc:
+        server_info = None
+        warnings.warn(f"Server info unavailable; preserving request results: {exc}")
 
     # Compute metrics and print results
-    benchmark_duration = time.perf_counter() - benchmark_start_time
     metrics, output_lens = calculate_metrics(
         input_requests=None if is_multi_turn else input_requests,
         outputs=outputs,
@@ -2821,6 +3139,18 @@ async def benchmark(
         accept_length=accept_length,
         plot_throughput=args.plot_throughput,
     )
+
+    # FLAT_MEMORY: Legacy device/host/storage totals retain their original meaning.
+    flat_mode = (
+        flat_io.enabled
+        or any(output.flat_dram is not None for output in outputs)
+        or bool(((server_info or {}).get("internal_states") or [{}])[0].get("flat_memory"))
+    )
+    flat_cache = summarize_flat_cache(outputs, metrics.total_prompt_tokens)
+
+    def print_flat_metric(label, value):
+        rendered = "N/A" if value is None else (f"{value:.3f}" if isinstance(value, float) else str(value))
+        print(f"{label:<44} {rendered}")
 
     print("\n{s:{c}^{n}}".format(s=" Serving Benchmark Result ", n=50, c="="))
     print("{:<40} {:<10}".format("Backend:", backend))
@@ -2887,10 +3217,49 @@ async def benchmark(
         print("{:<40} {:<10}".format("Total cached tokens:", metrics.total_cached_tokens))
         print("{:<40} {:<10}".format("Total prompt tokens:", metrics.total_prompt_tokens))
         print("{:<40} {:<10.4f}".format("Cache hit rate:", metrics.cache_hit_rate))
-        if metrics.total_cached_tokens_device > 0 or metrics.total_cached_tokens_host > 0 or metrics.total_cached_tokens_storage > 0:
+        if flat_mode:
+            # FLAT_MEMORY: Host here means Flat DRAM, not the legacy HiCache pool.
+            for label, tokens, rate in (
+                ("Device(GPU HBM)", _flat_optional_sum(
+                    [o for o in outputs if o.success], "server_cached_tokens_device"
+                ), "device_hit_rate_pct"),
+                ("Host(Flat DRAM)", flat_cache["flat_cached_tokens_dram"], "flat_dram_hit_rate_pct"),
+                ("Storage(Flat NVMe SSD)", flat_cache["flat_cached_tokens_ssd"], "flat_ssd_hit_rate_pct"),
+                ("FlatCake storage(DRAM+SSD) subtotal", flat_cache["flat_cached_tokens_total"], "flat_storage_hit_rate_pct"),
+            ):
+                print_flat_metric(f"{label} tokens:", tokens)
+                print_flat_metric(f"{label} hit rate (%):", flat_cache[rate])
+            print_flat_metric("Mixed tokens (subset of SSD, not additive):", flat_cache["flat_cached_tokens_mixed"])
+        elif metrics.total_cached_tokens_device > 0 or metrics.total_cached_tokens_host > 0 or metrics.total_cached_tokens_storage > 0:
             print("{:<40} {:<10}".format("  - Device (GPU HBM):", metrics.total_cached_tokens_device))
             print("{:<40} {:<10}".format("  - Host (CPU DRAM):", metrics.total_cached_tokens_host))
             print("{:<40} {:<10}".format("  - Storage (L3 SSD):", metrics.total_cached_tokens_storage))
+    if flat_mode:
+        print("{s:{c}^{n}}".format(s="Flat Prefetch Arrival-to-All-TP-GPU-Ready", n=50, c="-"))
+        for label, key in (
+            ("All successful prefetch ops (ms):", "flat_prefetch_latency_ms"),
+            ("DRAM-only prefetch ops (ms):", "flat_dram_prefetch_latency_ms"),
+            ("SSD-dependent prefetch ops (ms):", "flat_ssd_prefetch_latency_ms"),
+        ):
+            print_flat_metric(label, flat_cache[key])
+        print("{s:{c}^{n}}".format(s="Flat Completed/Durable I/O Window", n=50, c="-"))
+        print_flat_metric("Flat I/O status:", flat_io.result["flat_io_status"])
+        if flat_io.result["flat_io_error"]:
+            print_flat_metric("Flat I/O error:", flat_io.result["flat_io_error"])
+        for label, key in (
+            ("I/O window (s):", "flat_io_window_seconds"),
+            ("DRAM read bandwidth (GB/s):", "flat_dram_read_bw_gbps"),
+            ("DRAM write bandwidth (GB/s):", "flat_dram_write_bw_gbps"),
+            ("SSD read bandwidth (GB/s):", "flat_ssd_read_bw_gbps"),
+            ("SSD durable write bandwidth (GB/s):", "flat_ssd_write_bw_gbps"),
+            ("SSD read peak (100ms, GB/s):", "flat_ssd_read_peak_bw_gbps"),
+            ("SSD durable write peak (100ms, GB/s):", "flat_ssd_write_peak_bw_gbps"),
+            ("SSD completed read I/O count:", "flat_ssd_read_io_count"),
+            ("SSD completed write I/O count:", "flat_ssd_write_io_count"),
+            ("SSD durable write batches:", "flat_ssd_durable_write_batches"),
+            ("SSD new KV blocks (rank/layer/K/V keys):", "flat_ssd_new_kv_blocks"),
+        ):
+            print_flat_metric(label, flat_io.result[key])
     if metrics.kvcache_page_size > 0 or metrics.kvcache_bytes_per_page > 0:
         print("{s:{c}^{n}}".format(s="KVCache Block Granularity", n=50, c="-"))
         print("{:<40} {:<10}".format("Page size (tokens):", metrics.kvcache_page_size))
@@ -2898,7 +3267,8 @@ async def benchmark(
         print("{:<40} {:<10.2f}".format(
             "Bytes per page (K+V, KB):", metrics.kvcache_bytes_per_page / 1024.0
         ))
-    if (metrics.avg_storage_read_latency_ms > 0 or metrics.total_storage_read_tokens > 0
+    # FLAT_MEMORY: These legacy transfer labels do not describe the Flat path.
+    if not flat_mode and (metrics.avg_storage_read_latency_ms > 0 or metrics.total_storage_read_tokens > 0
             or metrics.total_d2h_tokens > 0 or metrics.total_storage_write_tokens > 0):
         print("{s:{c}^{n}}".format(s="Transfer Metrics", n=50, c="-"))
         if metrics.avg_storage_read_latency_ms > 0:
@@ -2919,7 +3289,7 @@ async def benchmark(
             ))
     # Fetch and print Mooncake Master eviction metrics
     mooncake_eviction = {}
-    if hasattr(args, 'mooncake_master_host') and args.mooncake_master_host:
+    if not flat_mode and getattr(args, "mooncake_master_host", None):
         mooncake_eviction = fetch_mooncake_eviction_metrics(
             master_host=args.mooncake_master_host,
             metrics_port=getattr(args, 'mooncake_metrics_port', 9003),
@@ -2945,7 +3315,7 @@ async def benchmark(
                 ))
     # Fetch and print SGLang Prefill bandwidth metrics
     bandwidth_metrics = {}
-    if hasattr(args, 'prefill_metrics_host') and args.prefill_metrics_host:
+    if not flat_mode and getattr(args, "prefill_metrics_host", None):
         bandwidth_metrics = fetch_sglang_bandwidth_metrics(
             prefill_host=args.prefill_metrics_host,
             prefill_port=getattr(args, 'prefill_metrics_port', 30000),
@@ -2973,7 +3343,7 @@ async def benchmark(
     # Fetch and print Flat Memory System per-backend stats
     flat_memory_metrics = {}
     fm_host = getattr(args, 'prefill_metrics_host', None)
-    if fm_host:
+    if fm_host and not flat_mode:
         flat_memory_metrics = fetch_flat_memory_metrics(
             prefill_host=fm_host,
             prefill_port=getattr(args, 'prefill_metrics_port', 30000),
@@ -3135,9 +3505,6 @@ async def benchmark(
     print("{:<40} {:<10.2f}".format("Max ITL (ms):", metrics.max_itl_ms))
     print("=" * 50)
 
-    resp = requests.get(base_url + "/get_server_info", headers=get_auth_headers())
-    server_info = resp.json() if resp.status_code == 200 else None
-
     if (
         metrics.median_ttft_ms is not None
         and metrics.mean_itl_ms is not None
@@ -3211,6 +3578,10 @@ async def benchmark(
             # Flat Memory System per-backend stats
             "flat_memory": flat_memory_metrics if flat_memory_metrics else {},
         }
+        # FLAT_MEMORY: Separate Flat report from legacy totals and service BW metadata.
+        if flat_mode:
+            result.update(flat_cache)
+            result.update(flat_io.result)
     else:
         print(f"Error running benchmark for request rate: {request_rate}")
         print("-" * 30)
@@ -3251,6 +3622,19 @@ async def benchmark(
         ],
         "server_cached_tokens": [output.server_cached_tokens for output in outputs],
     }
+    # FLAT_MEMORY: Keep per-request sums/op counts for auditable weighted latency.
+    if flat_mode:
+        result_details["flat_cached_tokens_details"] = [
+            {
+                name: getattr(output, name)
+                for name in (
+                    "flat_dram", "flat_ssd", "flat_mixed",
+                    "flat_prefetch_dram_ms", "flat_prefetch_dram_ops",
+                    "flat_prefetch_ssd_ms", "flat_prefetch_ssd_ops",
+                )
+            }
+            for output in outputs
+        ]
 
     # Append results to a JSONL file
     with open(output_file_name, "a") as file:
@@ -3801,6 +4185,13 @@ if __name__ == "__main__":
         "Can specify multiple URLs: --profile-decode-url http://localhost:30010 http://localhost:30011. "
         "NOTE: Cannot be used together with --profile-prefill-url. "
         "In PD separated mode, prefill and decode workers must be profiled separately.",
+    )
+    # FLAT_MEMORY: Native 100ms buckets, not HTTP bandwidth sampling.
+    parser.add_argument(
+        "--collect-flat-memory-io",
+        action="store_true",
+        help="Collect a TP4 Flat I/O UUID window after warmup/flush through pipeline drain; "
+        "telemetry/drain time is excluded from request throughput timing.",
     )
     parser.add_argument(
         "--flush-cache",

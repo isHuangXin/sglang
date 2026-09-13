@@ -269,6 +269,10 @@ class GPUStorageOperation(StorageOperation):
         self.addresses = addresses or []
         self.arrival_time = time.monotonic() if arrival_time is None else arrival_time
         self.done = threading.Event()
+        self.tp_ready = False
+        self.completed_at = 0.0
+        self.ready_latency_ms = 0.0
+        self.page_media = []
         self.cancelled = False
         self.error = None
         self.start_event = torch.cuda.Event()
@@ -307,6 +311,7 @@ class HiCacheController:
         self.storage_backend = None
         self.storage_backend_type = None
         self.flat_gpu_mode = False
+        self.flat_io_errors = 0
         self.pp_rank = pp_rank
         self.pp_size = pp_size
 
@@ -472,6 +477,7 @@ class HiCacheController:
                 logger.exception("GDS (compat) prefetch failed")
             finally:
                 stream.synchronize()
+                operation.completed_at = time.monotonic()
                 operation.done.set()
                 with self.flat_condition:
                     self.flat_completed_reads += 1
@@ -536,11 +542,13 @@ class HiCacheController:
         elif hasattr(self, "prefetch_io_aux_thread"):
             threads.append(self.prefetch_io_aux_thread)
 
+        timeout = float(os.environ.get("HICACHE_IO_DRAIN_TIMEOUT", "120")) if self.flat_gpu_mode else 10.0
+        if not 0 < timeout < float("inf"):
+            raise ValueError("HICACHE_IO_DRAIN_TIMEOUT must be finite and positive")
+        deadline = time.monotonic() + timeout
         for t in threads:
-            try:
-                t.join(timeout=10)
-            except Exception:
-                pass
+            if t.ident is not None:
+                t.join(timeout=max(0.0, deadline - time.monotonic()))
 
         alive = [t for t in threads if getattr(t, "is_alive", lambda: False)()]
         if alive:
@@ -564,6 +572,12 @@ class HiCacheController:
         """
         if self.enable_storage:
             raise RuntimeError("Storage backend already attached.")
+        gpu_storage = (
+            storage_backend == "flat_memory"
+            and (storage_backend_extra_config or {}).get("gds_mode") == "compat"
+        )
+        if self.mem_pool_host.kv_buffer is None and not gpu_storage:
+            raise ValueError("A metadata-only Host pool requires GDS (compat); restart to change modes")
 
         # Defensive: a previous partial detach may have flipped `enable_storage` but
         # left background threads alive. Attaching on top of them is unsafe.
@@ -594,23 +608,32 @@ class HiCacheController:
         from sglang.srt.mem_cache.storage import StorageBackendFactory
 
         try:
-            self.storage_backend = StorageBackendFactory.create_backend(
-                storage_backend, self.storage_config, self.mem_pool_host
-            )
-            self.storage_backend.register_mem_pool_host(self.mem_pool_host)
-            # FLAT_MEMORY: The GPU path must not dispatch to host-pointer APIs.
-            self.flat_gpu_mode = (
-                storage_backend == "flat_memory" and self.storage_backend.gpu_direct
-            )
-            if self.flat_gpu_mode:
-                if self.write_policy != "write_through":
-                    raise ValueError("GDS (compat) requires write_through")
-                if (
-                    torch.distributed.get_world_size(group=self.tp_group) != 1
-                    or self.pp_size != 1
-                ):
-                    raise ValueError("GDS (compat) currently supports TP=1, PP=1")
-                self.storage_backend.register_mem_pool_device(self.mem_pool_device)
+            initialization_error = None
+            try:
+                self.storage_backend = StorageBackendFactory.create_backend(
+                    storage_backend, self.storage_config, self.mem_pool_host
+                )
+                self.storage_backend.register_mem_pool_host(self.mem_pool_host)
+                self.flat_gpu_mode = gpu_storage
+                if self.flat_gpu_mode:
+                    if self.write_policy != "write_through":
+                        raise ValueError("GDS (compat) requires write_through")
+                    if self.tp_size not in (1, 4) or self.pp_size != 1:
+                        raise ValueError("GDS (compat) supports TP=1/4, PP=1")
+                    self.storage_backend.register_mem_pool_device(self.mem_pool_device)
+            except Exception as exc:
+                if not gpu_storage:
+                    raise
+                initialization_error = f"{type(exc).__name__}: {exc}"
+            if gpu_storage:
+                errors = [initialization_error]
+                if self.tp_size > 1:
+                    errors = [None] * self.tp_size
+                    torch.distributed.all_gather_object(
+                        errors, initialization_error, group=self.tp_group
+                    )
+                if any(error is not None for error in errors):
+                    raise RuntimeError(f"GDS (compat) TP initialization failed: {errors}")
 
             self.enable_storage = True
             # todo: threshold policy for prefetching

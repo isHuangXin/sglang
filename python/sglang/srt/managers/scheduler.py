@@ -1660,6 +1660,8 @@ class Scheduler(
         ):
             if not hasattr(req, "flat_arrival_time"):
                 req.flat_arrival_time = time.monotonic()
+                req.flat_arrival_seq = getattr(self, "flat_arrival_seq", 0)
+                self.flat_arrival_seq = req.flat_arrival_seq + 1
             self.tree_cache.check_hicache_events()
             req.init_next_round_input(self.tree_cache)
             self.tree_cache.prefetch_gpu(req)
@@ -2049,7 +2051,7 @@ class Scheduler(
                     self.flat_dram_ready.append(req)
                 else:
                     preparing.append(req)
-            self.flat_dram_ready.sort(key=lambda req: req.flat_arrival_time)
+            self.flat_dram_ready.sort(key=lambda req: req.flat_arrival_seq)
             self.waiting_queue = self.flat_dram_ready + preparing
         else:
             self.policy.calc_priority(self.waiting_queue, self.running_batch)
@@ -2133,6 +2135,8 @@ class Scheduler(
                 loaded_tokens = self.tree_cache.pop_prefetch_loaded_tokens(req.rid)
                 if getattr(self.tree_cache, "flat_gpu_mode", False):
                     req.storage_hit_length += loaded_tokens
+                    for name, value in self.tree_cache.pop_flat_prefetch_stats(req.rid).items():
+                        req.flat_prefetch_stats[name] += value
                 else:
                     req.storage_hit_length = loaded_tokens
                 # FLAT_MEMORY: Pop prefetch latency and token count for this request
@@ -2675,10 +2679,14 @@ class Scheduler(
 
     def flush_cache(self):
         """Flush the memory pool and cache."""
-        if self._is_no_request():
+        if self._is_no_request() and not self.waiting_queue:
+            try:
+                self.tree_cache.reset()
+            except (TimeoutError, RuntimeError) as exc:
+                logger.error("Cache flush aborted without clearing pools: %s", exc)
+                return False
             self.cur_batch = None
             self.last_batch = None
-            self.tree_cache.reset()
             self.req_to_token_pool.clear()
             self.token_to_kv_pool_allocator.clear()
             self.grammar_manager.clear()
@@ -2700,8 +2708,59 @@ class Scheduler(
             success = False
         return success
 
+    def _control_flat_io_window(self, action, window_id):
+        if not getattr(self.tree_cache, "flat_gpu_mode", False):
+            return {"error": "Flat I/O windows require GDS (compat)"}
+        controller = self.tree_cache.cache_controller
+        manager = controller.storage_backend.manager
+        error = None
+        current = None
+        try:
+            current = manager.get_io_window()
+            if action not in ("begin", "end", "abort") or not window_id:
+                error = "Invalid Flat I/O window action or ID"
+            elif action == "begin":
+                if current["active"] and current["window_id"] != window_id:
+                    error = "Another Flat I/O window is active"
+                elif not current["active"] and current["window_id"] == window_id:
+                    error = "Use a fresh ID for a new Flat I/O window"
+            elif current["window_id"] != window_id:
+                error = "Flat I/O window owner does not match"
+            needs_idle = action == "begin" and not current["active"] or action == "end" and current["active"]
+            if needs_idle and (
+                not self._is_no_request() or self.waiting_queue
+                or controller.pending_backup_count or self.tree_cache.flat_prefetch
+            ):
+                error = "Flat I/O is not idle"
+        except Exception as exc:
+            error = str(exc)
+        errors = self.tree_cache._flat_gather(error)
+        if any(errors):
+            return {"error": str(errors)}
+        boundary = self.tree_cache._flat_gather(manager.io_clock_ns())[0]
+        try:
+            if action == "begin":
+                accepted = manager.start_io_window(window_id, boundary)
+            else:
+                accepted = manager.end_io_window(window_id, boundary, abort=action == "abort")
+            if accepted is False:
+                raise RuntimeError("Flat I/O window operation was rejected")
+        except Exception as exc:
+            error = str(exc)
+        errors = self.tree_cache._flat_gather(error)
+        if any(errors):
+            if action == "begin":
+                try:
+                    window = manager.get_io_window()
+                    if window["active"] and window["window_id"] == window_id:
+                        manager.end_io_window(window_id, manager.io_clock_ns(), abort=True)
+                except Exception:
+                    logger.exception("Could not abort a partially opened Flat I/O window")
+            return {"error": str(errors)}
+        return {"error": None}
+
     def get_internal_state(self, recv_req: GetInternalStateReq):
-        ret = vars(get_global_server_args())
+        ret = vars(get_global_server_args()).copy()
         ret["last_gen_throughput"] = self.last_gen_throughput
         ret["memory_usage"] = {
             "weight": round(self.tp_worker.model_runner.weight_load_mem_usage, 2),
@@ -2712,6 +2771,39 @@ class Scheduler(
             "graph": round(self.tp_worker.model_runner.graph_mem_usage, 2),
         }
         ret["effective_max_running_requests_per_dp"] = self.max_running_requests
+
+        if recv_req.flat_io_action and not getattr(self.tree_cache, "flat_gpu_mode", False):
+            ret["flat_io_control"] = {"error": "Flat I/O windows require GDS (compat)"}
+        if getattr(self.tree_cache, "flat_gpu_mode", False):
+            self.tree_cache.check_hicache_events()
+            if recv_req.flat_io_action:
+                ret["flat_io_control"] = self._control_flat_io_window(
+                    recv_req.flat_io_action, recv_req.flat_io_window_id
+                )
+            controller = self.tree_cache.cache_controller
+            store = controller.storage_backend
+            snapshot = store.get_flat_memory_stats()
+            snapshot["io_window"] = store.manager.get_io_window()
+            snapshot.update(
+                pid=os.getpid(),
+                tp_rank=store.local_rank,
+                gpu_id=store.manager.config.gpu_id,
+                gds_mode=store.manager.config.gds_mode,
+                host_pool_bytes=controller.mem_pool_host.size
+                * controller.mem_pool_host.get_size_per_token(),
+                pending_backups=controller.pending_backup_count,
+                pending_prefetches=len(self.tree_cache.flat_prefetch),
+                flat_io_errors=controller.flat_io_errors,
+                prefetch_token_limit=controller.prefetch_capacity_limit,
+                gpu_pack_buffer_limit_bytes=store.gpu_stage_bytes,
+                gds_worker_scratch_bytes=store.manager.config.gds_max_io_bytes
+                * store.manager.config.io_thread_pool_size,
+            )
+            ranks = [snapshot]
+            if self.tree_cache.tp_world_size > 1:
+                ranks = [None] * self.tree_cache.tp_world_size
+                torch.distributed.all_gather_object(ranks, snapshot, group=controller.tp_group)
+            ret["flat_memory"] = {"ranks": ranks}
 
         if not self.spec_algorithm.is_none() and self.spec_total_num_forward_ct > 0:
             ret["avg_spec_accept_length"] = (

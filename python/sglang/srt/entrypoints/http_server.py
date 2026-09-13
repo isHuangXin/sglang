@@ -106,6 +106,7 @@ from sglang.srt.managers.io_struct import (
     DestroyWeightsUpdateGroupReqInput,
     DumperControlReqInput,
     EmbeddingReqInput,
+    FlatMemoryIOWindowReq,
     GenerateReqInput,
     GetWeightsByNameReqInput,
     InitWeightsSendGroupForRemoteInstanceReqInput,
@@ -610,6 +611,20 @@ async def server_info():
     }
 
 
+@app.post("/flat_memory/io_window")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def flat_memory_io_window(obj: FlatMemoryIOWindowReq):
+    if obj.action not in ("begin", "end", "abort") or not 1 <= len(obj.window_id) <= 128:
+        return ORJSONResponse({"error": "Invalid Flat I/O window action or ID"}, status_code=400)
+    states = await _global_state.tokenizer_manager.get_internal_state(
+        flat_io_action=obj.action, flat_io_window_id=obj.window_id
+    )
+    errors = [state.get("flat_io_control", {}).get("error") for state in states]
+    if any(errors) or len(states) != 1:
+        return ORJSONResponse({"error": str(errors)}, status_code=409)
+    return {"ranks": states[0]["flat_memory"]["ranks"]}
+
+
 @app.get("/get_load")
 async def get_load():
     """Get load metrics (deprecated - use /v1/loads instead)."""
@@ -713,8 +728,11 @@ async def flush_cache():
     """Flush the radix cache."""
     ret = await _global_state.tokenizer_manager.flush_cache()
     return Response(
-        content="Cache flushed.\nPlease check backend logs for more details. "
-        "(When there are running or waiting requests, the operation will not be performed.)\n",
+        content=(
+            "Cache flushed.\n"
+            if ret.success
+            else "Cache not flushed: requests or storage I/O are still active. Check backend logs.\n"
+        ),
         status_code=200 if ret.success else HTTPStatus.BAD_REQUEST,
     )
 

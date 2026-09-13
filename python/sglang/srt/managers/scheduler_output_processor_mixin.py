@@ -91,10 +91,12 @@ class SchedulerOutputProcessorMixin:
             return None
 
         # Only show if there are any cached tokens
+        flat_storage = getattr(self.tree_cache, "flat_gpu_mode", False)
         if (
             req.cached_tokens_device > 0
             or req.cached_tokens_host > 0
             or req.cached_tokens_storage > 0
+            or flat_storage
         ):
             details = {
                 "device": req.cached_tokens_device,
@@ -104,6 +106,12 @@ class SchedulerOutputProcessorMixin:
             if getattr(self, "enable_hicache_storage", False):
                 details["storage"] = req.cached_tokens_storage
                 details["storage_backend"] = self._get_storage_backend_type()
+            if flat_storage:
+                details.update(req.flat_cached_tokens)
+                details.update({
+                    name: value for name, value in req.flat_prefetch_stats.items()
+                    if name.startswith("flat_prefetch_")
+                })
             # FLAT_MEMORY: include transfer metrics and granularity info
             if req.kvcache_page_size > 0:
                 details["page_size"] = req.kvcache_page_size

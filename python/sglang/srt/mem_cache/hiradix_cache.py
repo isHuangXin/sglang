@@ -69,6 +69,27 @@ class HiRadixCache(RadixCache):
 
         self.page_size = params.page_size
         self.kv_cache = params.token_to_kv_pool_allocator.get_kvcache()
+        (
+            extra_config,
+            prefetch_threshold,
+            prefetch_timeout_base,
+            prefetch_timeout_per_ki_token,
+            hicache_storage_pass_prefix_keys,
+        ) = self._parse_storage_backend_extra_config(
+            server_args.hicache_storage_backend_extra_config
+        )
+        gpu_storage = (
+            server_args.hicache_storage_backend == "flat_memory"
+            and extra_config.get("gds_mode") == "compat"
+        )
+        if gpu_storage and (
+            type(self.kv_cache) is not MHATokenToKVPool
+            or server_args.pp_size != 1
+            or server_args.dp_size != 1
+            or server_args.enable_dp_attention
+            or torch.distributed.get_world_size(params.tp_cache_group) not in (1, 4)
+        ):
+            raise ValueError("GDS (compat) requires standard MHA/GQA, TP=1/4, PP=DP=1")
 
         if isinstance(self.kv_cache, MHATokenToKVPool):
             self.token_to_kv_pool_host = MHATokenToKVPoolHost(
@@ -78,6 +99,7 @@ class HiRadixCache(RadixCache):
                 self.page_size,
                 server_args.hicache_mem_layout,
                 allocator_type=server_args.hicache_storage_backend,
+                allocate_buffer=not gpu_storage,
             )
         elif isinstance(self.kv_cache, NSATokenToKVPool):
             self.token_to_kv_pool_host = NSATokenToKVPoolHost(
@@ -114,15 +136,6 @@ class HiRadixCache(RadixCache):
             server_args.hicache_storage_backend == "flat_memory"
         )
 
-        (
-            extra_config,
-            prefetch_threshold,
-            prefetch_timeout_base,
-            prefetch_timeout_per_ki_token,
-            hicache_storage_pass_prefix_keys,
-        ) = self._parse_storage_backend_extra_config(
-            server_args.hicache_storage_backend_extra_config
-        )
         # TODO: support more timeout check functions
         self.is_prefetch_timeout = self._prefetch_timeout_check_linear_func
         self.prefetch_stop_policy = server_args.hicache_storage_prefetch_policy
@@ -162,6 +175,7 @@ class HiRadixCache(RadixCache):
         self.ongoing_prefetch = {}
         self.ongoing_backup = {}
         self.flat_prefetch = {}
+        self._flat_prefetch_stats_by_reqid = {}
         self.flat_pending_backup = set()
         self.flat_gpu_mode = self.cache_controller.flat_gpu_mode
         # track per-request tokens loaded from storage (L3 hits)
@@ -198,7 +212,7 @@ class HiRadixCache(RadixCache):
         """
         try:
             if self.enable_storage:
-                self.detach_storage_backend()
+                self.detach_storage_backend(shutdown=True)
         except Exception:
             logger.exception("Failed to detach storage backend on process shutdown.")
 
@@ -265,6 +279,8 @@ class HiRadixCache(RadixCache):
         requests to avoid races.
         """
         # Validate inputs first (no side effects).
+        if self.flat_gpu_mode and hicache_write_policy not in (None, "write_through"):
+            return False, "GDS (compat) requires write_through"
         if hicache_storage_prefetch_policy is not None:
             allowed = ["best_effort", "wait_complete", "timeout"]
             if hicache_storage_prefetch_policy not in allowed:
@@ -369,11 +385,13 @@ class HiRadixCache(RadixCache):
         )
         return True, "Attached HiCache storage backend successfully."
 
-    def detach_storage_backend(self) -> tuple[bool, str]:
+    def detach_storage_backend(self, shutdown=False) -> tuple[bool, str]:
         """Detach (disable) storage backend at runtime.
 
         Caller must ensure there are no running/queued requests to avoid races.
         """
+        if self.token_to_kv_pool_host.kv_buffer is None and not shutdown:
+            return False, "GDS (compat) has no Host cache; restart to change storage modes"
         try:
             # Drain any pending control queues before tearing down storage threads/backend.
             # IMPORTANT: this must happen before we clear `ongoing_*`, otherwise acks/releases
@@ -411,7 +429,7 @@ class HiRadixCache(RadixCache):
         if self.flat_gpu_mode:
             for req_id, operation in list(self.flat_prefetch.items()):
                 operation.cancelled = True
-                self._finish_gpu_prefetch(req_id)
+                self._finish_gpu_prefetch(req_id, local=True)
             for node in self.ongoing_backup.values():
                 self.dec_lock_ref(node)
             self.ongoing_backup.clear()
@@ -620,8 +638,28 @@ class HiRadixCache(RadixCache):
 
     def reset(self):
         if self.flat_gpu_mode:
-            self.cache_controller._stop_storage_threads()
+            error = None
+            try:
+                self.cache_controller._stop_storage_threads()
+            except RuntimeError as exc:
+                error = str(exc)
+            errors = self._flat_gather(error)
+            if any(item is not None for item in errors):
+                raise RuntimeError(f"Flat TP storage did not drain: {errors}")
+            self._sync_flat_io()
             self._force_release_pending_storage_ops()
+            TreeNode.counter = 0
+            self.cache_controller.reset()
+            self.token_to_kv_pool_host.clear()
+            self.ongoing_write_through.clear()
+            self.ongoing_load_back.clear()
+            self.ongoing_prefetch.clear()
+            self.prefetch_loaded_tokens_by_reqid.clear()
+            self._flat_prefetch_stats_by_reqid.clear()
+            self._prefetch_latency_by_reqid.clear()
+            self.evictable_host_leaves.clear()
+            super().reset()
+            return
         TreeNode.counter = 0
         # Flush the full GPU→Host→Storage pipeline before clearing queues.
         # Pipeline: ongoing_write_through (D2H) → writing_check → backup_queue → Storage
@@ -1104,14 +1142,70 @@ class HiRadixCache(RadixCache):
         """
         return self.cache_controller.start_loading()
 
+    def _flat_gather(self, value):
+        if self.tp_world_size == 1:
+            return [value]
+        values = [None] * self.tp_world_size
+        torch.distributed.all_gather_object(values, value, group=self.tp_group)
+        return values
+
+    # FLAT_MEMORY: Agree on completed I/O before any rank mutates its radix tree.
+    def _sync_flat_io(self):
+        cc = self.cache_controller
+        reads = {
+            rid: (
+                op.done.is_set(), op.completed_tokens, op.cancelled, op.error,
+                max(0.0, op.completed_at - op.arrival_time) * 1000,
+            )
+            for rid, op in self.flat_prefetch.items()
+        }
+        with cc.ack_backup_queue.mutex:
+            backups = list(cc.ack_backup_queue.queue)
+        state = {
+            "reads": reads,
+            "writes": tuple(self.ongoing_backup),
+            "backups": [(op.id, op.completed_tokens, len(op.token_ids), op.error) for op in backups],
+        }
+        states = self._flat_gather(state)
+        if any(
+            tuple(other["reads"]) != tuple(reads)
+            or other["writes"] != state["writes"]
+            for other in states
+        ):
+            raise RuntimeError("Flat TP operation order diverged")
+        for rid, operation in self.flat_prefetch.items():
+            reports = [other["reads"][rid] for other in states]
+            operation.cancelled = any(report[2] for report in reports)
+            error = next((report[3] for report in reports if report[3]), None)
+            if error:
+                operation.error = error
+                operation.cancelled = True
+            operation.tp_ready = all(report[0] for report in reports)
+            if operation.tp_ready:
+                operation.completed_tokens = min(report[1] for report in reports)
+                operation.ready_latency_ms = max(report[4] for report in reports)
+        count = min(len(other["backups"]) for other in states)
+        for index in range(count):
+            reports = [other["backups"][index] for other in states]
+            if any((report[0], report[2]) != (reports[0][0], reports[0][2]) for report in reports):
+                raise RuntimeError("Flat TP backup acknowledgements diverged")
+            completed = min(report[1] for report in reports)
+            if any(report[3] for report in reports):
+                completed = 0
+            backups[index].completed_tokens = completed
+            if completed != reports[0][2]:
+                cc.flat_io_errors += 1
+        self._drain_storage_control_queues_impl(0, count, 0, True)
+
     def check_hicache_events(self):
         if self.flat_gpu_mode:
+            self._sync_flat_io()
             for req_id, operation in list(self.flat_prefetch.items()):
                 if operation.cancelled:
                     self._finish_gpu_prefetch(req_id)
         self.writing_check()
         self.loading_check()
-        if self.enable_storage:
+        if self.enable_storage and not self.flat_gpu_mode:
             self.drain_storage_control_queues()
         if self.enable_storage_metrics:
             self.storage_metrics_collector.log_storage_metrics(
@@ -1281,7 +1375,6 @@ class HiRadixCache(RadixCache):
             operation = self.flat_prefetch.get(req_id)
             if operation is not None:
                 operation.cancelled = True
-                self._finish_gpu_prefetch(req_id)
             return
         if req_id not in self.ongoing_prefetch:
             return
@@ -1298,6 +1391,9 @@ class HiRadixCache(RadixCache):
         This should be called after check_prefetch_progress() returns True.
         """
         return self.prefetch_loaded_tokens_by_reqid.pop(req_id, 0)
+
+    def pop_flat_prefetch_stats(self, req_id: str) -> dict:
+        return self._flat_prefetch_stats_by_reqid.pop(req_id, {})
 
     def pop_prefetch_latency(self, req_id: str) -> tuple:
         """
@@ -1370,12 +1466,13 @@ class HiRadixCache(RadixCache):
 
     # FLAT_MEMORY: Page allocation and radix mutation stay on the scheduler thread.
     def prefetch_gpu(self, req):
-        if req.rid in self.flat_prefetch:
-            return
         cc = self.cache_controller
         prefix_len = len(req.prefix_indices)
         end = (len(req.fill_ids) - 1) // self.page_size * self.page_size
-        if end - prefix_len < self.prefetch_threshold:
+        identity = (req.rid, prefix_len, end, req.rid in self.flat_prefetch)
+        if any(other != identity for other in self._flat_gather(identity)):
+            raise RuntimeError("Flat TP request prefixes diverged")
+        if identity[3] or end - prefix_len < self.prefetch_threshold:
             return
         hashes = []
         last_hash = None
@@ -1387,25 +1484,25 @@ class HiRadixCache(RadixCache):
                 hashes.append(last_hash)
         addresses, hit_pages = cc.storage_backend.resolve_gpu_prefix(hashes)
         budget = max(0, cc.prefetch_capacity_limit - cc.prefetch_tokens_occupied)
-        count = (
-            min(hit_pages * self.page_size, budget) // self.page_size * self.page_size
-        )
+        limits = self._flat_gather(min(hit_pages * self.page_size, budget))
+        count = min(limits) // self.page_size * self.page_size
         if count < self.prefetch_threshold:
             return
         anchor = req.last_node
         self.inc_lock_ref(anchor)
         allocator = cc.mem_pool_device_allocator
         reserve = 2 * self.page_size
-        missing = count + reserve - allocator.available_size()
+        available = min(self._flat_gather(allocator.available_size()))
+        missing = count + reserve - available
         if missing > 0:
             self.evict(EvictParams(num_tokens=missing))
-        count = (
-            min(count, max(0, allocator.available_size() - reserve))
-            // self.page_size
-            * self.page_size
-        )
+        available = min(self._flat_gather(allocator.available_size()))
+        count = min(count, max(0, available - reserve)) // self.page_size * self.page_size
         indices = allocator.alloc(count) if count >= self.prefetch_threshold else None
-        if indices is None:
+        allocated = self._flat_gather(indices is not None)
+        if not all(allocated):
+            if indices is not None:
+                allocator.free(indices)
             self.dec_lock_ref(anchor)
             return
         count_pages = count // self.page_size
@@ -1422,6 +1519,17 @@ class HiRadixCache(RadixCache):
             req.flat_arrival_time,
             selected,
         )
+        local_media = [
+            sum({1 << (address >> 60) for address in selected[page::count_pages]})
+            for page in range(count_pages)
+        ]
+        rank_media = self._flat_gather(local_media)
+        operation.page_media = []
+        for page in range(count_pages):
+            mask = 0
+            for media in rank_media:
+                mask |= media[page]
+            operation.page_media.append(mask)
         operation.anchor = anchor
         operation.extra_key = req.extra_key
         self.flat_prefetch[req.rid] = operation
@@ -1429,14 +1537,27 @@ class HiRadixCache(RadixCache):
         cc.prefetch_tokens_occupied += count
         cc.enqueue_gpu_prefetch(operation)
 
-    def _finish_gpu_prefetch(self, req_id):
+    def _finish_gpu_prefetch(self, req_id, local=False):
         operation = self.flat_prefetch.get(req_id)
         if operation is None:
             return True
-        if not operation.done.is_set():
+        if not operation.done.is_set() or (not local and not operation.tp_ready):
             return False
         cc = self.cache_controller
+        if operation.error or (
+            not operation.cancelled
+            and operation.completed_tokens != len(operation.token_ids)
+        ):
+            cc.flat_io_errors += 1
         self.protected_size_ -= len(operation.device_indices)
+        source_tokens = {"flat_dram": 0, "flat_ssd": 0, "flat_mixed": 0}
+
+        def record_source(start, length):
+            for mask in operation.page_media[start // self.page_size : (start + length) // self.page_size]:
+                source_tokens["flat_ssd" if mask & 2 else "flat_dram"] += self.page_size
+                if mask == 3:
+                    source_tokens["flat_mixed"] += self.page_size
+
         if operation.cancelled or operation.error:
             cc.mem_pool_device_allocator.free(operation.device_indices)
             loaded = 0
@@ -1462,6 +1583,7 @@ class HiRadixCache(RadixCache):
                     node.children[child_key] = child
                     self.evictable_size_ += len(value)
                     loaded += len(value)
+                    record_source(completed - len(key), len(value))
                     self._update_leaf_status(node)
                     self._update_leaf_status(child)
                     break
@@ -1472,6 +1594,7 @@ class HiRadixCache(RadixCache):
                     child.value = value[:length].clone()
                     self.evictable_size_ += length
                     loaded += length
+                    record_source(completed - len(key), length)
                 else:
                     cc.mem_pool_device_allocator.free(value[:length])
                 child.fm_stored = True
@@ -1487,10 +1610,17 @@ class HiRadixCache(RadixCache):
         del self.flat_prefetch[req_id]
         if not operation.cancelled:
             self.prefetch_loaded_tokens_by_reqid[req_id] = loaded
-            self._prefetch_latency_by_reqid[req_id] = (
-                (time.monotonic() - operation.arrival_time) * 1000,
-                loaded,
+            self._prefetch_latency_by_reqid[req_id] = (operation.ready_latency_ms, loaded)
+            stats = source_tokens.copy()
+            stats.update(
+                flat_prefetch_dram_ms=0.0, flat_prefetch_dram_ops=0,
+                flat_prefetch_ssd_ms=0.0, flat_prefetch_ssd_ops=0,
             )
+            if not operation.error and operation.completed_tokens == len(operation.token_ids):
+                medium = "ssd" if any(mask & 2 for mask in operation.page_media) else "dram"
+                stats[f"flat_prefetch_{medium}_ms"] = operation.ready_latency_ms
+                stats[f"flat_prefetch_{medium}_ops"] = 1
+            self._flat_prefetch_stats_by_reqid[req_id] = stats
         return True
 
     def prefetch_from_storage(
@@ -1723,6 +1853,7 @@ class HiRadixCache(RadixCache):
         return InsertResult(prefix_len=total_prefix_length)
 
     def release_aborted_request(self, rid: str):
+        self._flat_prefetch_stats_by_reqid.pop(rid, None)
         if self.flat_gpu_mode:
             self.terminate_prefetch(rid)
             self.prefetch_loaded_tokens_by_reqid.pop(rid, None)

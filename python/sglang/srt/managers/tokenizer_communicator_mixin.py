@@ -854,8 +854,14 @@ class TokenizerCommunicatorMixin:
         self.auto_create_handle_loop()
         await self.slow_down_communicator(obj)
 
-    async def get_internal_state(self: TokenizerManager) -> List[Dict[Any, Any]]:
-        req = GetInternalStateReq()
+    async def get_internal_state(
+        self: TokenizerManager,
+        flat_io_action: Optional[str] = None,
+        flat_io_window_id: Optional[str] = None,
+    ) -> List[Dict[Any, Any]]:
+        req = GetInternalStateReq(
+            flat_io_action=flat_io_action, flat_io_window_id=flat_io_window_id
+        )
         responses: List[GetInternalStateReqOutput] = (
             await self.get_internal_state_communicator(req)
         )

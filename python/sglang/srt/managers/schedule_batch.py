@@ -143,6 +143,7 @@ from sglang.srt.observability.req_time_stats import (
     DPControllerReqTimeStats,
     SchedulerReqTimeStats,
 )
+from sglang.srt.observability.tiered_cache_metrics import tiered_cache_breakdown
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.utils import flatten_nested_list
@@ -1208,6 +1209,9 @@ class Req(ReqDllmMixin):
         )
         # FLAT_MEMORY: None denotes unavailable metadata, including older PD peers.
         self.flat_storage_backend = False
+        # FLAT_MEMORY: Absolute restored ranges, consumed only on the first chunk.
+        self.tiered_cache_sources: List[Tuple[int, int, int]] = []
+        self.tiered_cached_tokens: Optional[Dict[str, int]] = None
         self.flat_prefetch_stats = dict.fromkeys(
             (*FLAT_CACHE_FIELDS, *FLAT_PREFETCH_FIELDS), None
         )
@@ -2641,6 +2645,29 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                         finalize_flat_cache_accounting(
                             req, prefix_len=len(req.prefix_indices)
                         )
+                    elif getattr(self.tree_cache, "tiered_gds_mode", False):
+                        # FLAT_MEMORY: Report only consumed ranges, not speculative reads.
+                        try:
+                            req.tiered_cached_tokens = tiered_cache_breakdown(
+                                len(req.prefix_indices),
+                                req.host_hit_length,
+                                req.tiered_cache_sources,
+                            )
+                        except ValueError as error:
+                            req.tiered_cached_tokens = None
+                            logger.warning(
+                                "Tiered cache provenance unavailable: %s", error
+                            )
+                        if req.tiered_cached_tokens is not None:
+                            req.cached_tokens_device = req.tiered_cached_tokens[
+                                "device"
+                            ]
+                            req.cached_tokens_host = req.tiered_cached_tokens["l2_host"]
+                            req.cached_tokens_storage = (
+                                req.tiered_cached_tokens["mooncake_dram"]
+                                + req.tiered_cached_tokens["ssd"]
+                            )
+                        req.tiered_cache_sources = []
                     req._cache_breakdown_computed = True
 
                 req.already_computed = seq_len

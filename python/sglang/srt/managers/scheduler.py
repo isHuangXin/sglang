@@ -3683,12 +3683,23 @@ class Scheduler(
                 from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
 
                 loaded_tokens = self.tree_cache.pop_prefetch_loaded_tokens(req.rid)
-                if loaded_tokens > 0:
+                if (
+                    isinstance(self.tree_cache, HiRadixCache)
+                    and self.tree_cache.tiered_gds_mode
+                ):
+                    req.storage_hit_length += loaded_tokens
+                    req.tiered_cache_sources.extend(
+                        self.tree_cache.pop_tiered_cache_sources(req.rid)
+                    )
+                elif loaded_tokens > 0:
                     req.storage_hit_length = loaded_tokens
                 if isinstance(self.tree_cache, HiRadixCache):
-                    req.storage_read_latency_ms, req.storage_read_tokens = (
-                        self.tree_cache.pop_prefetch_latency(req.rid)
+                    latency_ms, read_tokens = self.tree_cache.pop_prefetch_latency(
+                        req.rid
                     )
+                    if latency_ms > 0 or not self.tree_cache.tiered_gds_mode:
+                        req.storage_read_latency_ms = latency_ms
+                        req.storage_read_tokens = read_tokens
                     req.kvcache_bytes_per_page = (
                         self.tree_cache.token_to_kv_pool_host.get_size_per_token()
                         * self.tree_cache.page_size
@@ -4621,6 +4632,10 @@ class Scheduler(
                 if tc.enable_storage:
                     idle &= len(tc.ongoing_prefetch) == 0
                     idle &= len(tc.ongoing_backup) == 0
+                    from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
+
+                    if isinstance(tc, HiRadixCache) and tc.tiered_gds_mode:
+                        idle &= not tc.tiered_prefetch
                     if get_memory().hicache_host_memory_mode == "buffer_only":
                         # Queued writes, staged prefetches, and in-flight
                         # storage writes still hold host staging
@@ -4770,6 +4785,86 @@ class Scheduler(
             success = False
         return success
 
+    def _control_gds_io_window(self, action, window_id):
+        from sglang.srt.managers.tiered_gds_io_window import control_gds_io_window
+        from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
+
+        if (
+            not isinstance(self.tree_cache, HiRadixCache)
+            or not self.tree_cache.tiered_gds_mode
+        ):
+            return {"error": "GDS I/O windows require Mooncake tiered GDS (compat)"}
+        controller = self.tree_cache.cache_controller
+        return control_gds_io_window(
+            action,
+            window_id,
+            storage=controller.storage_backend,
+            gather=self.tree_cache._tiered_gather,
+            is_idle=lambda: (
+                self.is_fully_idle()
+                and not self.waiting_queue
+                and controller.pending_backup_count == 0
+                and not self.tree_cache.tiered_prefetch
+                and not self.tree_cache.ongoing_write_through
+                and not self.tree_cache.ongoing_load_back
+            ),
+        )
+
+    def _hicache_io_state(self, recv_req: GetInternalStateReq):
+        from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
+        from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
+            MooncakeStore,
+        )
+
+        ret = {}
+        if not isinstance(self.tree_cache, HiRadixCache):
+            if recv_req.gds_io_action:
+                ret["gds_io_control"] = self._control_gds_io_window(
+                    recv_req.gds_io_action, recv_req.gds_io_window_id
+                )
+            return ret
+        controller = self.tree_cache.cache_controller
+        storage = controller.storage_backend
+        idle = self.is_fully_idle(for_health_check=True)
+        if (recv_req.gds_io_action and self.tree_cache.tiered_gds_mode) or (
+            isinstance(storage, MooncakeStore) and idle
+        ):
+            # FLAT_MEMORY: Advance final D2H callbacks before checking native window idleness.
+            self.tree_cache.check_hicache_events()
+        if recv_req.gds_io_action:
+            control = self._control_gds_io_window(
+                recv_req.gds_io_action, recv_req.gds_io_window_id
+            )
+            ret["gds_io_control"] = control
+            if control["error"] is None:
+                snapshot = storage.get_gds_io_snapshot()
+                snapshot.update(
+                    tp_rank=controller.tp_rank,
+                    tp_size=controller.tp_size,
+                    gpu_id=storage.gds_device,
+                    generation=controller._host_io_generation,
+                    gds_mode="compat",
+                )
+                ret["gds_io"] = {"ranks": self.tree_cache._tiered_gather(snapshot)}
+        snapshot = controller.host_io_snapshot()
+        snapshot["idle"] = idle
+        snapshot["storage_pending"] = 0
+        if controller.enable_storage:
+            with controller.pending_backup_lock:
+                snapshot["storage_pending"] = controller.pending_backup_count + len(
+                    self.tree_cache.tiered_prefetch
+                )
+                if isinstance(storage, MooncakeStore):
+                    snapshot["mooncake_io"] = storage.get_storage_io_snapshot()
+        ranks = self.tree_cache._tiered_gather(snapshot)
+        if any(
+            rank["tp_rank"] != index or rank["tp_size"] != len(ranks)
+            for index, rank in enumerate(ranks)
+        ):
+            raise RuntimeError("Inconsistent HiCache telemetry TP snapshots")
+        ret["hicache_io"] = {"ranks": ranks}
+        return ret
+
     def get_internal_state(self, recv_req: GetInternalStateReq):
         # Resolved config (pristine server_args + post-publish overrides) so a
         # readback reflects values changed via /set_internal_state, not startup.
@@ -4795,6 +4890,7 @@ class Scheduler(
         )
         ret["startup_time"] = self.startup_time
         ret["effective_max_running_requests_per_dp"] = self.max_running_requests
+        ret.update(self._hicache_io_state(recv_req))
 
         if get_exec().moe.elastic_ep_backend is not None:
             from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager

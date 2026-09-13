@@ -135,6 +135,7 @@ from sglang.srt.managers.io_struct import (
     InitWeightsUpdateGroupReqInput,
     LoadLoRAAdapterFromTensorsReqInput,
     LoadLoRAAdapterReqInput,
+    MooncakeGDSIOWindowReq,
     OpenSessionReqInput,
     ParseFunctionCallReq,
     PauseGenerationReqInput,
@@ -160,6 +161,10 @@ from sglang.srt.managers.multi_tokenizer_mixin import (
     get_tokenizer_worker_class,
     read_from_shared_memory,
     write_data_for_multi_tokenizer,
+)
+from sglang.srt.managers.tiered_gds_io_window import (
+    gds_io_window_response,
+    validate_gds_window_request,
 )
 from sglang.srt.managers.tokenizer_manager import ServerStatus, TokenizerManager
 from sglang.srt.observability.func_timer import enable_func_timer
@@ -858,6 +863,24 @@ async def flat_memory_io_window(obj: FlatMemoryIOWindowReq):
     )
     try:
         return flat_io_window_response(
+            states, action=obj.action, window_id=obj.window_id
+        )
+    except ValueError as exc:
+        return ORJSONResponse({"error": str(exc)}, status_code=409)
+
+
+@app.post("/mooncake/gds_io_window")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def mooncake_gds_io_window(obj: MooncakeGDSIOWindowReq):
+    try:
+        validate_gds_window_request(obj.action, obj.window_id)
+    except ValueError as exc:
+        return ORJSONResponse({"error": str(exc)}, status_code=400)
+    states = await _global_state.tokenizer_manager.get_internal_state(
+        gds_io_action=obj.action, gds_io_window_id=obj.window_id
+    )
+    try:
+        return gds_io_window_response(
             states, action=obj.action, window_id=obj.window_id
         )
     except ValueError as exc:

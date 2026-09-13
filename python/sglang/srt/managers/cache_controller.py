@@ -15,6 +15,7 @@ limitations under the License.
 
 
 import logging
+import os
 import threading
 import time
 from collections import deque
@@ -245,7 +246,6 @@ class _OrderedPrefetchAckQueue(Queue):
         super().put(item, block=block, timeout=timeout)
 
 
-
 class StorageOperation:
     counter = 0
 
@@ -313,6 +313,24 @@ class PrefetchOperation(StorageOperation):
             return self._terminated_flag
 
 
+# FLAT_MEMORY: Only scheduler-owned completion may publish or release GPU pages.
+class TieredPrefetchOperation(PrefetchOperation):
+    def __init__(self, request_id, token_ids, last_hash=None, prefix_keys=None):
+        super().__init__(request_id, token_ids, last_hash, prefix_keys)
+        self.query_ready = threading.Event()
+        self.done = threading.Event()
+        self.device_indices = None
+        self.submitted = False
+        self.cancelled = False
+        self.error = None
+        self.page_media = []
+        self.start_event = torch.cuda.Event()
+        self.anchor = None
+        self.host_anchor = None
+        self.prefix_offset = 0
+        self.tp_ready = False
+
+
 class GPUStorageOperation(StorageOperation):
     def __init__(
         self,
@@ -342,7 +360,6 @@ class GPUStorageOperation(StorageOperation):
         self.extra_key = None
 
 
-
 class HiCacheController:
 
     def __init__(
@@ -363,7 +380,11 @@ class HiCacheController:
         storage_backend_extra_config: Optional[dict] = None,
         enable_storage_metrics: bool = False,
         host_memory_mode: str = "cache",
+        enable_tiered_gds: bool = False,
+        enable_metrics: bool = False,
     ):
+        self.supports_tiered_gds = enable_tiered_gds
+        self.tiered_gds_mode = False
         self.tp_group = tp_group
         self.host_memory_mode = host_memory_mode
         self.attn_cp_group = attn_cp_group
@@ -428,6 +449,16 @@ class HiCacheController:
         self.ack_write_queue: List[HiCacheAck] = []
 
         self.l2_transfer_engine = L2TransferEngine(io_backend)
+        self.enable_host_io_metrics = bool(
+            (enable_metrics or enable_storage_metrics)
+            and torch.device(self.device).type == "cuda"
+        )
+        self._host_io_generation = 0
+        self._host_io_pending = {direction: deque() for direction in ("read", "write")}
+        self._host_io_totals = {
+            direction: {"bytes": 0, "batches": 0, "elapsed_ms": 0.0}
+            for direction in ("read", "write")
+        }
 
         # If a storage backend is provided at startup, treat it as an implicit attach,
         # so init/runtime share the same lifecycle semantics and code paths.
@@ -442,6 +473,52 @@ class HiCacheController:
             except ValueError as e:
                 # Preserve the historical error shape on init for unknown backends.
                 raise ValueError(f"Failed to create storage backend: {e}") from e
+
+    # FLAT_MEMORY: Keep independent completion references after the tree consumes ACKs.
+    def _track_host_io(self, direction, completion, num_bytes):
+        if self.enable_host_io_metrics:
+            self.collect_host_io_metrics()
+            if not completion.timing_enabled:
+                self.enable_host_io_metrics = False
+                return
+            self._host_io_pending[direction].append((completion, num_bytes))
+
+    def collect_host_io_metrics(self) -> None:
+        for direction, pending in self._host_io_pending.items():
+            while pending and pending[0][0].finish_event.query():
+                completion, num_bytes = pending.popleft()
+                totals = self._host_io_totals[direction]
+                totals["bytes"] += num_bytes
+                totals["batches"] += 1
+                totals["elapsed_ms"] += float(
+                    completion.start_event.elapsed_time(completion.finish_event)
+                )
+
+    def host_io_snapshot(self) -> dict:
+        self.collect_host_io_metrics()
+        pending = len(self.load_queue) + len(self.write_queue)
+        pending += sum(len(items) for items in self._host_io_pending.values())
+        if not self.enable_host_io_metrics:
+            pending += sum(
+                not ack.finish_event.query()
+                for queue in (self.ack_load_queue, self.ack_write_queue)
+                for ack in queue
+            )
+        bytes_per_token = int(self.mem_pool_host.get_size_per_token())
+        return {
+            "enabled": self.enable_host_io_metrics,
+            "pid": os.getpid(),
+            "generation": self._host_io_generation,
+            "tp_rank": torch.distributed.get_rank(group=self.tp_group),
+            "tp_size": torch.distributed.get_world_size(group=self.tp_group),
+            "io_backend": self.io_backend,
+            "host_capacity_bytes": int(self.mem_pool_host.size) * bytes_per_token,
+            "device_capacity_bytes": int(self.mem_pool_device.size) * bytes_per_token,
+            "bytes_per_token": bytes_per_token,
+            "pending": int(pending),
+            "read": self._host_io_totals["read"].copy(),
+            "write": self._host_io_totals["write"].copy(),
+        }
 
     def get_attn_cp_rank_and_size(self) -> tuple[int, int]:
         """Derive CP rank/size from the attn_cp process group."""
@@ -533,10 +610,66 @@ class HiCacheController:
         self.ack_backup_queue = Queue()
         self.host_mem_release_queue = Queue()
 
+        if self.tiered_gds_mode:
+            self.prefetch_thread = threading.Thread(
+                target=self._tiered_query_worker, daemon=True
+            )
+            self.prefetch_io_aux_thread = threading.Thread(
+                target=self._tiered_io_worker, daemon=True
+            )
+        else:
+            self.prefetch_sync_thread.start()
         self.prefetch_thread.start()
         self.prefetch_io_aux_thread.start()
-        self.prefetch_sync_thread.start()
         self.backup_thread.start()
+
+    # FLAT_MEMORY: Queries neither allocate GPU memory nor enter collectives.
+    def _tiered_query_worker(self):
+        while not self.storage_stop_event.is_set() or not self.prefetch_queue.empty():
+            try:
+                operation = self.prefetch_queue.get(timeout=0.1)
+            except Empty:
+                continue
+            if operation is None:
+                continue
+            try:
+                if not operation.cancelled and not self.storage_stop_event.is_set():
+                    self.backup_idle_event.wait(timeout=self._backup_wait_timeout)
+                    operation.hash_value, operation.storage_hit_count = (
+                        self._storage_hit_query(operation)
+                    )
+            except Exception as error:
+                operation.error = str(error)
+                logger.exception("Mooncake GDS prefix query failed")
+            finally:
+                operation.query_ready.set()
+
+    def _tiered_io_worker(self):
+        torch.cuda.set_device(self.storage_backend.gds_device)
+        stream = torch.cuda.Stream()
+        while not self.storage_stop_event.is_set() or not self.prefetch_buffer.empty():
+            try:
+                operation = self.prefetch_buffer.get(timeout=0.1)
+            except Empty:
+                continue
+            if operation is None:
+                continue
+            try:
+                if not operation.cancelled:
+                    with torch.cuda.stream(stream):
+                        stream.wait_event(operation.start_event)
+                        operation.completed_tokens, operation.page_media = (
+                            self.storage_backend.read_gpu_pages(
+                                operation.hash_value, operation.device_indices
+                            )
+                        )
+            except Exception as error:
+                operation.error = str(error)
+                logger.exception("Mooncake GDS prefetch failed")
+            finally:
+                # A failed synchronize must not advertise safe-to-free allocations.
+                stream.synchronize()
+                operation.done.set()
 
     def _stop_storage_threads(self):
         """Stop storage prefetch/backup threads and drain internal queues.
@@ -574,9 +707,10 @@ class HiCacheController:
         if hasattr(self, "prefetch_sync_thread"):
             threads.append(self.prefetch_sync_thread)
 
+        deadline = time.monotonic() + (120.0 if self.tiered_gds_mode else 10.0)
         for t in threads:
             try:
-                t.join(timeout=10)
+                t.join(timeout=max(0.0, deadline - time.monotonic()))
             except Exception:
                 pass
 
@@ -631,12 +765,55 @@ class HiCacheController:
         # Use storage backend factory for dynamic backend creation
         from sglang.srt.mem_cache.storage import StorageBackendFactory
 
+        tiered_gds = (
+            storage_backend == "mooncake"
+            and (storage_backend_extra_config or {}).get("gds_mode") == "compat"
+        )
         try:
-            self.storage_backend = StorageBackendFactory.create_backend(
-                storage_backend, self.storage_config, self.storage_host_pool
-            )
-            self.storage_backend.register_mem_pool_host(self.storage_host_pool)
-
+            initialization_error = None
+            try:
+                if tiered_gds:
+                    if not self.supports_tiered_gds:
+                        raise ValueError(
+                            "Mooncake tiered GDS requires the HiRadix integration; "
+                            "Unified/hybrid compatibility is not enabled"
+                        )
+                    parallel = get_parallel()
+                    if (
+                        self.write_policy != "write_through"
+                        or self.host_memory_mode != "cache"
+                        or self.io_backend != "direct"
+                        or self.tp_size not in (1, 4)
+                        or self.pp_size != 1
+                        or parallel.dp_size != 1
+                        or parallel.enable_dp_attention
+                        or parallel.attn_cp_size != 1
+                        or parallel.dcp_size != 1
+                    ):
+                        raise ValueError(
+                            "Mooncake GDS (compat) requires write_through, retained "
+                            "Host cache with direct I/O, TP=1/4, PP=DP=CP=1"
+                        )
+                self.storage_backend = StorageBackendFactory.create_backend(
+                    storage_backend, self.storage_config, self.storage_host_pool
+                )
+                self.storage_backend.register_mem_pool_host(self.storage_host_pool)
+                if tiered_gds:
+                    self.storage_backend.register_mem_pool_device(self.mem_pool_device)
+            except Exception as error:
+                if not tiered_gds:
+                    raise
+                initialization_error = f"{type(error).__name__}: {error}"
+            if tiered_gds:
+                errors = [initialization_error]
+                if self.tp_size > 1:
+                    errors = [None] * self.tp_size
+                    torch.distributed.all_gather_object(
+                        errors, initialization_error, group=self.tp_group
+                    )
+                if any(errors):
+                    raise RuntimeError(f"Mooncake GDS initialization failed: {errors}")
+            self.tiered_gds_mode = tiered_gds
             self.enable_storage = True
             # todo: threshold policy for prefetching
             env_threshold = envs.SGLANG_PREFETCH_THRESHOLD.get()
@@ -654,6 +831,12 @@ class HiCacheController:
             else:
                 # Budget speculative prefetch at half the host pool, leaving the rest for the write-back staging path.
                 self.prefetch_capacity_limit = int(0.5 * self.mem_pool_host.size)
+            if self.tiered_gds_mode:
+                self.prefetch_capacity_limit = (
+                    max(0, self.mem_pool_device.size - 2 * self.page_size)
+                    // self.page_size
+                    * self.page_size
+                )
             # tracking the number of tokens locked in prefetching, updated by the main scheduler thread
             self.prefetch_tokens_occupied = 0
             self.storage_batch_size = envs.SGLANG_STORAGE_READ_BATCH_SIZE.get()
@@ -664,8 +847,9 @@ class HiCacheController:
 
             # Use dedicated gloo groups so storage prefetch sync is isolated
             # from other collectives and consistent across CPxTP participants.
-            self.prefetch_hits_sync_groups = self._create_sync_groups()
-            self.prefetch_completion_sync_groups = self._create_sync_groups()
+            if not self.tiered_gds_mode:
+                self.prefetch_hits_sync_groups = self._create_sync_groups()
+                self.prefetch_completion_sync_groups = self._create_sync_groups()
 
             # Select the get and set functions
             self.page_get_func = self._generic_page_get
@@ -706,6 +890,7 @@ class HiCacheController:
             self.storage_backend = None
             self.storage_backend_type = None
             self.enable_storage = False
+            self.tiered_gds_mode = False
             self.page_get_func = self._generic_page_get
             self.page_set_func = self._generic_page_set
             raise
@@ -751,6 +936,7 @@ class HiCacheController:
         self.storage_backend = None
         self.storage_backend_type = None
         self.enable_storage = False
+        self.tiered_gds_mode = False
         self.page_get_func = self._generic_page_get
         self.page_set_func = self._generic_page_set
         # Now it's safe to clear the stop event for future re-attach.
@@ -820,6 +1006,23 @@ class HiCacheController:
         )
 
     def reset(self):
+        self.l2_transfer_engine.device_to_host_stream.synchronize()
+        self.l2_transfer_engine.host_to_device_stream.synchronize()
+        self.collect_host_io_metrics()
+        self._host_io_generation += 1
+        for totals in self._host_io_totals.values():
+            totals.update(bytes=0, batches=0, elapsed_ms=0.0)
+        self.layer_done_counter.reset()
+        if self.tiered_gds_mode:
+            self._stop_storage_threads()
+            self.write_queue.clear()
+            self.load_queue.clear()
+            self.ack_write_queue.clear()
+            self.ack_load_queue.clear()
+            self.prefetch_tokens_occupied = 0
+            self.storage_stop_event.clear()
+            self._start_storage_threads()
+            return
         self.storage_stop_event.set()
 
         self.write_queue.clear()
@@ -891,6 +1094,7 @@ class HiCacheController:
             self._l2_transfers(host_indices, device_indices, pool_transfers)
         )
 
+        self._track_host_io("write", completion, self._transfer_num_bytes(op))
         self.ack_write_queue.append(
             HiCacheAck(
                 start_event=completion.start_event,
@@ -1017,6 +1221,7 @@ class HiCacheController:
             layer_num=self.layer_num,
         )
 
+        self._track_host_io("read", completion, self._transfer_num_bytes(op))
         self.ack_load_queue.append(
             HiCacheAck(
                 start_event=completion.start_event,

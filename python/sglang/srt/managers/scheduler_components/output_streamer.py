@@ -93,11 +93,13 @@ class SchedulerOutputStreamer:
         """
         # FLAT_MEMORY: A measured cold request still has useful zero-valued details.
         flat_details = flat_cached_tokens_details(req)
+        tiered_gds = getattr(self.tree_cache, "tiered_gds_mode", False)
         if (
             req.cached_tokens_device > 0
             or req.cached_tokens_host > 0
             or req.cached_tokens_storage > 0
             or flat_details
+            or tiered_gds
         ):
             details = {
                 "device": req.cached_tokens_device,
@@ -109,6 +111,10 @@ class SchedulerOutputStreamer:
                 details["storage"] = req.cached_tokens_storage
             if self.enable_hicache_storage():
                 details["storage_backend"] = self._get_storage_backend_type()
+            if tiered_gds:
+                # FLAT_MEMORY: None preserves unavailable provenance, including cold errors.
+                details["cache_source_mode"] = "mooncake_tiered_gds"
+                details["tiered_cache"] = req.tiered_cached_tokens
             details.update(flat_details)
             return details
 

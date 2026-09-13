@@ -1385,7 +1385,7 @@ TokenIdsLogprobIndices = Optional[List[Optional[List[Optional[List[int]]]]]]
 HiddenStateChunk = List[Optional[Union[float, List[float]]]]
 OutputHiddenStates = Optional[List[Optional[List[HiddenStateChunk]]]]
 # FLAT_MEMORY: Missing telemetry is null, not a measured zero.
-CachedTokensDetails = Dict[str, Union[int, float, str, None]]
+CachedTokensDetails = Dict[str, Union[int, float, str, Dict[str, int], None]]
 # Serialized form of BaseFinishReason.to_json() — all values are primitives.
 FinishReasonDict = Dict[str, Optional[Union[str, int, List[int]]]]
 
@@ -2089,9 +2089,16 @@ class FlatMemoryIOWindowReq(BaseReq, kw_only=True):
     window_id: str
 
 
+class MooncakeGDSIOWindowReq(BaseReq, kw_only=True):
+    action: str
+    window_id: str
+
+
 class GetInternalStateReq(BaseReq, kw_only=True):
     flat_io_action: Optional[str] = None
     flat_io_window_id: Optional[str] = None
+    gds_io_action: Optional[str] = None
+    gds_io_window_id: Optional[str] = None
 
 
 class GetInternalStateReqOutput(BaseReq, kw_only=True):

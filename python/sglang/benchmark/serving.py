@@ -55,6 +55,27 @@ from sglang.benchmark.flat_memory_metrics import (
     summarize_flat_cache,
     summarize_flat_io,
 )
+from sglang.benchmark.native_io_metrics import (
+    NativeIOWindow,
+    calculate_gds_io_metrics as calculate_gds_io_metrics,
+    calculate_hicache_io_metrics as calculate_hicache_io_metrics,
+    calculate_mooncake_io_metrics as calculate_mooncake_io_metrics,
+    fetch_gds_io_window as fetch_gds_io_window,
+    fetch_hicache_io_snapshot as fetch_hicache_io_snapshot,
+    fetch_mooncake_io_snapshot as fetch_mooncake_io_snapshot,
+    fetch_mooncake_storage_capacity as fetch_mooncake_storage_capacity,
+    print_gds_io_metrics as print_gds_io_metrics,
+    print_mooncake_io_metrics as print_mooncake_io_metrics,
+    unavailable_gds_io_metrics as unavailable_gds_io_metrics,
+    unavailable_mooncake_io_metrics as unavailable_mooncake_io_metrics,
+    validate_gds_io_window as validate_gds_io_window,
+    validate_mooncake_io_snapshot as validate_mooncake_io_snapshot,
+)
+from sglang.benchmark.tiered_cache_metrics import (
+    consume_tiered_cache_metadata,
+    print_tiered_cache,
+    summarize_tiered_cache,
+)
 from sglang.benchmark.utils import (
     get_tokenizer,
     parse_custom_headers,
@@ -130,6 +151,8 @@ class RequestFuncOutput:
     server_prompt_tokens: Optional[int] = None
     server_completion_tokens: Optional[int] = None
     server_cached_tokens: Optional[int] = None
+    cache_source_mode: Optional[str] = None
+    tiered_cache: Optional[Dict[str, int]] = None
     server_cached_tokens_device: Optional[int] = None
     server_cached_tokens_host: Optional[int] = None
     server_cached_tokens_storage: Optional[int] = None
@@ -769,6 +792,7 @@ async def async_request_sglang_generate(
                             if "text" in data and data["text"]:
                                 generated_text = data["text"]
                             consume_native_usage(output, _meta_info)
+                            consume_tiered_cache_metadata(output, _meta_info)
                             completion_tokens = output.server_completion_tokens
                             if completion_tokens is not None:
                                 output_len = completion_tokens
@@ -1411,6 +1435,21 @@ async def benchmark(
     profile_prefill_url: Optional[List[str]] = None,
     profile_decode_url: Optional[List[str]] = None,
 ):
+    native_io = NativeIOWindow(
+        base_url,
+        backend,
+        collect_mooncake_io_metrics=getattr(args, "collect_mooncake_io_metrics", False),
+        collect_mooncake_gds_io=getattr(args, "collect_mooncake_gds_io", False),
+        collect_hicache_io_metrics=getattr(args, "collect_hicache_io_metrics", False),
+        collect_flat_memory_io=getattr(args, "collect_flat_memory_io", False),
+        mooncake_master_host=getattr(args, "mooncake_master_host", None),
+        mooncake_metrics_port=getattr(args, "mooncake_metrics_port", 9003),
+        mooncake_client_host=getattr(args, "mooncake_client_host", "127.0.0.1"),
+        mooncake_client_metrics_port=getattr(
+            args, "mooncake_client_metrics_port", 9301
+        ),
+        headers=get_request_headers(),
+    )
     if backend in ASYNC_REQUEST_FUNCS:
         request_func = ASYNC_REQUEST_FUNCS[backend]
     else:
@@ -1581,7 +1620,7 @@ async def benchmark(
     pbar = None if disable_tqdm else tqdm(total=pbar_total)
     benchmark_requests: List[DatasetRow] = []
     # FLAT_MEMORY: Window begin/drain/end and profiling are outside request timing.
-    async with flat_io:
+    async with native_io, flat_io:
         benchmark_start_time = time.perf_counter()
         try:
             async for request in request_generator:
@@ -1668,6 +1707,13 @@ async def benchmark(
     except Exception as exc:
         # FLAT_MEMORY: Post-request telemetry failure must not discard completed outputs.
         warnings.warn(f"Server information unavailable after benchmark: {exc}")
+
+    if server_info is None and native_io.collect_host:
+        server_info = (native_io.after or native_io.before)["server_config"]
+    tiered_mode = getattr(args, "collect_mooncake_gds_cache_metrics", False) or any(
+        output.cache_source_mode == "mooncake_tiered_gds" for output in outputs
+    )
+    tiered_cache = summarize_tiered_cache(outputs) if tiered_mode else None
 
     # Compute metrics and print results
     metrics, output_lens = calculate_metrics(
@@ -1790,7 +1836,9 @@ async def benchmark(
         print("{:<40} {:<10.2f}".format("P95 ITL (ms):", metrics.p95_itl_ms))
         print("{:<40} {:<10.2f}".format("P99 ITL (ms):", metrics.p99_itl_ms))
         print("{:<40} {:<10.2f}".format("Max ITL (ms):", metrics.max_itl_ms))
-    if args.cache_report:
+    if tiered_mode:
+        print_tiered_cache(tiered_cache)
+    elif args.cache_report:
         total_prompt_tokens = 0
         total_cached = 0
         total_device = total_host = total_storage = 0
@@ -1847,6 +1895,7 @@ async def benchmark(
                 )
                 print("{:<40} {:.1f}%".format(label, storage_pct))
     print("=" * 50)
+    native_io.print_metrics()
 
     cache_usage = summarize_cache_usage(outputs)
     flat_cache = summarize_flat_cache(outputs, cache_usage["total_prompt_tokens"])
@@ -1859,11 +1908,13 @@ async def benchmark(
         "flat_memory": {},
     }
     if not flat_mode:
-        if getattr(args, "mooncake_master_host", None):
+        if not native_io.collect_mooncake and getattr(
+            args, "mooncake_master_host", None
+        ):
             legacy_metrics["mooncake_eviction"] = fetch_mooncake_eviction_metrics(
                 args.mooncake_master_host, getattr(args, "mooncake_metrics_port", 9003)
             )
-        if getattr(args, "prefill_metrics_host", None):
+        if not native_io.collect_host and getattr(args, "prefill_metrics_host", None):
             host, port = args.prefill_metrics_host, getattr(
                 args, "prefill_metrics_port", 30000
             )
@@ -1947,7 +1998,15 @@ async def benchmark(
             result.update(flat_cache)
             result.update(flat_io.result)
 
-        if args.cache_report:
+        if tiered_mode:
+            result.update(tiered_cache)
+        result.update(native_io.host_result)
+        result.update(native_io.mooncake_result)
+        result.update(native_io.gds_result)
+
+        if args.cache_report and tiered_mode:
+            result["cache_report"] = tiered_cache
+        elif args.cache_report:
             result["cache_report"] = {
                 "total_prompt_tokens": total_prompt_tokens,
                 "total_cached_tokens": total_cached,
@@ -2009,6 +2068,14 @@ async def benchmark(
         result_details["flat_cached_tokens_details"] = [
             {name: getattr(output, name) for name in FLAT_DETAIL_FIELDS}
             for output in outputs
+        ]
+
+    if tiered_mode:
+        result_details["tiered_cached_tokens_details"] = [
+            output.tiered_cache for output in outputs
+        ]
+        result_details["cache_source_modes"] = [
+            output.cache_source_mode for output in outputs
         ]
 
     if args.cache_report:
@@ -2345,6 +2412,37 @@ class LoRAPathAction(argparse.Action):
 def cli_main():
     parser = ArgumentParser(description="Benchmark the online serving throughput.")
     # FLAT_MEMORY: Native owned windows are separate from legacy lifetime collectors.
+    parser.add_argument(
+        "--collect-hicache-io-metrics",
+        action="store_true",
+        help="Collect completed all-TP native HiCache Host copy bytes and CUDA event timing.",
+    )
+    parser.add_argument(
+        "--collect-mooncake-gds-io",
+        action="store_true",
+        help="Collect TP1/TP4 consumer cuFile read bandwidth and aligned 100 ms peaks after warmup/flush; requires the GDS-window runtime.",
+    )
+    parser.add_argument(
+        "--collect-mooncake-gds-cache-metrics",
+        action="store_true",
+        help="Report GPU, all CPU DRAM and SSD-dependent token hit rates from Mooncake tiered GDS response metadata.",
+    )
+    parser.add_argument(
+        "--collect-mooncake-io-metrics",
+        action="store_true",
+        help="Collect native Mooncake completed I/O, 100 ms owner SSD peaks and separate L2 Host copies; requires --mooncake-master-host.",
+    )
+    parser.add_argument(
+        "--mooncake-client-host",
+        default="127.0.0.1",
+        help="Native Mooncake SSD owner's HTTP host.",
+    )
+    parser.add_argument(
+        "--mooncake-client-metrics-port",
+        type=int,
+        default=9301,
+        help="Native Mooncake SSD owner's HTTP port (default: 9301).",
+    )
     parser.add_argument(
         "--collect-flat-memory-io",
         action="store_true",

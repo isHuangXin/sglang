@@ -848,11 +848,16 @@ class TokenizerControlMixin:
         self: TokenizerManager,
         flat_io_action: Optional[str] = None,
         flat_io_window_id: Optional[str] = None,
+        gds_io_action: Optional[str] = None,
+        gds_io_window_id: Optional[str] = None,
     ) -> List[Dict[Any, Any]]:
         self.auto_create_handle_loop()
         # FLAT_MEMORY: Keep window control serialized with ordinary state requests.
         req = GetInternalStateReq(
-            flat_io_action=flat_io_action, flat_io_window_id=flat_io_window_id
+            flat_io_action=flat_io_action,
+            flat_io_window_id=flat_io_window_id,
+            gds_io_action=gds_io_action,
+            gds_io_window_id=gds_io_window_id,
         )
         # FLAT_MEMORY: An HTTP disconnect must not let the next window consume this reply.
         responses: List[GetInternalStateReqOutput] = await asyncio.shield(

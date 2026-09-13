@@ -398,6 +398,21 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 if storage_config
                 else None
             )
+            # FLAT_MEMORY: Retain Host writes and the native Mooncake object format.
+            self.gds_config = dict(extra_config or {})
+            gds_mode = self.gds_config.get("gds_mode", "off")
+            if gds_mode not in ("off", "compat"):
+                raise ValueError("Mooncake gds_mode must be off or compat")
+            self.tiered_gds_mode = gds_mode == "compat"
+            self.gds_stage_bytes = int(
+                self.gds_config.get("gds_stage_bytes", 128 << 20)
+            )
+            self._previous_gds_stats = {}
+            if self.tiered_gds_mode:
+                if not (16 << 20) <= self.gds_stage_bytes <= (256 << 20):
+                    raise ValueError("gds_stage_bytes must be between 16 and 256 MiB")
+                if self.config.standalone_storage or self.config.protocol != "tcp":
+                    raise ValueError("Mooncake GDS (compat) requires TCP RealClient")
             self.enable_group_semantics = bool(
                 extra_config.get("enable_group_semantics", False)
                 if extra_config
@@ -519,7 +534,11 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                             client_hostname,
                             self.config.metadata_server,
                             per_rank_global_segment_size,
-                            DEFAULT_LOCAL_BUFFER_SIZE,  # Zero copy interface does not need local buffer
+                            (
+                                self.gds_stage_bytes
+                                if self.tiered_gds_mode
+                                else DEFAULT_LOCAL_BUFFER_SIZE
+                            ),
                             self.config.protocol,
                             device_name,
                             self.config.master_server_address,
@@ -703,6 +722,152 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
 
         bytes_per_page = mem_pool_host.get_ksize_per_token() * mem_pool_host.page_size
         self.gb_per_page = bytes_per_page / (1 << 30)
+
+    # FLAT_MEMORY: This codec is limited to the original dense MHA/GQA layout.
+    def register_mem_pool_device(self, pool):
+        from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+
+        if (
+            type(pool) is not MHATokenToKVPool
+            or self.is_mla_backend
+            or pool.store_dtype not in (torch.float16, torch.bfloat16)
+            or pool.head_dim != pool.v_head_dim
+            or self.mem_pool_host.layout != "page_first_direct"
+            or self.mem_pool_host.layer_num != pool.layer_num
+            or self.should_split_heads
+            or self.config.standalone_storage
+            or self.config.protocol != "tcp"
+            or torch.device(pool.device).type != "cuda"
+        ):
+            raise ValueError(
+                "Tiered GDS requires MHA/GQA FP16/BF16, equal K/V head dimensions, "
+                "page_first_direct without draft side pools, and TCP RealClient"
+            )
+        # Capability probing is required at the optional native binding boundary.
+        required = (
+            "enable_gds",
+            "batch_get_into_gpu",
+            "get_gds_stats",
+            "begin_gds_io_window",
+            "end_gds_io_window",
+            "get_gds_io_window",
+            "gds_io_clock_ns",
+        )
+        if not all(callable(getattr(self.store, name, None)) for name in required):
+            raise RuntimeError("Mooncake binding lacks tiered GDS and I/O window APIs")
+        self.mem_pool_device = pool
+        first_buffer = pool._get_key_buffer(pool.start_layer)
+        self.gds_device = first_buffer.device.index
+        for layer in range(pool.start_layer, pool.start_layer + pool.layer_num):
+            for buffer in (pool._get_key_buffer(layer), pool._get_value_buffer(layer)):
+                if (
+                    buffer.device != first_buffer.device
+                    or buffer.dtype != pool.store_dtype
+                    or buffer.ndim != 3
+                    or tuple(buffer.shape[1:]) != (pool.head_num, pool.head_dim)
+                    or not buffer.is_contiguous()
+                ):
+                    raise ValueError(
+                        "Tiered GDS requires contiguous token-major K/V buffers"
+                    )
+        self.gpu_page_bytes = self.mem_pool_host.get_size_per_token() * pool.page_size
+        expected = (
+            2
+            * pool.layer_num
+            * pool.page_size
+            * pool.head_num
+            * pool.head_dim
+            * pool.store_dtype.itemsize
+        )
+        if self.gpu_page_bytes != expected:
+            raise ValueError("Host and GPU GDS page sizes differ")
+        # Two objects per page; native calls accept at most 4096 unique keys.
+        self.gpu_batch_pages = min(
+            envs.SGLANG_STORAGE_READ_BATCH_SIZE.get(),
+            (self.gds_stage_bytes // 2) // self.gpu_page_bytes,
+            4096 // 2,
+        )
+        if self.gpu_batch_pages < 1:
+            raise ValueError("A KV page exceeds the configured GDS staging budget")
+        self.store.enable_gds(
+            self.gds_config["gds_ssd_root"],
+            self.gds_device,
+            int(self.gds_config.get("gds_max_io_bytes", 16 << 20)),
+        )
+        logger.info(
+            "Mooncake tiered GDS (compat): Host retained, client buffer=%d, GPU pack limit=%d",
+            self.gds_stage_bytes,
+            self.gpu_batch_pages * self.gpu_page_bytes,
+        )
+
+    def read_gpu_pages(self, keys, device_indices):
+        pool = self.mem_pool_device
+        page_size = pool.page_size
+        if len(device_indices) != len(keys) * page_size:
+            raise ValueError("GDS keys and destination page count differ")
+        if device_indices.device != pool._get_key_buffer(pool.start_layer).device:
+            raise ValueError("GDS destination indices are on the wrong device")
+        media = []
+        for start in range(0, len(keys), self.gpu_batch_pages):
+            batch = keys[start : start + self.gpu_batch_pages]
+            names = [
+                f"{key}_{self.mha_suffix}_{kind}"
+                for key in self._tag_keys(batch)
+                for kind in ("k", "v")
+            ]
+            if len(set(names)) != len(names):
+                raise ValueError("GDS batch contains duplicate native object keys")
+            packed = torch.empty(
+                (
+                    len(batch),
+                    2,
+                    pool.layer_num,
+                    page_size,
+                    pool.head_num,
+                    pool.head_dim,
+                ),
+                dtype=pool.store_dtype,
+                device=f"cuda:{self.gds_device}",
+            )
+            pointers = [part.data_ptr() for part in packed.flatten(0, 1)]
+            stream = torch.cuda.current_stream()
+            stream.synchronize()
+            results = self.store.batch_get_into_gpu(
+                names, pointers, [self.gpu_page_bytes // 2] * len(pointers)
+            )
+            if len(results) != len(names):
+                raise RuntimeError("Mooncake GDS returned an incomplete result vector")
+            good = next(
+                (
+                    i
+                    for i in range(len(batch))
+                    if any(
+                        source not in (1, 2) for source in results[2 * i : 2 * i + 2]
+                    )
+                ),
+                len(batch),
+            )
+            if good:
+                indices = device_indices[start * page_size : (start + good) * page_size]
+                for layer in range(pool.layer_num):
+                    actual = pool.start_layer + layer
+                    for kind, buffer in enumerate(
+                        (pool._get_key_buffer(actual), pool._get_value_buffer(actual))
+                    ):
+                        buffer.index_copy_(
+                            0,
+                            indices,
+                            packed[:good, kind, layer].reshape(
+                                -1, pool.head_num, pool.head_dim
+                            ),
+                        )
+                stream.synchronize()
+                media.extend(results[2 * i] | results[2 * i + 1] for i in range(good))
+            if good != len(batch):
+                # A queried object can disappear before I/O; recompute the missing suffix.
+                logger.warning("Mooncake GDS read missed page %s", batch[good])
+                break
+        return len(media) * page_size, media
 
     def register_mem_host_pool_v2(self, host_pool: HostKVCache, host_pool_name):
         # KV anchor memory is already registered via register_mem_pool_host().
@@ -1379,6 +1544,51 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
     def _batch_exist(self, key_strs: List[str]) -> List[int]:
         return self.store.batch_is_exist(key_strs)
 
+    # FLAT_MEMORY: Consumer cuFile windows are distinct from native owner I/O.
+    def get_gds_io_snapshot(self):
+        return self.store.get_gds_io_window()
+
+    def begin_gds_io_window(self, window_id, start_ns):
+        return self.store.begin_gds_io_window(int(window_id), start_ns)
+
+    def end_gds_io_window(self, window_id, end_ns, abort=False):
+        return self.store.end_gds_io_window(int(window_id), end_ns, abort)
+
+    def gds_io_clock_ns(self):
+        return self.store.gds_io_clock_ns()
+
+    def get_storage_io_snapshot(self):
+        try:
+            return self.store.get_storage_io_stats()
+        except (AttributeError, RuntimeError, ValueError) as error:
+            return {"enabled": False, "error": str(error)}
+
+    def _gds_bandwidth(self):
+        stats = self.store.get_gds_stats()
+        previous = self._previous_gds_stats
+        read_bytes = stats["ssd_read_bytes"] - previous.get("ssd_read_bytes", 0)
+        read_ns = stats["ssd_read_ns"] - previous.get("ssd_read_ns", 0)
+        if stats != previous:
+            logger.info(
+                "MOONCAKE_GDS_STATS %s",
+                json.dumps(
+                    dict(
+                        stats,
+                        tp_rank=self.local_rank,
+                        native_client_buffer_bytes=self.gds_stage_bytes,
+                        gpu_pack_limit_bytes=self.gpu_batch_pages * self.gpu_page_bytes,
+                    ),
+                    sort_keys=True,
+                ),
+            )
+        self._previous_gds_stats = dict(stats)
+        return {
+            "ssd_read_bw_gbps": read_bytes / read_ns if read_ns > 0 else 0.0,
+            "ssd_read_total_bytes": stats["ssd_read_bytes"],
+            "ssd_read_count": stats["ssd_read_ops"],
+            "dram_read_total_bytes": stats["dram_payload_bytes"],
+        }
+
     def get_stats(self):
         storage_metrics = StorageMetrics()
         storage_metrics.prefetch_pgs.extend(self.prefetch_pgs)
@@ -1390,6 +1600,9 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         self.prefetch_bandwidth.clear()
         self.backup_bandwidth.clear()
         storage_metrics.mooncake_client_io = self._client_io_stats.snapshot_and_reset()
+        if self.tiered_gds_mode:
+            storage_metrics.flat_memory_bandwidth = self._gds_bandwidth()
+            return storage_metrics
         if self._native_io_stats is not None:
             try:
                 native = self._native_io_stats()

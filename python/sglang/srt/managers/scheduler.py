@@ -2675,10 +2675,14 @@ class Scheduler(
 
     def flush_cache(self):
         """Flush the memory pool and cache."""
-        if self._is_no_request():
+        if self._is_no_request() and not self.waiting_queue:
+            try:
+                self.tree_cache.reset()
+            except TimeoutError as exc:
+                logger.error("Cache flush aborted without clearing pools: %s", exc)
+                return False
             self.cur_batch = None
             self.last_batch = None
-            self.tree_cache.reset()
             self.req_to_token_pool.clear()
             self.token_to_kv_pool_allocator.clear()
             self.grammar_manager.clear()
@@ -2701,7 +2705,7 @@ class Scheduler(
         return success
 
     def get_internal_state(self, recv_req: GetInternalStateReq):
-        ret = vars(get_global_server_args())
+        ret = vars(get_global_server_args()).copy()
         ret["last_gen_throughput"] = self.last_gen_throughput
         ret["memory_usage"] = {
             "weight": round(self.tp_worker.model_runner.weight_load_mem_usage, 2),
@@ -2712,6 +2716,36 @@ class Scheduler(
             "graph": round(self.tp_worker.model_runner.graph_mem_usage, 2),
         }
         ret["effective_max_running_requests_per_dp"] = self.max_running_requests
+
+        controller = getattr(self.tree_cache, "cache_controller", None)
+        if controller is not None and hasattr(controller, "host_io_snapshot"):
+            storage = getattr(controller, "storage_backend", None)
+            if hasattr(storage, "get_storage_io_snapshot"):
+                # FLAT_MEMORY: Idle native HiCache otherwise leaves the last D2H acknowledgments unprocessed.
+                self.tree_cache.check_hicache_events()
+            snapshot = controller.host_io_snapshot()
+            snapshot["idle"] = bool(self._is_no_request() and not self.waiting_queue)
+            if hasattr(storage, "get_storage_io_snapshot"):
+                with controller.pending_backup_lock:
+                    snapshot["storage_pending"] = int(controller.pending_backup_count)
+                    snapshot["mooncake_io"] = storage.get_storage_io_snapshot()
+            # FLAT_MEMORY: HTTP internal_states is per DP, so gather actual TP data.
+            tp_size = torch.distributed.get_world_size(group=controller.tp_group)
+            if tp_size < 1 or snapshot["tp_size"] != tp_size:
+                raise RuntimeError("Invalid HiCache telemetry TP group size")
+            ranks = [None] * tp_size
+            if tp_size > 1:
+                torch.distributed.all_gather_object(
+                    ranks, snapshot, group=controller.tp_group
+                )
+            else:
+                ranks[0] = snapshot
+            if any(
+                rank["tp_rank"] != index or rank["tp_size"] != tp_size
+                for index, rank in enumerate(ranks)
+            ):
+                raise RuntimeError("Inconsistent HiCache telemetry TP snapshots")
+            ret["hicache_io"] = {"ranks": ranks}
 
         if not self.spec_algorithm.is_none() and self.spec_total_num_forward_ct > 0:
             ret["avg_spec_accept_length"] = (

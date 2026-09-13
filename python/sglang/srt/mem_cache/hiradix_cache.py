@@ -142,6 +142,7 @@ class HiRadixCache(RadixCache):
             storage_backend_extra_config=extra_config,
             pp_rank=self.pp_rank,
             pp_size=self.pp_size,
+            enable_metrics=server_args.enable_metrics,
         )
         self._apply_storage_runtime_config(
             storage_backend=server_args.hicache_storage_backend,
@@ -622,13 +623,16 @@ class HiRadixCache(RadixCache):
         if self.flat_gpu_mode:
             self.cache_controller._stop_storage_threads()
             self._force_release_pending_storage_ops()
-        TreeNode.counter = 0
         # Flush the full GPU→Host→Storage pipeline before clearing queues.
         # Pipeline: ongoing_write_through (D2H) → writing_check → backup_queue → Storage
         # Without this, flush_cache discards in-flight data at any stage.
         if self.enable_storage:
+            drain_timeout = float(os.environ.get("HICACHE_IO_DRAIN_TIMEOUT", "120"))
+            if not 0 < drain_timeout < float("inf"):
+                raise ValueError("HICACHE_IO_DRAIN_TIMEOUT must be finite and positive")
             logger.info(
-                "[FLUSH] Draining GPU→Host→Storage pipeline before reset..."
+                "[FLUSH] Draining GPU→Host→Storage pipeline before reset; storage wait budget=%ss",
+                drain_timeout,
             )
             # Step 1: Drain pending D2H copies and push completed nodes to backup_queue.
             # Blocking-wait for all CUDA D2H events in ongoing_write_through.
@@ -641,12 +645,32 @@ class HiRadixCache(RadixCache):
                         self.write_backup_storage(backuped_node)
                 self.cache_controller.ack_write_queue.clear()
             # Step 2: Wait for backup_thread to finish writing all queued data to Storage.
-            self.cache_controller.backup_idle_event.wait(timeout=60.0)
+            drained = self.cache_controller.backup_idle_event.wait(timeout=drain_timeout)
+            # FLAT_MEMORY: No rank may clear its cache if another TP rank timed out.
+            if self.tp_world_size > 1:
+                all_drained = torch.tensor(int(drained), dtype=torch.int, device="cpu")
+                torch.distributed.all_reduce(
+                    all_drained, op=torch.distributed.ReduceOp.MIN, group=self.tp_group
+                )
+                drained = bool(all_drained.item())
+            if not drained:
+                raise TimeoutError(
+                    f"Host/storage backup did not drain within {drain_timeout:g}s on all TP ranks; cache reset cancelled"
+                )
             logger.info("[FLUSH] All backup writes completed, proceeding with reset.")
+        # FLAT_MEMORY: Controller reset drains both copy streams, including native L2.
+        TreeNode.counter = 0
         self.cache_controller.reset()
+        self.ongoing_write_through.clear()
+        self.ongoing_load_back.clear()
+        self.ongoing_prefetch.clear()
+        self.ongoing_backup.clear()
+        self.flat_prefetch.clear()
+        self.flat_pending_backup.clear()
         self.token_to_kv_pool_host.clear()
         # Clear per-request tracking dicts
         self.prefetch_loaded_tokens_by_reqid.clear()
+        self._prefetch_latency_by_reqid.clear()
         self.evictable_host_leaves.clear()
         super().reset()
 
@@ -1111,6 +1135,7 @@ class HiRadixCache(RadixCache):
                     self._finish_gpu_prefetch(req_id)
         self.writing_check()
         self.loading_check()
+        self.cache_controller.collect_host_io_metrics()
         if self.enable_storage:
             self.drain_storage_control_queues()
         if self.enable_storage_metrics:

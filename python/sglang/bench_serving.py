@@ -16,6 +16,7 @@ import copy
 import importlib.util
 import io
 import json
+import math
 import os
 import pickle
 import random
@@ -1922,7 +1923,7 @@ def sample_image_requests(
 @lru_cache(maxsize=1)
 def get_available_tokens(tokenizer):
     """Get all available token ids from the tokenizer vocabulary."""
-    return list(tokenizer.get_vocab().values())
+    return sorted(tokenizer.get_vocab().values())
 
 
 def gen_prompt(tokenizer, token_num):
@@ -2191,6 +2192,305 @@ def fetch_mooncake_eviction_metrics(
             result[key] = int(match.group(1))
 
     return result
+
+
+# FLAT_MEMORY: Native Host transfers must not use storage-backend bandwidth counters.
+def fetch_hicache_io_snapshot(base_url: str, timeout: float = 120.0) -> dict:
+    deadline = time.perf_counter() + timeout
+    last_pending = None
+    while True:
+        remaining = deadline - time.perf_counter()
+        if remaining <= 0:
+            raise TimeoutError(f"HiCache workers or Host copies did not become idle: {last_pending}")
+        response = requests.get(
+            base_url + "/server_info",
+            headers=get_auth_headers(),
+            timeout=min(5.0, remaining),
+        )
+        response.raise_for_status()
+        info = response.json()
+        if not isinstance(info, dict):
+            raise ValueError("Invalid HiCache server-info response")
+        if (
+            info.get("enable_hierarchical_cache") is not True
+            or info.get("disable_radix_cache") is not False
+            or info.get("hicache_io_backend") != "direct"
+            or (info.get("hicache_mem_layout"), info.get("hicache_storage_backend"))
+            not in (("layer_first", None), ("page_first_direct", "mooncake"))
+            or info.get("disaggregation_mode") != "null"
+            or info.get("dp_size") != 1
+            or info.get("pp_size") != 1
+        ):
+            raise ValueError("Host I/O metrics require native direct HiCache: layer_first without storage, or page_first_direct with Mooncake; no PD")
+        tp_size = info.get("tp_size")
+        states = info.get("internal_states")
+        if (
+            type(tp_size) is not int or tp_size < 1
+            or not isinstance(states, list) or len(states) != 1
+            or not isinstance(states[0], dict)
+        ):
+            raise ValueError("Invalid HiCache worker configuration")
+        telemetry = states[0].get("hicache_io")
+        if not isinstance(telemetry, dict):
+            raise ValueError("Missing native HiCache telemetry")
+        ranks = telemetry.get("ranks")
+        if not isinstance(ranks, list) or len(ranks) != tp_size:
+            raise ValueError("Missing HiCache telemetry from one or more TP ranks")
+        seen = set()
+        for rank in ranks:
+            if not isinstance(rank, dict):
+                raise ValueError("Invalid HiCache rank snapshot")
+            for name in ("tp_rank", "tp_size", "pid", "generation", "pending", "host_capacity_bytes", "device_capacity_bytes", "bytes_per_token"):
+                value = rank.get(name)
+                minimum = 0 if name in ("tp_rank", "generation", "pending") else 1
+                if type(value) is not int or value < minimum:
+                    raise ValueError(f"Invalid HiCache rank field: {name}")
+            if (
+                rank["tp_rank"] not in range(tp_size)
+                or rank["tp_rank"] in seen
+                or rank["tp_size"] != tp_size
+                or rank.get("enabled") is not True
+                or rank.get("io_backend") != "direct"
+                or type(rank.get("idle")) is not bool
+            ):
+                raise ValueError("Incomplete or disabled HiCache TP telemetry")
+            seen.add(rank["tp_rank"])
+            for direction in ("read", "write"):
+                counters = rank.get(direction)
+                if not isinstance(counters, dict):
+                    raise ValueError(f"Missing HiCache {direction} counters")
+                for name in ("bytes", "batches"):
+                    if type(counters.get(name)) is not int or counters[name] < 0:
+                        raise ValueError(f"Invalid HiCache {direction} {name}")
+                elapsed = counters.get("elapsed_ms")
+                if type(elapsed) not in (int, float) or not math.isfinite(elapsed) or elapsed < 0:
+                    raise ValueError(f"Invalid HiCache {direction} timing")
+                if (counters["batches"] == 0) != (counters["bytes"] == 0) or (counters["batches"] == 0) != (elapsed == 0):
+                    raise ValueError(f"Inconsistent completed HiCache {direction} counters")
+        if any(type(rank.get("storage_pending", 0)) is not int or rank.get("storage_pending", 0) < 0 for rank in ranks):
+            raise ValueError("Invalid storage pipeline pending count")
+        last_pending = [{key: rank.get(key, 0) for key in ("tp_rank", "idle", "pending", "storage_pending")} for rank in ranks]
+        if all(rank["idle"] and rank["pending"] == 0 and rank.get("storage_pending", 0) == 0 for rank in ranks):
+            fields = (
+                "model_path", "served_model_name", "dtype", "kv_cache_dtype", "tp_size", "pp_size", "dp_size",
+                "disable_radix_cache", "enable_hierarchical_cache", "hicache_size", "hicache_ratio",
+                "hicache_write_policy", "hicache_io_backend", "hicache_mem_layout", "hicache_storage_backend",
+                "disaggregation_mode", "context_length", "max_total_num_tokens", "max_req_input_len",
+                "mem_fraction_static", "chunked_prefill_size", "max_running_requests", "stream_interval", "version",
+            )
+            return {
+                "sampled_at": time.perf_counter(),
+                "server_config": {name: info[name] for name in fields if name in info},
+                "ranks": sorted(ranks, key=lambda rank: rank["tp_rank"]),
+            }
+        time.sleep(min(0.05, max(0.0, deadline - time.perf_counter())))
+
+
+def calculate_hicache_io_metrics(before: dict, after: dict) -> dict:
+    window_seconds = after["sampled_at"] - before["sampled_at"]
+    if not math.isfinite(window_seconds) or window_seconds <= 0:
+        raise ValueError("Invalid Host I/O observation window")
+    if len(before["ranks"]) != len(after["ranks"]):
+        raise ValueError("HiCache TP membership changed during benchmark")
+    totals = {direction: {"bytes": 0, "batches": 0, "elapsed_ms": 0.0} for direction in ("read", "write")}
+    deltas = []
+    for start, end in zip(before["ranks"], after["ranks"]):
+        identity = ("pid", "generation", "tp_rank", "tp_size", "host_capacity_bytes", "device_capacity_bytes", "bytes_per_token")
+        if any(start[name] != end[name] for name in identity):
+            raise ValueError("HiCache worker or cache configuration changed during benchmark")
+        delta = {name: end[name] for name in identity}
+        for direction in ("read", "write"):
+            delta[direction] = {name: end[direction][name] - start[direction][name] for name in ("bytes", "batches", "elapsed_ms")}
+            counters = delta[direction]
+            if any(value < 0 or not math.isfinite(value) for value in counters.values()):
+                raise ValueError("HiCache completed counters went backwards")
+            if (counters["batches"] == 0) != (counters["bytes"] == 0) or (counters["batches"] == 0) != (counters["elapsed_ms"] == 0):
+                raise ValueError("HiCache copy accounting is incomplete")
+            for name, value in counters.items():
+                totals[direction][name] += value
+        deltas.append(delta)
+    result = {"hicache_io_status": "ok"}
+    for direction, counters in totals.items():
+        elapsed = counters["elapsed_ms"]
+        result[f"dram_{direction}_bw_gbps"] = counters["bytes"] / elapsed / 1e6 if elapsed > 0 else 0.0
+        result[f"hicache_io_{direction}_bytes"] = counters["bytes"]
+        result[f"hicache_io_{direction}_batches"] = counters["batches"]
+    reads = totals["read"]
+    result["mean_l2_kv_readback_ms"] = reads["elapsed_ms"] / reads["batches"] if reads["batches"] else None
+    result["hicache_io_metadata"] = {
+        "bandwidth_scope": "sum completed rank-batch bytes / sum copy-stream GPU seconds / 1e9; not aggregate TP bandwidth",
+        "readback_scope": "mean completed all-layer H2D rank-batch GPU milliseconds; not request latency or exposed TTFT penalty",
+        "window_scope": "all-TP bytes / snapshot observation seconds, including post-request copy drainage and control-query time",
+        "window_duration_s": window_seconds,
+        "window_read_bw_gbps": reads["bytes"] / window_seconds / 1e9,
+        "window_write_bw_gbps": totals["write"]["bytes"] / window_seconds / 1e9,
+        "totals": totals,
+        "rank_deltas": deltas,
+        "before": before,
+        "after": after,
+    }
+    return result
+
+
+def validate_mooncake_io_snapshot(snapshot: dict, require_ssd: bool = False) -> dict:
+    if not isinstance(snapshot, dict) or snapshot.get("schema_version") != 1 or snapshot.get("enabled") is not True:
+        raise ValueError("Native Mooncake I/O metrics are missing or disabled")
+    for field in ("pid", "sampled_at_ns"):
+        if type(snapshot.get(field)) is not int or snapshot[field] <= 0:
+            raise ValueError(f"Invalid native Mooncake identity: {field}")
+    totals = snapshot.get("totals")
+    if not isinstance(totals, dict):
+        raise ValueError("Missing Mooncake completed counters")
+    for path in ("dram_read", "dram_write", "ssd_read", "ssd_write"):
+        counters = totals.get(path)
+        if not isinstance(counters, dict) or any(type(counters.get(key)) is not int or counters[key] < 0 for key in ("bytes", "ops", "errors")):
+            raise ValueError(f"Invalid Mooncake completed counters: {path}")
+    if require_ssd:
+        if snapshot.get("ssd_io_available") is not True:
+            raise ValueError("SSD metrics require the native bucket/io_uring storage owner")
+        window = snapshot.get("window")
+        if not isinstance(window, dict) or window.get("bucket_ns") != 100_000_000 or type(window.get("active")) is not bool:
+            raise ValueError("Invalid Mooncake 100 ms I/O window")
+        for field in ("id", "start_ns", "end_ns"):
+            if type(window.get(field)) is not int or window[field] < 0:
+                raise ValueError(f"Invalid Mooncake window field: {field}")
+        if not isinstance(window.get("counters"), dict) or not isinstance(window.get("peak_window_bytes"), dict):
+            raise ValueError("Missing Mooncake window counters or peaks")
+    return snapshot
+
+
+def fetch_mooncake_io_snapshot(client_url: str, action: str = "snapshot", window_id: int = None, owner_pid: int = None) -> dict:
+    if action == "snapshot":
+        response = requests.get(client_url + "/storage_io", timeout=10)
+    else:
+        params = {"window_id": window_id, "pid": owner_pid} if action == "end" else None
+        response = requests.post(client_url + "/storage_io/" + action, params=params, timeout=10)
+    response.raise_for_status()
+    return validate_mooncake_io_snapshot(response.json(), require_ssd=True)
+
+
+def fetch_mooncake_storage_capacity(master_host: str, metrics_port: int) -> dict:
+    import re
+
+    response = requests.get(f"http://{master_host}:{metrics_port}/metrics", timeout=5)
+    response.raise_for_status()
+    result = {}
+    for metric, field in (("master_allocated_bytes", "mooncake_dram_used_bytes"), ("master_key_count", "mooncake_total_keys")):
+        matches = re.findall(rf"^{metric}(?:\{{[^\n]*\}})?\s+([^\s]+)$", response.text, re.MULTILINE)
+        if len(matches) != 1:
+            raise ValueError(f"Missing or ambiguous Mooncake capacity metric: {metric}")
+        value = float(matches[0])
+        if not math.isfinite(value) or value < 0 or not value.is_integer():
+            raise ValueError(f"Invalid Mooncake capacity metric: {metric}")
+        result[field] = int(value)
+    return result
+
+
+def unavailable_mooncake_io_metrics(error: Exception) -> dict:
+    result = {"mooncake_io_status": "unavailable", "mooncake_io_error": str(error)}
+    for medium in ("mooncake_dram", "ssd"):
+        for direction in ("read", "write"):
+            for field in ("bw_gbps", "total_bytes", "ops", "errors"):
+                result[f"{medium}_{direction}_{field}"] = None
+    for field in ("ssd_read_peak_bw_gbps", "ssd_write_peak_bw_gbps", "mooncake_dram_used_bytes", "mooncake_total_keys", "ssd_used_bytes", "ssd_keys"):
+        result[field] = None
+    return result
+
+
+def calculate_mooncake_io_metrics(before: dict, after: dict, ssd_before: dict, ssd_after: dict) -> dict:
+    validate_mooncake_io_snapshot(ssd_before, require_ssd=True)
+    validate_mooncake_io_snapshot(ssd_after, require_ssd=True)
+    start, end = ssd_before["window"], ssd_after["window"]
+    if (ssd_before["pid"] != ssd_after["pid"] or start["id"] <= 0 or start["id"] != end["id"]
+            or start["start_ns"] != end["start_ns"] or start["active"] is not True
+            or end["active"] is not False or end["end_ns"] <= start["start_ns"]):
+        raise ValueError("Mooncake process or measurement window changed")
+    if len(before["ranks"]) != len(after["ranks"]):
+        raise ValueError("Mooncake TP membership changed")
+    seconds = after["sampled_at"] - before["sampled_at"]
+    if not math.isfinite(seconds) or seconds <= 0:
+        raise ValueError("Invalid Mooncake DRAM observation window")
+    totals = {direction: {field: 0 for field in ("bytes", "ops", "errors")} for direction in ("read", "write")}
+    rank_deltas = []
+    for initial, final in zip(before["ranks"], after["ranks"]):
+        first = validate_mooncake_io_snapshot(initial.get("mooncake_io"))
+        last = validate_mooncake_io_snapshot(final.get("mooncake_io"))
+        if (any(initial[key] != final[key] for key in ("tp_rank", "tp_size", "pid", "generation"))
+                or first["pid"] != last["pid"] or last["pid"] != final["pid"]
+                or last["sampled_at_ns"] <= first["sampled_at_ns"]):
+            raise ValueError("Mooncake TP worker changed during measurement")
+        delta = {"tp_rank": final["tp_rank"], "pid": last["pid"]}
+        for direction in ("read", "write"):
+            path = "dram_" + direction
+            delta[direction] = {}
+            for field in ("bytes", "ops", "errors"):
+                value = last["totals"][path][field] - first["totals"][path][field]
+                if value < 0:
+                    raise ValueError("Mooncake completed counters went backwards")
+                totals[direction][field] += value
+                delta[direction][field] = value
+        rank_deltas.append(delta)
+    result = {"mooncake_io_status": "ok", "mooncake_dram_used_bytes": None, "mooncake_total_keys": None}
+    for direction, counters in totals.items():
+        result[f"mooncake_dram_{direction}_bw_gbps"] = counters["bytes"] / seconds / 1e9
+        for field, value in counters.items():
+            name = "total_bytes" if field == "bytes" else field
+            result[f"mooncake_dram_{direction}_{name}"] = value
+    ssd_seconds = (end["end_ns"] - start["start_ns"]) / 1e9
+    for direction in ("read", "write"):
+        path = "ssd_" + direction
+        counters = end.get("counters", {}).get(path)
+        peak = end.get("peak_window_bytes", {}).get(path)
+        if not isinstance(counters, dict) or any(type(counters.get(key)) is not int or counters[key] < 0 for key in ("bytes", "ops", "errors")):
+            raise ValueError(f"Invalid SSD window counters: {path}")
+        if type(peak) is not int or peak < 0 or peak > counters["bytes"]:
+            raise ValueError(f"Invalid SSD peak window: {path}")
+        for field, value in counters.items():
+            if field in ("bytes", "ops", "errors"):
+                name = "total_bytes" if field == "bytes" else field
+                result[f"{path}_{name}"] = value
+        result[f"{path}_bw_gbps"] = counters["bytes"] / ssd_seconds / 1e9
+        result[f"{path}_peak_bw_gbps"] = peak / (end["bucket_ns"] / 1e9) / 1e9
+    for field in ("ssd_used_bytes", "ssd_keys"):
+        value = ssd_after.get(field)
+        if value is not None and (type(value) is not int or value < 0):
+            raise ValueError(f"Invalid SSD capacity: {field}")
+        result[field] = value
+    result["mooncake_io_metadata"] = {
+        "dram_scope": "all-TP completed memory-replica bytes / observation seconds; excludes SSD staging transfers",
+        "dram_window_seconds": seconds,
+        "ssd_scope": "native bucket O_DIRECT read completions and datasync-successful bucket data writes; not device physical bandwidth",
+        "ssd_window_seconds": ssd_seconds,
+        "peak_window_ms": 100,
+        "peak_scope": "all-thread completed bytes per fixed 100 ms bucket; final partial bucket divided by 100 ms",
+        "ops_scope": "DRAM memory-replica objects; SSD reads are completed read CQEs; SSD writes are successfully persisted buckets",
+        "measurement_scope": "after warmup/flush through post-request Host/backup drainage; asynchronous offload counted by completion time",
+        "rank_deltas": rank_deltas, "ssd_before": ssd_before, "ssd_after": ssd_after,
+    }
+    return result
+
+
+def print_mooncake_io_metrics(metrics: dict) -> None:
+    print("Mooncake Storage I/O Statistics".center(62, "-"))
+    print("Storage DRAM is separate from GPU<->L2 Host copies; GB = 10^9 bytes.")
+    if metrics["mooncake_io_status"] != "ok":
+        print("Native storage I/O unavailable: " + metrics["mooncake_io_error"])
+    rows = [("DRAM used (GB):", "mooncake_dram_used_bytes", 1e9),
+            ("SSD used (GB, metadata):", "ssd_used_bytes", 1e9),
+            ("Total blocks stored (Mooncake keys):", "mooncake_total_keys", 1)]
+    for medium, prefix in (("DRAM", "mooncake_dram"), ("SSD", "ssd")):
+        for direction in ("write", "read"):
+            rows.append((f"{medium} {direction} bandwidth (GB/s):", f"{prefix}_{direction}_bw_gbps", 1))
+            if medium == "SSD":
+                rows.append((f"SSD {direction} bandwidth peak (GB/s, 100 ms):", f"ssd_{direction}_peak_bw_gbps", 1))
+            rows.extend([(f"{medium} {direction} ops:", f"{prefix}_{direction}_ops", 1),
+                         (f"{medium} {direction} total (GB):", f"{prefix}_{direction}_total_bytes", 1e9),
+                         (f"{medium} {direction} errors:", f"{prefix}_{direction}_errors", 1)])
+    for label, key, divisor in rows:
+        value = metrics.get(key)
+        shown = "N/A (unavailable)" if value is None else (str(value) if type(value) is int and divisor == 1 else f"{value / divisor:.4f}")
+        print(f"{label:<48} {shown}")
+    print("SSD writes/peak: datasync-successful bucket data, not buffered-write or device physical peak.")
 
 
 def fetch_sglang_bandwidth_metrics(
@@ -2575,6 +2875,28 @@ async def benchmark(
     profile_prefill_url: Optional[List[str]] = None,
     profile_decode_url: Optional[List[str]] = None,
 ):
+    collect_mooncake_io = getattr(args, "collect_mooncake_io_metrics", False)
+    collect_hicache_io = getattr(args, "collect_hicache_io_metrics", False) or collect_mooncake_io
+    if collect_hicache_io:
+        io_drain_timeout = float(os.environ.get("HICACHE_IO_DRAIN_TIMEOUT", "120"))
+        flush_timeout = float(os.environ.get("HICACHE_FLUSH_TIMEOUT", "150"))
+        if not (math.isfinite(io_drain_timeout) and io_drain_timeout > 0
+                and math.isfinite(flush_timeout) and flush_timeout > io_drain_timeout):
+            raise ValueError("HICACHE_FLUSH_TIMEOUT must exceed a finite positive HICACHE_IO_DRAIN_TIMEOUT")
+        print(f"Cache maintenance timeouts: drain={io_drain_timeout:g}s, flush HTTP={flush_timeout:g}s")
+    mooncake_io_metrics = {}
+    mooncake_before = None
+    mooncake_after = None
+    mooncake_client_url = None
+    if collect_mooncake_io:
+        if not getattr(args, "mooncake_master_host", None):
+            raise ValueError("--collect-mooncake-io-metrics requires --mooncake-master-host")
+        mooncake_client_url = f"http://{args.mooncake_client_host}:{args.mooncake_client_metrics_port}"
+        fetch_mooncake_io_snapshot(mooncake_client_url)
+    if collect_hicache_io and backend != "sglang":
+        raise ValueError("--collect-hicache-io-metrics requires --backend sglang")
+    hicache_io_metrics = {}
+
     if backend in ASYNC_REQUEST_FUNCS:
         request_func = ASYNC_REQUEST_FUNCS[backend]
     else:
@@ -2668,14 +2990,28 @@ async def benchmark(
         )
     else:
         print(
-            f"Warmup completed with {args.warmup_requests} sequences. Starting main benchmark run..."
+            f"Warmup completed with {args.warmup_requests} sequences. Preparing caches for the main benchmark..."
         )
 
     # Flush cache
     if ("sglang" in backend and _get_bool_env_var("SGLANG_IS_IN_CI")) or flush_cache:
-        requests.post(base_url + "/flush_cache", headers=get_auth_headers())
+        if collect_hicache_io:
+            requests.post(
+                base_url + "/flush_cache", headers=get_auth_headers(), timeout=flush_timeout
+            ).raise_for_status()
+        else:
+            requests.post(base_url + "/flush_cache", headers=get_auth_headers())
 
     time.sleep(1.0)
+    if collect_hicache_io:
+        hicache_before = fetch_hicache_io_snapshot(base_url, timeout=io_drain_timeout)
+    if collect_mooncake_io:
+        if hicache_before["server_config"].get("hicache_storage_backend") != "mooncake":
+            raise ValueError("Native Mooncake metrics require the Mooncake storage backend")
+        for rank in hicache_before["ranks"]:
+            snapshot = validate_mooncake_io_snapshot(rank.get("mooncake_io"))
+            if snapshot["pid"] != rank["pid"]:
+                raise ValueError("Mooncake counter owner does not match TP worker")
 
     # Build profile URLs for PD separated mode (do this once at the beginning)
     pd_profile_urls = []
@@ -2700,6 +3036,9 @@ async def benchmark(
             if profile_output.success:
                 print("Profiler started")
 
+    if collect_mooncake_io:
+        mooncake_before = fetch_mooncake_io_snapshot(mooncake_client_url, "begin")
+    print("Cache maintenance complete. Starting main benchmark run...")
     # Run all requests
     benchmark_start_time = time.perf_counter()
     tasks: List[asyncio.Task] = []
@@ -2729,45 +3068,100 @@ async def benchmark(
         lora_probs = None
 
     pbar = None if disable_tqdm else tqdm(total=pbar_total)
-    async for request in request_generator:
-        if lora_names is not None and len(lora_names) != 0:
-            if lora_request_distribution == "uniform":
-                lora_name = random.choice(lora_names)
-            elif lora_request_distribution == "distinct":
-                lora_name = lora_names[lora_idx]
-                lora_idx = (lora_idx + 1) % len(lora_names)
+    try:
+        async for request in request_generator:
+            if lora_names is not None and len(lora_names) != 0:
+                if lora_request_distribution == "uniform":
+                    lora_name = random.choice(lora_names)
+                elif lora_request_distribution == "distinct":
+                    lora_name = lora_names[lora_idx]
+                    lora_idx = (lora_idx + 1) % len(lora_names)
+                else:
+                    assert (
+                        lora_request_distribution == "skewed"
+                    ), f"Unexpected lora_request_distribution: {lora_request_distribution}. Expected 'skewed'."
+
+                    lora_name = np.random.choice(lora_names, p=lora_probs)
             else:
-                assert (
-                    lora_request_distribution == "skewed"
-                ), f"Unexpected lora_request_distribution: {lora_request_distribution}. Expected 'skewed'."
+                lora_name = None
 
-                lora_name = np.random.choice(lora_names, p=lora_probs)
-        else:
-            lora_name = None
+            # Merge global extra_request_body with per-request extras
+            # Per-request parameters take precedence over global ones
+            merged_extra_body = {**extra_request_body, **request.extra_request_body}
 
-        # Merge global extra_request_body with per-request extras
-        # Per-request parameters take precedence over global ones
-        merged_extra_body = {**extra_request_body, **request.extra_request_body}
-
-        request_func_input = RequestFuncInput(
-            model=model_id,
-            prompt=request.prompt,
-            api_url=api_url,
-            prompt_len=request.prompt_len,
-            output_len=request.output_len,
-            lora_name=lora_name,
-            image_data=request.image_data,
-            extra_request_body=merged_extra_body,
-            timestamp=request.timestamp,
-            routing_key=request.routing_key,
-        )
-
-        tasks.append(
-            asyncio.create_task(
-                limited_request_func(request_func_input=request_func_input, pbar=pbar)
+            request_func_input = RequestFuncInput(
+                model=model_id,
+                prompt=request.prompt,
+                api_url=api_url,
+                prompt_len=request.prompt_len,
+                output_len=request.output_len,
+                lora_name=lora_name,
+                image_data=request.image_data,
+                extra_request_body=merged_extra_body,
+                timestamp=request.timestamp,
+                routing_key=request.routing_key,
             )
-        )
-    outputs: List[RequestFuncOutput] = await asyncio.gather(*tasks)
+
+            tasks.append(
+                asyncio.create_task(
+                    limited_request_func(request_func_input=request_func_input, pbar=pbar)
+                )
+            )
+        outputs: List[RequestFuncOutput] = await asyncio.gather(*tasks)
+    except BaseException:
+        if mooncake_before is not None:
+            try:
+                fetch_mooncake_io_snapshot(
+                    mooncake_client_url, "end", mooncake_before["window"]["id"], mooncake_before["pid"]
+                )
+            except (requests.RequestException, ValueError) as exc:
+                print(f"Could not close this benchmark's Mooncake I/O window: {exc}")
+        raise
+    # FLAT_MEMORY: Reporting and copy drainage are outside the request throughput window.
+    benchmark_duration = time.perf_counter() - benchmark_start_time
+    if collect_hicache_io:
+        hicache_after = None
+        try:
+            hicache_after = fetch_hicache_io_snapshot(base_url, timeout=io_drain_timeout)
+            hicache_io_metrics = calculate_hicache_io_metrics(hicache_before, hicache_after)
+        except (requests.RequestException, TimeoutError, ValueError) as exc:
+            # FLAT_MEMORY: Failed telemetry must not discard completed request measurements.
+            hicache_io_metrics = {
+                "hicache_io_status": "unavailable",
+                "hicache_io_error": str(exc),
+                "dram_read_bw_gbps": None,
+                "dram_write_bw_gbps": None,
+                "mean_l2_kv_readback_ms": None,
+                "hicache_io_read_bytes": None,
+                "hicache_io_write_bytes": None,
+                "hicache_io_read_batches": None,
+                "hicache_io_write_batches": None,
+                "hicache_io_metadata": {
+                    "before": hicache_before, "after": hicache_after, "error": str(exc)
+                },
+            }
+    if collect_mooncake_io:
+        try:
+            mooncake_after = fetch_mooncake_io_snapshot(
+                mooncake_client_url, "end", mooncake_before["window"]["id"], mooncake_before["pid"]
+            )
+            if hicache_after is None:
+                raise ValueError("Completed TP I/O snapshots unavailable")
+            mooncake_io_metrics = calculate_mooncake_io_metrics(
+                hicache_before, hicache_after, mooncake_before, mooncake_after
+            )
+        except (requests.RequestException, ValueError) as exc:
+            mooncake_io_metrics = unavailable_mooncake_io_metrics(exc)
+            mooncake_io_metrics["mooncake_io_metadata"] = {
+                "ssd_before": mooncake_before, "ssd_after": mooncake_after,
+                "tp_before": hicache_before, "tp_after": hicache_after,
+            }
+        try:
+            mooncake_io_metrics.update(fetch_mooncake_storage_capacity(
+                args.mooncake_master_host, args.mooncake_metrics_port
+            ))
+        except (requests.RequestException, ValueError) as exc:
+            mooncake_io_metrics["mooncake_io_metadata"]["capacity_error"] = str(exc)
     if is_multi_turn:
         outputs = [x for output in outputs for x in output]
 
@@ -2788,7 +3182,9 @@ async def benchmark(
     if pbar is not None:
         pbar.close()
 
-    if "sglang" in backend:
+    if collect_hicache_io:
+        accept_length = None
+    elif "sglang" in backend:
         server_info = requests.get(
             base_url + "/get_server_info", headers=get_auth_headers()
         )
@@ -2811,7 +3207,6 @@ async def benchmark(
         accept_length = None
 
     # Compute metrics and print results
-    benchmark_duration = time.perf_counter() - benchmark_start_time
     metrics, output_lens = calculate_metrics(
         input_requests=None if is_multi_turn else input_requests,
         outputs=outputs,
@@ -2903,11 +3298,11 @@ async def benchmark(
         print("{s:{c}^{n}}".format(s="Transfer Metrics", n=50, c="-"))
         if metrics.avg_storage_read_latency_ms > 0:
             print("{:<40} {:<10.2f}".format(
-                "Avg SSD→Host latency (ms):", metrics.avg_storage_read_latency_ms
+                "Avg Storage→Host latency (ms):", metrics.avg_storage_read_latency_ms
             ))
         if metrics.total_storage_read_tokens > 0:
             print("{:<40} {:<10}".format(
-                "Total SSD→Host tokens:", metrics.total_storage_read_tokens
+                "Total Storage→Host tokens:", metrics.total_storage_read_tokens
             ))
         if metrics.total_d2h_tokens > 0:
             print("{:<40} {:<10}".format(
@@ -2917,9 +3312,11 @@ async def benchmark(
             print("{:<40} {:<10}".format(
                 "Total Host→Storage tokens:", metrics.total_storage_write_tokens
             ))
+    if collect_mooncake_io:
+        print_mooncake_io_metrics(mooncake_io_metrics)
     # Fetch and print Mooncake Master eviction metrics
     mooncake_eviction = {}
-    if hasattr(args, 'mooncake_master_host') and args.mooncake_master_host:
+    if hasattr(args, 'mooncake_master_host') and args.mooncake_master_host and not collect_mooncake_io:
         mooncake_eviction = fetch_mooncake_eviction_metrics(
             master_host=args.mooncake_master_host,
             metrics_port=getattr(args, 'mooncake_metrics_port', 9003),
@@ -2973,37 +3370,13 @@ async def benchmark(
     # Fetch and print Flat Memory System per-backend stats
     flat_memory_metrics = {}
     fm_host = getattr(args, 'prefill_metrics_host', None)
-    if fm_host:
+    if fm_host and not collect_mooncake_io:
         flat_memory_metrics = fetch_flat_memory_metrics(
             prefill_host=fm_host,
             prefill_port=getattr(args, 'prefill_metrics_port', 30000),
         )
-    # FLAT_MEMORY: For Mooncake, merge eviction data into flat_memory_metrics
-    # SSD writes happen in mooncake_client process (not SGLang), so SSD write stats
-    # from Prometheus are always 0. Use Master's eviction metrics as SSD write proxy.
-    if flat_memory_metrics and mooncake_eviction:
-        evicted_bytes = mooncake_eviction.get("evicted_size_bytes", 0)
-        evicted_keys = mooncake_eviction.get("evicted_key_count", 0)
-        if evicted_bytes > 0 and benchmark_duration > 0:
-            # SSD write bandwidth = total evicted bytes / benchmark duration
-            ssd_write_bw = evicted_bytes / (benchmark_duration * 1e9)  # GB/s
-            flat_memory_metrics["ssd_write_bw_gbps"] = ssd_write_bw
-            flat_memory_metrics["ssd_write_total_bytes"] = evicted_bytes
-            flat_memory_metrics["ssd_write_ops"] = evicted_keys
-        # SSD used = total evicted to SSD
-        if evicted_bytes > 0:
-            flat_memory_metrics["ssd_used_bytes"] = evicted_bytes
-        # DRAM used: use HICACHE_SIZE env var (GB) or default 20GB
-        hicache_gb = int(os.environ.get("HICACHE_SIZE", "20"))
-        flat_memory_metrics["dram_used_bytes"] = hicache_gb * (1024**3)
     if flat_memory_metrics:
-        # FLAT_MEMORY: Detect backend type for section header
-        hicache_storage = os.environ.get("SGLANG_HICACHE_STORAGE", "").lower()
-        if hicache_storage == "mooncake":
-            section_title = "Mooncake Storage I/O Statistics"
-        else:
-            section_title = "Flat Memory System Statistics"
-        print("{s:{c}^{n}}".format(s=section_title, n=50, c="-"))
+        print("{s:{c}^{n}}".format(s="Flat Memory System Statistics", n=50, c="-"))
         # Storage usage
         dram_used = flat_memory_metrics.get("dram_used_bytes", 0)
         ssd_used = flat_memory_metrics.get("ssd_used_bytes", 0)
@@ -3135,8 +3508,27 @@ async def benchmark(
     print("{:<40} {:<10.2f}".format("Max ITL (ms):", metrics.max_itl_ms))
     print("=" * 50)
 
-    resp = requests.get(base_url + "/get_server_info", headers=get_auth_headers())
-    server_info = resp.json() if resp.status_code == 200 else None
+    if collect_hicache_io:
+        server_info = (hicache_after or hicache_before)["server_config"]
+        if hicache_io_metrics["hicache_io_status"] == "ok":
+            print("HiCache L2 Host I/O Statistics".center(62, "-"))
+            print("Native HiCache: rank-pooled copy-service bandwidth, not aggregate TP bandwidth")
+            for direction in ("read", "write"):
+                batches = hicache_io_metrics[f"hicache_io_{direction}_batches"]
+                value = hicache_io_metrics[f"dram_{direction}_bw_gbps"]
+                byte_count = hicache_io_metrics[f"hicache_io_{direction}_bytes"]
+                print(f"L2 Host DRAM {direction} bandwidth (GB/s): {value:.4f}" + (" (no I/O)" if batches == 0 else ""))
+                print(f"L2 Host {direction} rank-batches: {batches}")
+                print(f"L2 Host {direction} total (GB): {byte_count / 1e9:.4f}")
+            readback_ms = hicache_io_metrics["mean_l2_kv_readback_ms"]
+            print(f"Mean all-layer H2D rank-batch time (ms): {readback_ms if readback_ms is not None else 'N/A (no readbacks)'}")
+            print("KV readback time is not an additive component of TTFT; copies may overlap computation.")
+        else:
+            print(f"Native HiCache I/O metrics unavailable: {hicache_io_metrics['hicache_io_error']}")
+            print("Completed request measurements are retained; Host I/O validation failed.")
+    else:
+        resp = requests.get(base_url + "/get_server_info", headers=get_auth_headers())
+        server_info = resp.json() if resp.status_code == 200 else None
 
     if (
         metrics.median_ttft_ms is not None
@@ -3210,6 +3602,8 @@ async def benchmark(
             "kvcache_bandwidth": bandwidth_metrics if bandwidth_metrics else {},
             # Flat Memory System per-backend stats
             "flat_memory": flat_memory_metrics if flat_memory_metrics else {},
+            **hicache_io_metrics,
+            **mooncake_io_metrics,
         }
     else:
         print(f"Error running benchmark for request rate: {request_rate}")
@@ -3814,6 +4208,11 @@ if __name__ == "__main__":
         help="Number of warmup requests to run before the benchmark",
     )
     parser.add_argument(
+        "--collect-hicache-io-metrics",
+        action="store_true",
+        help="Collect completed native direct GPU/Host copies across TP ranks; requires server metrics and no storage/PD",
+    )
+    parser.add_argument(
         "--tokenize-prompt",
         action="store_true",
         help="Use integer ids instead of string for inputs. Useful to control prompt lengths accurately",
@@ -3909,6 +4308,18 @@ if __name__ == "__main__":
 
     # Mooncake Master metrics arguments
     mooncake_metrics_group = parser.add_argument_group("mooncake master metrics arguments")
+    mooncake_metrics_group.add_argument(
+        "--collect-mooncake-io-metrics", action="store_true",
+        help="Collect native Mooncake completed I/O, 100 ms SSD peaks and separate L2 Host copies; requires --mooncake-master-host.",
+    )
+    mooncake_metrics_group.add_argument(
+        "--mooncake-client-host", default="127.0.0.1",
+        help="Native Mooncake SSD owner's HTTP host.",
+    )
+    mooncake_metrics_group.add_argument(
+        "--mooncake-client-metrics-port", type=int, default=9301,
+        help="Native Mooncake SSD owner's HTTP port (default: 9301).",
+    )
     mooncake_metrics_group.add_argument(
         "--mooncake-master-host",
         type=str,

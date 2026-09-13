@@ -713,8 +713,11 @@ async def flush_cache():
     """Flush the radix cache."""
     ret = await _global_state.tokenizer_manager.flush_cache()
     return Response(
-        content="Cache flushed.\nPlease check backend logs for more details. "
-        "(When there are running or waiting requests, the operation will not be performed.)\n",
+        content=(
+            "Cache flushed.\n"
+            if ret.success
+            else "Cache not flushed: requests are active or Host/storage backups did not drain. Check backend logs.\n"
+        ),
         status_code=200 if ret.success else HTTPStatus.BAD_REQUEST,
     )
 

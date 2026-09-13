@@ -17,6 +17,7 @@ import logging
 import os
 import threading
 import time
+from collections import deque
 from queue import Empty, Full, Queue
 from typing import TYPE_CHECKING, List, NamedTuple, Optional
 
@@ -295,6 +296,7 @@ class HiCacheController:
         storage_backend_extra_config: Optional[dict] = None,
         pp_rank: int = 0,
         pp_size: int = 1,
+        enable_metrics: bool = False,
     ):
         self.tp_group = tp_group
         self.mem_pool_device_allocator = token_to_kv_pool_allocator
@@ -347,6 +349,23 @@ class HiCacheController:
         self.write_stream = device_module.Stream()
         self.load_stream = device_module.Stream()
 
+        self.enable_host_io_metrics = bool(
+            enable_metrics
+            and torch.device(self.device).type == "cuda"
+            and (self.io_backend, self.mem_pool_host.layout)
+            in (
+                ("direct", "layer_first"),
+                ("direct", "page_first_direct"),
+                ("kernel", "page_first"),
+            )
+        )
+        self._host_io_generation = 0
+        self._host_io_pending = {direction: deque() for direction in ("read", "write")}
+        self._host_io_totals = {
+            direction: {"bytes": 0, "batches": 0, "elapsed_ms": 0.0}
+            for direction in ("read", "write")
+        }
+
         # If a storage backend is provided at startup, treat it as an implicit attach,
         # so init/runtime share the same lifecycle semantics and code paths.
         if storage_backend is not None:
@@ -360,6 +379,74 @@ class HiCacheController:
             except ValueError as e:
                 # Preserve the historical error shape on init for unknown backends.
                 raise ValueError(f"Failed to create storage backend: {e}") from e
+
+    def _begin_host_io(self, direction: str, num_tokens: int) -> Optional[dict]:
+        if not self.enable_host_io_metrics or self.flat_gpu_mode or num_tokens <= 0:
+            return None
+        if direction not in self._host_io_pending:
+            raise ValueError(f"Unsupported host I/O direction: {direction}")
+        stream = self.load_stream if direction == "read" else self.write_stream
+        # FLAT_MEMORY: Timing events must outlive the reused layer-completion ring.
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+        start_event.record(stream)
+        return {
+            "direction": direction,
+            "bytes": int(num_tokens * self.mem_pool_host.get_size_per_token()),
+            "start_event": start_event,
+            "end_event": end_event,
+        }
+
+    def _finish_host_io(self, measurement: Optional[dict]) -> None:
+        if measurement is None:
+            return
+        direction = measurement["direction"]
+        stream = self.load_stream if direction == "read" else self.write_stream
+        measurement["end_event"].record(stream)
+        self._host_io_pending[direction].append(measurement)
+
+    def collect_host_io_metrics(self) -> None:
+        """Account completed rank-batches once, without synchronizing copy streams."""
+        for direction, pending in self._host_io_pending.items():
+            while pending:
+                measurement = pending[0]
+                if not measurement["end_event"].query():
+                    break
+                elapsed_ms = float(
+                    measurement["start_event"].elapsed_time(measurement["end_event"])
+                )
+                totals = self._host_io_totals[direction]
+                totals["bytes"] += measurement["bytes"]
+                totals["batches"] += 1
+                totals["elapsed_ms"] += elapsed_ms
+                pending.popleft()
+
+    def host_io_snapshot(self) -> dict:
+        """Return JSON-safe local counters and outstanding Host-copy work."""
+        self.collect_host_io_metrics()
+        pending = len(self.load_queue) + len(self.write_queue)
+        pending += sum(len(queue) for queue in self._host_io_pending.values())
+        if not self.enable_host_io_metrics:
+            pending += sum(
+                not ack.finish_event.query()
+                for queue in (self.ack_load_queue, self.ack_write_queue)
+                for ack in queue
+            )
+        bytes_per_token = int(self.mem_pool_host.get_size_per_token())
+        return {
+            "enabled": bool(self.enable_host_io_metrics and not self.flat_gpu_mode),
+            "pid": os.getpid(),
+            "generation": self._host_io_generation,
+            "tp_rank": int(torch.distributed.get_rank(group=self.tp_group)),
+            "tp_size": int(torch.distributed.get_world_size(group=self.tp_group)),
+            "io_backend": self.io_backend,
+            "host_capacity_bytes": int(self.mem_pool_host.size) * bytes_per_token,
+            "device_capacity_bytes": int(self.mem_pool_device.size) * bytes_per_token,
+            "bytes_per_token": bytes_per_token,
+            "pending": int(pending),
+            "read": self._host_io_totals["read"].copy(),
+            "write": self._host_io_totals["write"].copy(),
+        }
 
     def _start_storage_threads(self):
         """Start storage prefetch/backup threads and their queues.
@@ -781,6 +868,14 @@ class HiCacheController:
         )
 
     def reset(self):
+        # FLAT_MEMORY: Explicit reset must drain copies before queues/pages are reused.
+        self.write_stream.synchronize()
+        self.load_stream.synchronize()
+        self.collect_host_io_metrics()
+        self._host_io_generation += 1
+        for totals in self._host_io_totals.values():
+            totals.update(bytes=0, batches=0, elapsed_ms=0.0)
+
         # FLAT_MEMORY: Direct I/O uses medium workers instead of the host coordinator.
         if self.flat_gpu_mode:
             self._stop_storage_threads()
@@ -788,6 +883,7 @@ class HiCacheController:
             self.storage_stop_event.clear()
             self._start_storage_threads()
             return
+        self.layer_done_counter.reset()
         self.stop_event.set()
         self.storage_stop_event.set()
 
@@ -854,9 +950,11 @@ class HiCacheController:
         start_event.record()
         with device_module.stream(self.write_stream):
             start_event.wait(self.write_stream)
+            measurement = self._begin_host_io("write", len(host_indices))
             self.mem_pool_host.backup_from_device_all_layer(
                 self.mem_pool_device, host_indices, device_indices, self.io_backend
             )
+            self._finish_host_io(measurement)
             finish_event.record()
             # NOTE: We must save the host indices and device indices here,
             # this is because we need to guarantee that these tensors are
@@ -917,6 +1015,7 @@ class HiCacheController:
 
         with device_module.stream(self.load_stream):
             producer_event.start_event.wait(self.load_stream)
+            measurement = self._begin_host_io("read", len(host_indices))
             for i in range(self.layer_num):
                 self.mem_pool_host.load_to_device_per_layer(
                     self.mem_pool_device,
@@ -926,6 +1025,7 @@ class HiCacheController:
                     self.io_backend,
                 )
                 producer_event.complete(i)
+            self._finish_host_io(measurement)
             # NOTE: We must save the host indices and device indices here,
             # this is because we need to guarantee that these tensors are
             # still alive when the load stream is executing.

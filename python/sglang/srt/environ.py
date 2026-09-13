@@ -710,13 +710,14 @@ class Envs:
     # ===================================================================
     # HiCache storage backends and mmap allocation
     # ===================================================================
-    # Per-call cudaHostRegister limit in GB.
+    # FLAT_MEMORY: Keep the published storage tuning names across framework upgrades.
     SGLANG_PREFETCH_THRESHOLD = EnvInt(None)
     SGLANG_STORAGE_READ_BATCH_SIZE = EnvInt(128)
     SGLANG_STORAGE_WRITE_BATCH_SIZE = EnvInt(128)
-    SGLANG_PREFETCH_IO_WORKERS = EnvInt(1)
     SGLANG_PREFETCH_QUERY_WORKERS = EnvInt(1)
+    SGLANG_PREFETCH_IO_WORKERS = EnvInt(1)
     SGLANG_BACKUP_WAIT_TIMEOUT = EnvFloat(10.0)
+    # Per-call cudaHostRegister limit in GB.
     SGLANG_HICACHE_HOST_REGISTER_CHUNK_GB = EnvInt(256)
     SGLANG_HICACHE_HF3FS_CONFIG_PATH = EnvStr(None)
     SGLANG_HICACHE_DECODE_OFFLOAD_STRIDE = EnvInt(None)

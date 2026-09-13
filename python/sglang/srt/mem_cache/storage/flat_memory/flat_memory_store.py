@@ -1,563 +1,372 @@
-"""
-FlatMemoryStore - SGLang HiCache storage backend powered by flat_memory_system.
+"""Flat Memory host-storage adapter; direct GPU transfers use the Flat linker."""
 
-Thin adapter that implements HiCacheStorage interface and delegates all
-storage operations to flat_memory_system.manager.FlatMemoryManager.
+from __future__ import annotations
 
-Usage:
-    python -m sglang.launch_server \
-        --hicache-storage-backend flat_memory \
-        --hicache-storage-backend-extra-config '{
-            "policy": "LATENCY_FIRST",
-            "dram_capacity_gb": 10,
-            "ssd_capacity_gb": 100,
-            "ssd_path": "/data2/huangxin/flat_memory_sys_kvcache_storage_dir/experiment_4"
-        }'
-"""
-
+import hashlib
+import json
 import logging
 import os
+import threading
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 import torch
 
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorage,
     HiCacheStorageConfig,
-    HiCacheStorageExtraInfo,
+    PoolHitPolicy,
+    PoolName,
+    PoolTransfer,
+    PoolTransferResult,
 )
-from sglang.srt.mem_cache.pool_host import HostKVCache
-from sglang.srt.observability.metrics_collector import StorageMetrics
-
-# Import the independent flat_memory_system library
-from flat_memory_system.manager import FlatMemoryConfig, FlatMemoryManager
+from sglang.srt.mem_cache.storage.flat_memory.payload import restorable_boundaries
 
 logger = logging.getLogger(__name__)
 
 
-class FlatMemoryStore(HiCacheStorage):
-    """
-    SGLang HiCache storage backend using Flat Memory System.
+def make_storage_metrics(manager, prefetch_samples, backup_samples):
+    from sglang.srt.observability.metrics_collector import StorageMetrics
 
-    Manages DRAM + SSD as a unified flat address space via FlatMemoryManager.
-    No tiered eviction. Placement strategy decides where each KVCache page
-    is stored at write time.
-    """
-
-    def __init__(
-        self,
-        storage_config: HiCacheStorageConfig = None,
-        mem_pool: HostKVCache = None,
+    metrics = StorageMetrics()
+    for samples, pages, bandwidth in (
+        (prefetch_samples, metrics.prefetch_pgs, metrics.prefetch_bandwidth),
+        (backup_samples, metrics.backup_pgs, metrics.backup_bandwidth),
     ):
-        # Parse config from SGLang's extra_config
-        extra_config = (
-            getattr(storage_config, "extra_config", None)
-            if storage_config
-            else None
-        )
-        fm_config = FlatMemoryConfig.from_dict(extra_config)
+        for count, size, elapsed in samples:
+            pages.append(count)
+            if elapsed > 0:
+                bandwidth.append(size / (1 << 30) / elapsed)
+    report = manager.get_bandwidth_report()
+    stats = manager.get_stats()
+    report.update(
+        {
+            "dram_used_bytes": stats["dram_used"],
+            "ssd_used_bytes": stats["ssd_used"],
+            "total_blocks": stats["total_blocks"],
+        }
+    )
+    report.update(manager.get_capacity_stats())
+    metrics.flat_memory_bandwidth = report
+    return metrics
 
-        # SGLang-specific config
-        if storage_config is not None:
-            self.is_mla_backend = storage_config.is_mla_model
-            self.local_rank = storage_config.tp_rank
-            self.pp_rank = storage_config.pp_rank
-            self.pp_size = storage_config.pp_size
-        else:
-            self.is_mla_backend = False
-            self.local_rank = 0
-            self.pp_rank = 0
-            self.pp_size = 1
 
-        self.tp_size = storage_config.tp_size if storage_config is not None else 1
-        # FLAT_MEMORY: TP shards must not share a GPU binding or backing file.
-        if fm_config.gds_mode == "compat":
-            fm_config.gpu_id = torch.cuda.current_device()
-            fm_config.ssd_path = os.path.join(
-                fm_config.ssd_path, f"tp_rank_{self.local_rank}"
+class FlatMemoryStore(HiCacheStorage):
+    def __init__(
+        self, storage_config: HiCacheStorageConfig | None = None, mem_pool=None
+    ):
+        from flat_memory_system.manager import FlatMemoryConfig, FlatMemoryManager
+
+        extra = storage_config.extra_config if storage_config is not None else None
+        config = FlatMemoryConfig.from_dict(extra)
+        if config.gds_mode == "compat":
+            raise ValueError(
+                "Flat gds_mode=compat must use the direct Flat radix backend, not a host pool"
             )
-        self.manager = FlatMemoryManager(fm_config)
-
+        if storage_config is not None and storage_config.should_split_heads:
+            raise ValueError(
+                "Flat host storage does not support heterogeneous-TP split heads"
+            )
+        self.is_mla_backend = storage_config.is_mla_model if storage_config else False
+        self.local_rank = storage_config.tp_rank if storage_config else 0
+        self.tp_size = storage_config.tp_size if storage_config else 1
+        self.pp_rank = storage_config.pp_rank if storage_config else 0
+        self.pp_size = storage_config.pp_size if storage_config else 1
         self.enable_pp = self.pp_size > 1
-        if self.enable_pp:
-            self.mha_suffix = f"{self.local_rank}_{self.pp_rank}"
-            self.mla_suffix = f"{self.pp_rank}"
-        else:
-            self.mha_suffix = f"{self.local_rank}"
-            self.mla_suffix = ""
-
-        # Metrics accumulators
+        self.mha_suffix = f"{self.local_rank}_{self.pp_rank}"
+        self.mla_suffix = self.mha_suffix
+        identity = {
+            "format": 1,
+            "model": storage_config.model_name if storage_config else None,
+            "tp_rank": self.local_rank,
+            "tp_size": self.tp_size,
+            "pp_rank": self.pp_rank,
+            "pp_size": self.pp_size,
+            "cp_rank": storage_config.attn_cp_rank if storage_config else 0,
+            "cp_size": storage_config.attn_cp_size if storage_config else 1,
+            "tag": (extra or {}).get("extra_backend_tag"),
+        }
+        self._namespace = hashlib.sha256(
+            json.dumps(identity, sort_keys=True).encode()
+        ).hexdigest()
+        # FLAT_MEMORY: Namespaced keys do not isolate rank-local backing files.
+        config.ssd_path = os.path.join(
+            config.ssd_path,
+            f"tp_rank_{self.local_rank}",
+            f"pp_rank_{self.pp_rank}_cp_rank_{identity['cp_rank']}",
+        )
+        self._manager_factory = lambda: FlatMemoryManager(config)
+        self.manager = self._manager_factory()
+        self.mem_pool_host = None
+        self.registered_pools = {}
+        self._pool_sizes: dict[PoolName, tuple[int, ...]] = {}
+        self._pool_tags: dict[PoolName, str] = {}
+        self._metrics_lock = threading.Lock()
+        self._prefetch_samples = []
+        self._backup_samples = []
         self.gb_per_page = None
-        self.prefetch_pgs = []
-        self.backup_pgs = []
-        self.prefetch_bandwidth = []
-        self.backup_bandwidth = []
+        if mem_pool is not None:
+            self.register_mem_pool_host(mem_pool)
 
-    # FLAT_MEMORY: GPU-file payloads never use the HiCache host pool.
     @property
     def gpu_direct(self) -> bool:
-        return self.manager.config.gds_mode == "compat"
+        return False
 
-    def register_mem_pool_device(self, pool):
-        from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
-
-        if type(pool) is not MHATokenToKVPool or self.is_mla_backend:
-            raise ValueError(
-                "GDS (compat) currently supports standard MHA/GQA KV pools"
-            )
-        if pool.store_dtype not in (torch.float16, torch.bfloat16):
-            raise ValueError("GDS (compat) requires FP16/BF16 KV data")
-        self.mem_pool_device = pool
-        self.gpu_buffers = [
-            buffer
-            for layer in range(pool.start_layer, pool.start_layer + pool.layer_num)
-            for buffer in (pool._get_key_buffer(layer), pool._get_value_buffer(layer))
-        ]
-        self.gpu_page_bytes = [
-            buffer[0].nbytes * pool.page_size for buffer in self.gpu_buffers
-        ]
-        if len(set(self.gpu_page_bytes)) != 1:
-            raise ValueError("GDS (compat) requires equal K/V page sizes")
-        self.gpu_slot_bytes = (self.gpu_page_bytes[0] + 4095) // 4096 * 4096
-        self.gpu_stage_bytes = 128 * 1024 * 1024
-        self.gpu_batch_pages = max(
-            1, self.gpu_stage_bytes // (len(self.gpu_buffers) * self.gpu_slot_bytes)
-        )
-        self.gb_per_page = sum(self.gpu_page_bytes) / (1 << 30)
-
-    def _gpu_keys(self, keys: List[str]) -> List[str]:
-        return [
-            f"{key}_{self.mha_suffix}_l{layer}_{kind}"
-            for layer in range(
-                self.mem_pool_device.start_layer,
-                self.mem_pool_device.start_layer + self.mem_pool_device.layer_num,
-            )
-            for kind in ("k", "v")
-            for key in keys
-        ]
-
-    def resolve_gpu_prefix(self, keys: List[str]):
-        if not keys:
-            return [], 0
-        addresses = self.manager.lookup_addresses(self._gpu_keys(keys))
-        pages = len(keys)
-        hit = pages
-        for slot in range(len(self.gpu_buffers)):
-            for page, address in enumerate(
-                addresses[slot * pages : (slot + 1) * pages]
-            ):
-                if address == 0:
-                    hit = min(hit, page)
-                    break
-        return [
-            address
-            for slot in range(len(self.gpu_buffers))
-            for address in addresses[slot * pages : slot * pages + hit]
-        ], hit
-
-    def write_gpu_pages(self, keys: List[str], device_indices: torch.Tensor) -> int:
-        page_size = self.mem_pool_device.page_size
-        completed = 0
-        for start in range(0, len(keys), self.gpu_batch_pages):
-            batch = keys[start : start + self.gpu_batch_pages]
-            indices = device_indices[
-                start * page_size : (start + len(batch)) * page_size
-            ]
-            packed = torch.zeros(
-                (len(self.gpu_buffers), len(batch), self.gpu_slot_bytes),
-                dtype=torch.uint8,
-                device=indices.device,
-            )
-            for slot, buffer in enumerate(self.gpu_buffers):
-                data = (
-                    buffer.index_select(0, indices)
-                    .view(torch.uint8)
-                    .reshape(len(batch), -1)
-                )
-                packed[slot, :, : self.gpu_page_bytes[slot]].copy_(data)
-            torch.cuda.current_stream().synchronize()
-            pointers = [part.data_ptr() for part in packed.flatten(0, 1)]
-            results = self.manager.put_gpu_file(
-                self._gpu_keys(batch), pointers, [self.gpu_slot_bytes] * len(pointers)
-            )
-            if not all(results):
-                break
-            completed += len(batch) * page_size
-        return completed
-
-    def read_gpu_pages(self, addresses: List[int], device_indices: torch.Tensor) -> int:
-        page_size = self.mem_pool_device.page_size
-        pages = len(device_indices) // page_size
-        completed = 0
-        for start in range(0, pages, self.gpu_batch_pages):
-            count = min(self.gpu_batch_pages, pages - start)
-            packed = torch.empty(
-                (len(self.gpu_buffers), count, self.gpu_slot_bytes),
-                dtype=torch.uint8,
-                device=device_indices.device,
-            )
-            selected = [
-                address
-                for slot in range(len(self.gpu_buffers))
-                for address in addresses[
-                    slot * pages + start : slot * pages + start + count
-                ]
-            ]
-            pointers = [part.data_ptr() for part in packed.flatten(0, 1)]
-            results = self.manager.read_gpu(
-                selected, pointers, [self.gpu_slot_bytes] * len(pointers)
-            )
-            good = next(
-                (
-                    page
-                    for page in range(count)
-                    if not all(
-                        results[slot * count + page]
-                        for slot in range(len(self.gpu_buffers))
-                    )
-                ),
-                count,
-            )
-            indices = device_indices[start * page_size : (start + good) * page_size]
-            if good:
-                for slot, buffer in enumerate(self.gpu_buffers):
-                    data = packed[slot, :good, : self.gpu_page_bytes[slot]].contiguous()
-                    data = data.view(buffer.dtype).reshape(
-                        good * page_size, *buffer.shape[1:]
-                    )
-                    buffer.index_copy_(0, indices, data)
-                torch.cuda.current_stream().synchronize()
-                completed += good * page_size
-            if good != count:
-                break
-        return completed
-
-    # ---- Memory pool registration (same pattern as MooncakeStore) ----
-
-    def register_mem_pool_host(self, mem_pool_host: HostKVCache):
-        super().register_mem_pool_host(mem_pool_host)
-        assert self.mem_pool_host.layout in [
-            "page_first", "page_first_direct", "page_head",
-        ], "FlatMemoryStore only supports page_first, page_first_direct, or page_head layout"
-        bytes_per_page = mem_pool_host.get_ksize_per_token() * mem_pool_host.page_size
-        self.gb_per_page = bytes_per_page / (1 << 30)
-        logger.info(
-            f"FlatMemoryStore: registered mem_pool_host, "
-            f"bytes_per_page={bytes_per_page}, layout={mem_pool_host.layout}"
-        )
-
-    # ---- Key encoding helpers (same as MooncakeStore) ----
-
-    def _get_mha_buffer_meta(self, keys, indices):
-        ptr_list, element_size_list = self.mem_pool_host.get_page_buffer_meta(indices)
-        key_list = []
-        for key_ in keys:
-            key_list.append(f"{key_}_{self.mha_suffix}_k")
-            key_list.append(f"{key_}_{self.mha_suffix}_v")
-        assert len(key_list) == len(ptr_list)
-        return key_list, ptr_list, element_size_list
-
-    def _get_mla_buffer_meta(self, keys, indices):
-        ptr_list, element_size_list = self.mem_pool_host.get_page_buffer_meta(indices)
-        key_list = []
-        for key_ in keys:
-            key_list.append(f"{key_}_{self.mla_suffix}_k")
-        assert len(key_list) == len(ptr_list)
-        return key_list, ptr_list, element_size_list
-
-    def _batch_preprocess(self, keys, host_indices):
-        assert len(keys) > 0
-        assert len(keys) == len(host_indices) // self.mem_pool_host.page_size
-        if self.is_mla_backend:
-            return self._get_mla_buffer_meta(keys, host_indices)
-        else:
-            return self._get_mha_buffer_meta(keys, host_indices)
-
-    def _batch_postprocess(self, results: List[bool], is_set_operate=False):
-        if self.is_mla_backend:
-            return results
-        else:
-            kv_pairs = zip(results[::2], results[1::2])
-            return [k and v for k, v in kv_pairs]
-
-    # ---- HiCacheStorage v1 interface (used by HiCacheController) ----
-
-    def batch_set_v1(
-        self,
-        keys: List[str],
-        host_indices: torch.Tensor,
-        extra_info: Optional[HiCacheStorageExtraInfo] = None,
-    ) -> List[bool]:
-        key_strs, buffer_ptrs, buffer_sizes = self._batch_preprocess(keys, host_indices)
-        if key_strs:
-            logger.info(
-                f"[PREFETCH-DEBUG] batch_set_v1: n_keys={len(key_strs)}, "
-                f"first_key={key_strs[0]}"
-            )
-        results = self.manager.batch_put(key_strs, buffer_ptrs, buffer_sizes)
-        return self._batch_postprocess(results, is_set_operate=True)
-
-    # FLAT_MEMORY: Direct write from pre-aligned buffer (8.2b).
-    # Called by cache_controller's direct GPU→SSD path.
-    # Buffer pointers are 4KB-aligned (from alloc_aligned), enabling
-    # io_uring zero-copy writev in C++ SSDBucketBackend.
-    def batch_set_direct(
-        self,
-        keys: List[str],
-        buffer_ptrs: List[int],
-        buffer_sizes: List[int],
-    ) -> List[bool]:
-        """Write KVCache pages directly from aligned buffers (bypasses HiCache DRAM).
-
-        Args:
-            keys: Hash values for each page (like batch_set_v1).
-            buffer_ptrs: Pre-aligned buffer addresses (from alloc_aligned).
-            buffer_sizes: Size of each buffer.
-
-        Returns:
-            List of bool indicating success for each key.
-        """
-        # Build key list with MHA/MLA suffix (same encoding as _batch_preprocess)
-        key_strs = []
-        for key_ in keys:
-            if self.is_mla_backend:
-                key_strs.append(f"{key_}_{self.mla_suffix}_k")
+    @staticmethod
+    def _flatten_meta(pointers, sizes):
+        flat_pointers, flat_sizes = [], []
+        for pointer, size in zip(pointers, sizes):
+            if isinstance(pointer, (list, tuple)):
+                if not isinstance(size, (list, tuple)) or len(pointer) != len(size):
+                    raise ValueError("Flat host buffer pointer/size vectors disagree")
+                flat_pointers.extend(pointer)
+                flat_sizes.extend(size)
             else:
-                key_strs.append(f"{key_}_{self.mha_suffix}_k")
-                key_strs.append(f"{key_}_{self.mha_suffix}_v")
+                flat_pointers.append(pointer)
+                flat_sizes.append(size)
+        if len(pointers) != len(sizes):
+            raise ValueError("Flat host buffer metadata lengths disagree")
+        return flat_pointers, flat_sizes
 
-        if self.is_mla_backend:
-            # 1:1 mapping
-            results = self.manager.batch_put(key_strs, buffer_ptrs, buffer_sizes)
-        else:
-            # MHA: each key produces k+v entries, split ptrs/sizes accordingly
-            expanded_ptrs = []
-            expanded_sizes = []
-            for i in range(len(keys)):
-                # For MHA, each page has [k_data, v_data] packed.
-                # The ptr points to the start, size covers both k and v.
-                # Split in half: first half = k, second half = v
-                half = buffer_sizes[i] // 2
-                expanded_ptrs.append(buffer_ptrs[i])
-                expanded_sizes.append(half)
-                expanded_ptrs.append(buffer_ptrs[i] + half)
-                expanded_sizes.append(half)
-            results = self.manager.batch_put(key_strs, expanded_ptrs, expanded_sizes)
+    def register_mem_pool_host(self, mem_pool_host):
+        super().register_mem_pool_host(mem_pool_host)
+        self.register_mem_host_pool_v2(mem_pool_host, PoolName.KV)
+        self.gb_per_page = sum(self._pool_sizes[PoolName.KV]) / (1 << 30)
 
-        if key_strs:
-            logger.info(
-                f"[PREFETCH-DEBUG] batch_set_direct: n_keys={len(key_strs)}, "
-                f"first_key={key_strs[0]}, direct_path=True"
+    def register_mem_host_pool_v2(self, host_pool, host_pool_name):
+        name = PoolName(host_pool_name)
+        if host_pool.kv_buffer is None:
+            self.registered_pools[name] = host_pool
+            self._pool_sizes[name] = ()
+            self._pool_tags[name] = "logical"
+            return
+        pointers, sizes = host_pool.get_page_buffer_meta(
+            torch.arange(host_pool.page_size, dtype=torch.int64)
+        )
+        pointers, sizes = self._flatten_meta(pointers, sizes)
+        if not pointers or any(size <= 0 for size in sizes):
+            raise ValueError(f"Flat host pool {name} has an empty physical page")
+        self.registered_pools[name] = host_pool
+        self._pool_sizes[name] = tuple(sizes)
+        descriptor = (
+            type(host_pool).__name__,
+            host_pool.page_size,
+            str(host_pool.dtype),
+            host_pool.layout,
+            sizes,
+        )
+        self._pool_tags[name] = hashlib.sha256(
+            json.dumps(descriptor).encode()
+        ).hexdigest()[:24]
+
+    def _keys(self, *, keys: list[str], name: PoolName) -> list[str]:
+        return [
+            f"flat-host-v1:{self._namespace}:{name}:{self._pool_tags[name]}:b{component}:{key}"
+            for key in keys
+            for component in range(len(self._pool_sizes[name]))
+        ]
+
+    def _metadata(self, *, keys, indices, name):
+        pool = self.registered_pools[name]
+        if len(keys) * pool.page_size != len(indices):
+            raise ValueError("Flat host page keys and token indices disagree")
+        if not self._pool_sizes[name]:
+            return [], [], []
+        pointers, sizes = self._flatten_meta(*pool.get_page_buffer_meta(indices))
+        expected = list(self._pool_sizes[name]) * len(keys)
+        if sizes != expected or len(pointers) != len(expected):
+            raise ValueError("Flat host pool layout changed after registration")
+        return self._keys(keys=keys, name=name), pointers, sizes
+
+    def _batch_io(self, *, keys, indices, name, write):
+        if not keys:
+            return []
+        objects, pointers, sizes = self._metadata(keys=keys, indices=indices, name=name)
+        if not objects:
+            return [True] * len(keys)
+        started = time.perf_counter()
+        method = self.manager.batch_put if write else self.manager.batch_get
+        results = method(objects, pointers, sizes)
+        width = len(self._pool_sizes[name])
+        if len(results) != len(objects):
+            raise RuntimeError("Flat native host I/O returned an invalid result length")
+        page_results = [
+            all(results[index : index + width])
+            for index in range(0, len(results), width)
+        ]
+        completed = next(
+            (index for index, ok in enumerate(page_results) if not ok),
+            len(page_results),
+        )
+        elapsed = time.perf_counter() - started
+        with self._metrics_lock:
+            samples = self._backup_samples if write else self._prefetch_samples
+            samples.append(
+                (completed, sum(self._pool_sizes[name]) * completed, elapsed)
             )
-        return self._batch_postprocess(results, is_set_operate=True)
+        return page_results
 
-    def batch_get_v1(
-        self,
-        keys: List[str],
-        host_indices: torch.Tensor,
-        extra_info: Optional[HiCacheStorageExtraInfo] = None,
-    ) -> List[bool]:
-        key_strs, buffer_ptrs, buffer_sizes = self._batch_preprocess(keys, host_indices)
-        results = self.manager.batch_get(key_strs, buffer_ptrs, buffer_sizes)
-        return self._batch_postprocess(results, is_set_operate=False)
+    def batch_set_v1(self, keys, host_indices, extra_info=None):
+        return self._batch_io(
+            keys=keys, indices=host_indices, name=PoolName.KV, write=True
+        )
 
-    # ---- HiCacheStorage legacy interface ----
+    def batch_get_v1(self, keys, host_indices, extra_info=None):
+        return self._batch_io(
+            keys=keys, indices=host_indices, name=PoolName.KV, write=False
+        )
 
-    def set(
-        self,
-        key,
-        value: Optional[Any] = None,
-        target_location: Optional[Any] = None,
-        target_sizes: Optional[Any] = None,
-    ) -> bool:
-        assert target_location is not None and target_sizes is not None
-        if self.manager.exists(key):
-            return True
+    def batch_set_v2(self, transfers: list[PoolTransfer], extra_info=None):
+        return {
+            transfer.name: self._batch_io(
+                keys=transfer.keys,
+                indices=transfer.host_indices,
+                name=transfer.name,
+                write=True,
+            )
+            for transfer in transfers
+        }
+
+    def batch_get_v2(self, transfers: list[PoolTransfer], extra_info=None):
+        return {
+            transfer.name: self._batch_io(
+                keys=transfer.keys,
+                indices=transfer.host_indices,
+                name=transfer.name,
+                write=False,
+            )
+            for transfer in transfers
+        }
+
+    def _page_exists(self, *, keys, name):
+        width = len(self._pool_sizes[name])
+        if not width:
+            return [True] * len(keys)
+        query = self._keys(keys=keys, name=name)
+        addresses = self.manager.lookup_addresses(query)
+        if len(addresses) != len(query):
+            raise RuntimeError("Flat host lookup returned an invalid result length")
+        return [
+            all(addresses[index : index + width])
+            for index in range(0, len(addresses), width)
+        ]
+
+    def batch_exists(self, keys, extra_info=None):
+        exists = self._page_exists(keys=keys, name=PoolName.KV)
+        return next(
+            (index for index, present in enumerate(exists) if not present), len(keys)
+        )
+
+    def batch_exists_v2(self, keys, pool_transfers=None, extra_info=None):
+        candidates = set(range(1, self.batch_exists(keys) + 1))
+        hits = {}
+        for transfer in pool_transfers or []:
+            states = self._page_exists(keys=keys, name=transfer.name)
+            boundaries = restorable_boundaries(
+                states,
+                policy=transfer.hit_policy,
+                trailing_pages=max(1, len(transfer.keys or [])),
+            )
+            candidates &= boundaries
+            hits[transfer.name] = max(boundaries, default=0)
+        restorable = sorted(candidates)
+        return PoolTransferResult(restorable[-1] if restorable else 0, hits, restorable)
+
+    def batch_set_direct(self, keys, buffer_ptrs, buffer_sizes):
+        # FLAT_MEMORY: Split packed host pages by real component sizes, not equal K/V halves.
+        components = self._pool_sizes[PoolName.KV]
+        expected = sum(components)
+        if len(keys) != len(buffer_ptrs) or len(keys) != len(buffer_sizes):
+            raise ValueError("Flat direct host page metadata lengths disagree")
+        pointers, sizes = [], []
+        for pointer, size in zip(buffer_ptrs, buffer_sizes):
+            if size != expected:
+                raise ValueError(
+                    "Flat direct host page size differs from the registered layout"
+                )
+            offset = 0
+            for component in components:
+                pointers.append(pointer + offset)
+                sizes.append(component)
+                offset += component
+        results = self.manager.batch_put(
+            self._keys(keys=keys, name=PoolName.KV), pointers, sizes
+        )
+        width = len(components)
+        if len(results) != len(pointers):
+            raise RuntimeError("Flat direct host write returned invalid results")
+        return [
+            all(results[index : index + width])
+            for index in range(0, len(results), width)
+        ]
+
+    def set(self, key, value=None, target_location=None, target_sizes=None):
+        if target_location is None and isinstance(value, torch.Tensor):
+            if value.device.type != "cpu":
+                raise ValueError("Flat ordinary writes require host tensors")
+            target_location, target_sizes = value.data_ptr(), value.nbytes
+        if target_location is None or target_sizes is None:
+            raise ValueError("Flat set requires a source pointer and byte size")
         return self.manager.put(key, target_location, target_sizes)
 
-    def batch_set(
-        self,
-        keys: List[str],
-        values: Optional[Any] = None,
-        target_locations: Optional[Any] = None,
-        target_sizes: Optional[Any] = None,
-    ) -> bool:
-        if len(keys) == 0:
+    def batch_set(self, keys, values=None, target_locations=None, target_sizes=None):
+        if not keys:
             return False
-
-        # Called from _generic_page_set: batch_set(hash_values, data)
-        # where data is a list of torch.Tensor, target_locations/target_sizes are None.
-        # In this case, extract pointers and sizes from the tensor list.
         if target_locations is None and values is not None:
-            target_locations = [v.data_ptr() for v in values]
-            target_sizes = [v.nbytes for v in values]
-
-        assert target_locations is not None and target_sizes is not None
-        assert len(keys) == len(target_locations) == len(target_sizes)
-
-        start_time = time.perf_counter()
-
-        # Validate: reject batch if any entry is None
-        for i in range(len(keys)):
-            if keys[i] is None or target_locations[i] is None or target_sizes[i] is None:
-                return False
-
-        # Pass all keys directly to C++ BatchPutCoalesced which handles
-        # deduplication internally (single lock), avoiding per-key exists() overhead.
+            if any(value.device.type != "cpu" for value in values):
+                raise ValueError("Flat ordinary writes require host tensors")
+            target_locations = [value.data_ptr() for value in values]
+            target_sizes = [value.nbytes for value in values]
+        if target_locations is None or target_sizes is None:
+            raise ValueError("Flat batch_set requires source pointers and sizes")
+        if len(keys) != len(target_locations) or len(keys) != len(target_sizes):
+            raise ValueError("Flat batch_set vector lengths disagree")
         results = self.manager.batch_put(keys, target_locations, target_sizes)
-        all_ok = all(results)
-        if len(keys) > 0:
-            logger.info(
-                f"[PREFETCH-DEBUG] batch_set: n_keys={len(keys)}, "
-                f"first_key={keys[0][:32]}, all_ok={all_ok}"
-            )
+        if len(results) != len(keys):
+            raise RuntimeError("Flat batch_set returned an invalid result length")
+        return all(results)
 
-        end_time = time.perf_counter()
-
-        self.backup_pgs.append(len(keys))
-        if end_time > start_time:
-            self.backup_bandwidth.append(
-                len(keys) / (end_time - start_time) * self.gb_per_page
-            )
-
-        return all_ok
-
-    def get(
-        self,
-        key,
-        target_location: Optional[Any] = None,
-        target_sizes: Optional[Any] = None,
-    ) -> bool:
-        assert target_location is not None and target_sizes is not None
+    def get(self, key, target_location=None, target_sizes=None):
+        if target_location is None or target_sizes is None:
+            raise ValueError("Flat get requires a destination pointer and byte size")
         return self.manager.get(key, target_location, target_sizes) >= 0
 
-    def batch_get(
-        self,
-        keys: List[str],
-        target_locations: Optional[Any] = None,
-        target_sizes: Optional[Any] = None,
-    ) -> int:
-        assert len(keys) == len(target_locations) == len(target_sizes)
-        if len(keys) == 0:
-            return 0
-
-        if self.is_mla_backend:
-            key_multiplier = 1
-        else:
-            key_multiplier = 2
-
-        start_time = time.perf_counter()
+    def batch_get(self, keys, target_locations=None, target_sizes=None):
+        if target_locations is None or target_sizes is None:
+            raise ValueError("Flat batch_get requires destination pointers and sizes")
+        if len(keys) != len(target_locations) or len(keys) != len(target_sizes):
+            raise ValueError("Flat batch_get vector lengths disagree")
         results = self.manager.batch_get(keys, target_locations, target_sizes)
-        # Find first failure
-        for i, ok in enumerate(results):
-            if not ok:
-                end_time = time.perf_counter()
-                return i // key_multiplier
-        end_time = time.perf_counter()
+        if len(results) != len(keys):
+            raise RuntimeError("Flat batch_get returned an invalid result length")
+        first_failure = next(
+            (index for index, ok in enumerate(results) if not ok), len(results)
+        )
+        return first_failure // (1 if self.is_mla_backend else 2)
 
-        self.prefetch_pgs.append(len(keys))
-        if end_time > start_time:
-            self.prefetch_bandwidth.append(
-                len(keys) / (end_time - start_time) * self.gb_per_page
-            )
-
-        return len(keys) // key_multiplier
-
-    def exists(self, key) -> bool:
+    def exists(self, key):
         return self.manager.exists(key)
 
-    def batch_exists(
-        self,
-        keys: List[str],
-        extra_info: Optional[HiCacheStorageExtraInfo] = None,
-    ) -> int:
-        # FLAT_MEMORY: A page is visible only when every layer is committed.
-        if self.gpu_direct:
-            return self.resolve_gpu_prefix(keys)[1]
-        if self.is_mla_backend:
-            query_keys = [f"{key}_{self.mla_suffix}_k" for key in keys]
-            key_multiplier = 1
-        else:
-            query_keys = []
-            for key in keys:
-                query_keys.append(f"{key}_{self.mha_suffix}_k")
-                query_keys.append(f"{key}_{self.mha_suffix}_v")
-            key_multiplier = 2
-
-        # FLAT_MEMORY: Use C++ BatchExistsPrefix for single-lock batch check.
-        # This replaces the Python loop that called exists() 15000 times
-        # (each acquiring index_mutex_ separately), reducing batch_exists
-        # from ~600ms to ~50ms for a typical 7500-key query.
-        if hasattr(self.manager, 'batch_exists_prefix'):
-            first_miss = self.manager.batch_exists_prefix(query_keys)
-            if first_miss == 0:
-                logger.info(
-                    f"[PREFETCH-DEBUG] batch_exists: FIRST key miss: {query_keys[0]}, "
-                    f"is_mla={self.is_mla_backend}, total_keys={len(query_keys)}, "
-                    f"total_blocks={self.manager.get_stats()}"
-                )
-            return first_miss // key_multiplier
-        else:
-            # Fallback to Python loop if C++ method not available
-            for i in range(len(query_keys)):
-                if not self.manager.exists(query_keys[i]):
-                    if i == 0:
-                        logger.info(
-                            f"[PREFETCH-DEBUG] batch_exists: FIRST key miss: {query_keys[0]}, "
-                            f"is_mla={self.is_mla_backend}, total_keys={len(query_keys)}, "
-                            f"total_blocks={self.manager.get_stats()}"
-                        )
-                    return i // key_multiplier
-            return len(query_keys) // key_multiplier
-
     def close(self):
-        self.manager.close()
+        if self.manager is not None:
+            self.manager.close()
+            self.manager = None
 
-    def clear(self) -> None:
-        self.manager.close()
-        # Re-create manager with same config
-        self.manager = FlatMemoryManager(self.manager.config)
-        logger.info("FlatMemoryStore cleared and re-initialized")
+    def clear(self):
+        self.close()
+        self.manager = self._manager_factory()
 
     def get_stats(self):
-        storage_metrics = StorageMetrics()
-        storage_metrics.prefetch_pgs.extend(self.prefetch_pgs)
-        storage_metrics.backup_pgs.extend(self.backup_pgs)
-        storage_metrics.prefetch_bandwidth.extend(self.prefetch_bandwidth)
-        storage_metrics.backup_bandwidth.extend(self.backup_bandwidth)
-        self.prefetch_pgs.clear()
-        self.backup_pgs.clear()
-        self.prefetch_bandwidth.clear()
-        self.backup_bandwidth.clear()
-        # FLAT_MEMORY: Include C++ level bandwidth report + storage usage for Prometheus
-        bw_report = self.manager.get_bandwidth_report()
-        stats = self.manager.get_stats()
-        bw_report["dram_used_bytes"] = stats.get("dram_used", 0)
-        bw_report["ssd_used_bytes"] = stats.get("ssd_used", 0)
-        bw_report["total_blocks"] = stats.get("total_blocks", 0)
-        # FLAT_MEMORY: Include capacity management stats (overflow/dedup/delete)
-        cap_stats = self.manager.get_capacity_stats()
-        bw_report.update(cap_stats)
-        storage_metrics.flat_memory_bandwidth = bw_report
-        return storage_metrics
+        with self._metrics_lock:
+            prefetch, self._prefetch_samples = self._prefetch_samples, []
+            backup, self._backup_samples = self._backup_samples, []
+        return make_storage_metrics(self.manager, prefetch, backup)
 
-    # ---- Flat Memory specific stats (exposed via HTTP endpoint) ----
-
-    def get_flat_memory_stats(self) -> Dict[str, Any]:
-        """Return comprehensive Flat Memory statistics including bandwidth report.
-
-        Used by bench_serving to display per-backend throughput at the end of a run.
-        """
-        storage_stats = self.manager.get_stats()
-        bandwidth_report = self.manager.get_bandwidth_report()
-        capacity_stats = self.manager.get_capacity_stats()
+    def get_flat_memory_stats(self) -> dict[str, Any]:
         return {
-            # Storage capacity / usage
-            "storage": storage_stats,
-            # Per-backend bandwidth (from C++ atomic counters)
-            "bandwidth": bandwidth_report,
-            # Capacity management (overflow/dedup/delete)
-            "capacity": capacity_stats,
+            "storage": self.manager.get_stats(),
+            "bandwidth": self.manager.get_bandwidth_report(),
+            "capacity": self.manager.get_capacity_stats(),
             "cio": self.manager.get_cio_stats(),
+            "io_window": self.manager.get_io_window(),
         }

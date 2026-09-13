@@ -338,6 +338,14 @@ def _build_dsa_device_pool_group(kvcache: Any, page_size: int) -> DevicePoolGrou
         )
     num_layers = kvcache.layer_num
     identity = {layer: layer for layer in range(num_layers)}
+    # FLAT_MEMORY: Shared-topk layers retain zero-row placeholders, not physical payloads.
+    index_layers = [
+        layer
+        for layer, buffer in enumerate(kvcache.index_k_with_scale_buffer)
+        if buffer.shape[0] > 0
+    ]
+    index_buffers = [kvcache.index_k_with_scale_buffer[layer] for layer in index_layers]
+    index_mapping = {layer: index for index, layer in enumerate(index_layers)}
     entries = [
         DevicePoolEntry(
             name=PoolName.KV,
@@ -352,13 +360,58 @@ def _build_dsa_device_pool_group(kvcache: Any, page_size: int) -> DevicePoolGrou
             name=PoolName.INDEXER,
             indices_from_pool=PoolName.KV,
             device_pool=kvcache,
-            components=[kvcache.index_k_with_scale_buffer],
-            layer_mapping=identity,
+            components=[index_buffers],
+            layer_mapping=index_mapping,
             page_size=page_size,
             rows_are_pages=True,
         ),
     ]
     return DevicePoolGroup(entries, num_layers, page_size, rank_replicated=True)
+
+
+def resolve_flat_device_pool_group(
+    *,
+    kvcache: Any,
+    page_size: int,
+    params: Any,
+    components: set[ComponentType],
+) -> DevicePoolGroup:
+    """Resolve Flat's NHD MHA baseline or the upstream DSA/V4 pool strategy."""
+    from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+    from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+
+    if type(kvcache) is MHATokenToKVPool:
+        # FLAT_MEMORY: The same MHA class can now store HND or VMM-backed pages.
+        if (
+            components != {ComponentType.FULL}
+            or kvcache.kv_cache_layout != "nhd"
+            or kvcache.post_capture_active
+            or kvcache.store_dtype not in (torch.float16, torch.bfloat16)
+        ):
+            raise ValueError("Flat MHA requires an ordinary FP16/BF16 NHD FULL pool")
+        if kvcache.page_size != page_size:
+            raise ValueError("Flat MHA pool and tree page sizes must match")
+        layers = range(kvcache.start_layer, kvcache.start_layer + kvcache.layer_num)
+        entry = DevicePoolEntry(
+            name=PoolName.KV,
+            indices_from_pool=PoolName.KV,
+            device_pool=kvcache,
+            components=[
+                [kvcache._get_key_buffer(layer) for layer in layers],
+                [kvcache._get_value_buffer(layer) for layer in layers],
+            ],
+            layer_mapping={layer: layer for layer in range(kvcache.layer_num)},
+            page_size=page_size,
+            rows_are_pages=False,
+            packed=False,
+        )
+        return DevicePoolGroup([entry], kvcache.layer_num, page_size)
+    if isinstance(kvcache, DeepSeekV4TokenToKVPool) and page_size != 256:
+        # FLAT_MEMORY: Omitting request-scoped C128 state is valid at this boundary only.
+        raise ValueError("Flat DeepSeek V4 prefix restore requires page_size=256")
+    return resolve_hybrid_device_pool_group(
+        kvcache=kvcache, page_size=page_size, params=params, components=components
+    )
 
 
 def resolve_hybrid_device_pool_group(

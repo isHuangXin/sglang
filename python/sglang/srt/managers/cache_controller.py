@@ -15,6 +15,7 @@ limitations under the License.
 
 
 import logging
+import os
 import threading
 import time
 from collections import deque
@@ -47,7 +48,11 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.mem_cache.l2_transfer import L2Transfer, L2TransferEngine
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.observability.hicache_io_metrics import (
+    HostIOMetrics,
+    host_pool_capacities,
+)
+from sglang.srt.runtime_context import get_observability, get_parallel
 from sglang.srt.utils import get_device_module
 
 logger = logging.getLogger(__name__)
@@ -424,6 +429,12 @@ class HiCacheController:
         self.ack_write_queue: List[HiCacheAck] = []
 
         self.l2_transfer_engine = L2TransferEngine(io_backend)
+        self._host_io_metrics = HostIOMetrics(
+            enabled=bool(
+                get_observability().enable_metrics
+                and torch.device(self.device).type == "cuda"
+            )
+        )
 
         # If a storage backend is provided at startup, treat it as an implicit attach,
         # so init/runtime share the same lifecycle semantics and code paths.
@@ -492,6 +503,29 @@ class HiCacheController:
     ) -> None:
         for group in groups:
             torch.distributed.all_reduce(tensor, op=op, group=group)
+
+    def collect_host_io_metrics(self) -> None:
+        self._host_io_metrics.collect()
+
+    def host_io_snapshot(self) -> dict:
+        snapshot = self._host_io_metrics.snapshot()
+        pending = len(self.load_queue) + len(self.write_queue)
+        pending += sum(
+            not ack.finish_event.query()
+            for queue in (self.ack_load_queue, self.ack_write_queue)
+            for ack in queue
+        )
+        snapshot.update(
+            pid=os.getpid(),
+            tp_rank=torch.distributed.get_rank(group=self.tp_group),
+            tp_size=torch.distributed.get_world_size(group=self.tp_group),
+            io_backend=self.io_backend,
+            pending=int(pending),
+            **host_pool_capacities(
+                host_pool=self.mem_pool_host, device_pool=self.mem_pool_device
+            ),
+        )
+        return snapshot
 
     def _start_storage_threads(self):
         """Start storage prefetch/backup threads and their queues.
@@ -816,6 +850,10 @@ class HiCacheController:
         )
 
     def reset(self):
+        self.l2_transfer_engine.device_to_host_stream.synchronize()
+        self.l2_transfer_engine.host_to_device_stream.synchronize()
+        self._host_io_metrics.reset()
+        self.layer_done_counter.reset()
         self.storage_stop_event.set()
 
         self.write_queue.clear()
@@ -887,6 +925,9 @@ class HiCacheController:
             self._l2_transfers(host_indices, device_indices, pool_transfers)
         )
 
+        self._host_io_metrics.record(
+            direction="write", completion=completion, num_bytes=self._transfer_num_bytes(op)
+        )
         self.ack_write_queue.append(
             HiCacheAck(
                 start_event=completion.start_event,
@@ -1013,6 +1054,9 @@ class HiCacheController:
             layer_num=self.layer_num,
         )
 
+        self._host_io_metrics.record(
+            direction="read", completion=completion, num_bytes=self._transfer_num_bytes(op)
+        )
         self.ack_load_queue.append(
             HiCacheAck(
                 start_event=completion.start_event,

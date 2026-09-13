@@ -41,6 +41,7 @@ from tqdm.asyncio import tqdm
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
 from sglang.benchmark.datasets import DatasetRow, get_dataset
+from sglang.benchmark.native_io_metrics import NativeIOMeasurement
 from sglang.benchmark.datasets.mooncake import get_mooncake_request_over_time
 from sglang.benchmark.utils import (
     get_tokenizer,
@@ -1577,6 +1578,25 @@ async def benchmark(
     profile_prefill_url: Optional[List[str]] = None,
     profile_decode_url: Optional[List[str]] = None,
 ):
+    collect_storage_io = getattr(args, "collect_mooncake_io_metrics", False)
+    collect_host_io = getattr(args, "collect_hicache_io_metrics", False) or collect_storage_io
+    native_io = NativeIOMeasurement(
+        base_url=base_url,
+        collect_host=collect_host_io,
+        collect_storage=collect_storage_io,
+        headers=get_auth_headers(),
+        master_host=getattr(args, "mooncake_master_host", None),
+        master_port=getattr(args, "mooncake_metrics_port", 9003),
+        client_url=(
+            f"http://{getattr(args, 'mooncake_client_host', '127.0.0.1')}:"
+            f"{getattr(args, 'mooncake_client_metrics_port', 9301)}"
+        ),
+        drain_timeout=float(os.environ.get("HICACHE_IO_DRAIN_TIMEOUT", "120")) if collect_host_io else 120.0,
+        flush_timeout=float(os.environ.get("HICACHE_FLUSH_TIMEOUT", "150")) if collect_host_io else 150.0,
+    )
+    native_io.validate(backend=backend)
+    if native_io.enabled:
+        flush_cache_timeout = max(flush_cache_timeout, native_io.flush_timeout)
     if backend in ASYNC_REQUEST_FUNCS:
         request_func = ASYNC_REQUEST_FUNCS[backend]
     else:
@@ -1712,6 +1732,7 @@ async def benchmark(
             if profile_output.success:
                 print("Profiler started")
 
+    native_io.start()
     # Run all requests
     benchmark_start_time = time.perf_counter()
     tasks: List[asyncio.Task] = []
@@ -1742,46 +1763,49 @@ async def benchmark(
 
     pbar = None if disable_tqdm else tqdm(total=pbar_total)
     benchmark_requests: List[DatasetRow] = []
-    async for request in request_generator:
-        benchmark_requests.append(request)
-        if lora_names is not None and len(lora_names) != 0:
-            if lora_request_distribution == "uniform":
-                lora_name = random.choice(lora_names)
-            elif lora_request_distribution == "distinct":
-                lora_name = lora_names[lora_idx]
-                lora_idx = (lora_idx + 1) % len(lora_names)
+    try:
+        async for request in request_generator:
+            benchmark_requests.append(request)
+            if lora_names is not None and len(lora_names) != 0:
+                if lora_request_distribution == "uniform":
+                    lora_name = random.choice(lora_names)
+                elif lora_request_distribution == "distinct":
+                    lora_name = lora_names[lora_idx]
+                    lora_idx = (lora_idx + 1) % len(lora_names)
+                else:
+                    assert (
+                        lora_request_distribution == "skewed"
+                    ), f"Unexpected lora_request_distribution: {lora_request_distribution}. Expected 'skewed'."
+                    lora_name = np.random.choice(lora_names, p=lora_probs)
             else:
-                assert (
-                    lora_request_distribution == "skewed"
-                ), f"Unexpected lora_request_distribution: {lora_request_distribution}. Expected 'skewed'."
+                lora_name = None
 
-                lora_name = np.random.choice(lora_names, p=lora_probs)
-        else:
-            lora_name = None
-
-        # Merge global extra_request_body with per-request extras
-        # Per-request parameters take precedence over global ones
-        merged_extra_body = {**extra_request_body, **request.extra_request_body}
-
-        request_func_input = RequestFuncInput(
-            model=model_id,
-            prompt=request.prompt,
-            api_url=api_url,
-            prompt_len=request.prompt_len,
-            output_len=request.output_len,
-            lora_name=lora_name,
-            image_data=request.image_data,
-            extra_request_body=merged_extra_body,
-            timestamp=request.timestamp,
-            routing_key=request.routing_key,
-        )
-
-        tasks.append(
-            asyncio.create_task(
-                limited_request_func(request_func_input=request_func_input, pbar=pbar)
+            # Merge global extra_request_body with per-request extras
+            # Per-request parameters take precedence over global ones
+            merged_extra_body = {**extra_request_body, **request.extra_request_body}
+            request_func_input = RequestFuncInput(
+                model=model_id,
+                prompt=request.prompt,
+                api_url=api_url,
+                prompt_len=request.prompt_len,
+                output_len=request.output_len,
+                lora_name=lora_name,
+                image_data=request.image_data,
+                extra_request_body=merged_extra_body,
+                timestamp=request.timestamp,
+                routing_key=request.routing_key,
             )
-        )
-    outputs: List[RequestFuncOutput] = await asyncio.gather(*tasks)
+            tasks.append(
+                asyncio.create_task(
+                    limited_request_func(request_func_input=request_func_input, pbar=pbar)
+                )
+            )
+        outputs: List[RequestFuncOutput] = await asyncio.gather(*tasks)
+    except BaseException:
+        native_io.abort()
+        raise
+    benchmark_duration = time.perf_counter() - benchmark_start_time
+    native_io.finish()
     if is_multi_turn:
         outputs = [x for output in outputs for x in output]
 
@@ -1804,7 +1828,9 @@ async def benchmark(
     if pbar is not None:
         pbar.close()
 
-    if "sglang" in backend:
+    if native_io.enabled:
+        accept_length = None
+    elif "sglang" in backend:
         server_info = requests.get(
             base_url + "/server_info", headers=get_auth_headers()
         )
@@ -1827,7 +1853,6 @@ async def benchmark(
         accept_length = None
 
     # Compute metrics and print results
-    benchmark_duration = time.perf_counter() - benchmark_start_time
     metrics, output_lens = calculate_metrics(
         input_requests=None if is_multi_turn else benchmark_requests,
         outputs=outputs,
@@ -1934,11 +1959,11 @@ async def benchmark(
         print("{s:{c}^{n}}".format(s="Transfer Metrics", n=50, c="-"))
         if metrics.avg_storage_read_latency_ms > 0:
             print("{:<40} {:<10.2f}".format(
-                "Avg SSD→Host latency (ms):", metrics.avg_storage_read_latency_ms
+                "Avg Storage→Host latency (ms):", metrics.avg_storage_read_latency_ms
             ))
         if metrics.total_storage_read_tokens > 0:
             print("{:<40} {:<10}".format(
-                "Total SSD→Host tokens:", metrics.total_storage_read_tokens
+                "Total Storage→Host tokens:", metrics.total_storage_read_tokens
             ))
         if metrics.total_d2h_tokens > 0:
             print("{:<40} {:<10}".format(
@@ -1948,9 +1973,10 @@ async def benchmark(
             print("{:<40} {:<10}".format(
                 "Total Host→Storage tokens:", metrics.total_storage_write_tokens
             ))
+    native_io.report()
     # Fetch and print Mooncake Master eviction metrics
     mooncake_eviction = {}
-    if hasattr(args, 'mooncake_master_host') and args.mooncake_master_host:
+    if hasattr(args, 'mooncake_master_host') and args.mooncake_master_host and not native_io.storage_enabled:
         mooncake_eviction = fetch_mooncake_eviction_metrics(
             master_host=args.mooncake_master_host,
             metrics_port=getattr(args, 'mooncake_metrics_port', 9003),
@@ -2004,37 +2030,13 @@ async def benchmark(
     # Fetch and print Flat Memory System per-backend stats
     flat_memory_metrics = {}
     fm_host = getattr(args, 'prefill_metrics_host', None)
-    if fm_host:
+    if fm_host and not native_io.storage_enabled:
         flat_memory_metrics = fetch_flat_memory_metrics(
             prefill_host=fm_host,
             prefill_port=getattr(args, 'prefill_metrics_port', 30000),
         )
-    # FLAT_MEMORY: For Mooncake, merge eviction data into flat_memory_metrics
-    # SSD writes happen in mooncake_client process (not SGLang), so SSD write stats
-    # from Prometheus are always 0. Use Master's eviction metrics as SSD write proxy.
-    if flat_memory_metrics and mooncake_eviction:
-        evicted_bytes = mooncake_eviction.get("evicted_size_bytes", 0)
-        evicted_keys = mooncake_eviction.get("evicted_key_count", 0)
-        if evicted_bytes > 0 and benchmark_duration > 0:
-            # SSD write bandwidth = total evicted bytes / benchmark duration
-            ssd_write_bw = evicted_bytes / (benchmark_duration * 1e9)  # GB/s
-            flat_memory_metrics["ssd_write_bw_gbps"] = ssd_write_bw
-            flat_memory_metrics["ssd_write_total_bytes"] = evicted_bytes
-            flat_memory_metrics["ssd_write_ops"] = evicted_keys
-        # SSD used = total evicted to SSD
-        if evicted_bytes > 0:
-            flat_memory_metrics["ssd_used_bytes"] = evicted_bytes
-        # DRAM used: use HICACHE_SIZE env var (GB) or default 20GB
-        hicache_gb = int(os.environ.get("HICACHE_SIZE", "20"))
-        flat_memory_metrics["dram_used_bytes"] = hicache_gb * (1024**3)
     if flat_memory_metrics:
-        # FLAT_MEMORY: Detect backend type for section header
-        hicache_storage = os.environ.get("SGLANG_HICACHE_STORAGE", "").lower()
-        if hicache_storage == "mooncake":
-            section_title = "Mooncake Storage I/O Statistics"
-        else:
-            section_title = "Flat Memory System Statistics"
-        print("{s:{c}^{n}}".format(s=section_title, n=50, c="-"))
+        print("{s:{c}^{n}}".format(s="Flat Memory System Statistics", n=50, c="-"))
         # Storage usage
         dram_used = flat_memory_metrics.get("dram_used_bytes", 0)
         ssd_used = flat_memory_metrics.get("ssd_used_bytes", 0)
@@ -2229,8 +2231,11 @@ async def benchmark(
                 print("{:<40} {:.1f}%".format(label, storage_pct))
     print("=" * 50)
 
-    resp = requests.get(base_url + "/server_info", headers=get_auth_headers())
-    server_info = resp.json() if resp.status_code == 200 else None
+    if native_io.enabled:
+        server_info = (native_io.after or native_io.before)["server_config"]
+    else:
+        resp = requests.get(base_url + "/server_info", headers=get_auth_headers())
+        server_info = resp.json() if resp.status_code == 200 else None
 
     if (
         metrics.median_ttft_ms is not None
@@ -2310,6 +2315,8 @@ async def benchmark(
             "kvcache_bandwidth": bandwidth_metrics if bandwidth_metrics else {},
             # Flat Memory System per-backend stats
             "flat_memory": flat_memory_metrics if flat_memory_metrics else {},
+            **native_io.host_metrics,
+            **native_io.storage_metrics,
         }
 
         if args.cache_report:
@@ -3081,6 +3088,11 @@ def cli_main():
         help="Number of warmup requests to run before the benchmark",
     )
     parser.add_argument(
+        "--collect-hicache-io-metrics",
+        action="store_true",
+        help="Collect completed direct HiCache Host copies across TP ranks; requires server metrics, PP1/DP1 and no PD.",
+    )
+    parser.add_argument(
         "--tokenize-prompt",
         action="store_true",
         help="Use integer ids instead of string for inputs. Useful to control prompt lengths accurately",
@@ -3207,6 +3219,18 @@ def cli_main():
 
     # Mooncake Master metrics arguments
     mooncake_metrics_group = parser.add_argument_group("mooncake master metrics arguments")
+    mooncake_metrics_group.add_argument(
+        "--collect-mooncake-io-metrics", action="store_true",
+        help="Collect native Mooncake completion counters and 100 ms SSD peaks separately from L2 copies; requires --mooncake-master-host.",
+    )
+    mooncake_metrics_group.add_argument(
+        "--mooncake-client-host", default="127.0.0.1",
+        help="Native Mooncake SSD owner's HTTP host.",
+    )
+    mooncake_metrics_group.add_argument(
+        "--mooncake-client-metrics-port", type=int, default=9301,
+        help="Native Mooncake SSD owner's HTTP port (default: 9301).",
+    )
     mooncake_metrics_group.add_argument(
         "--mooncake-master-host",
         type=str,

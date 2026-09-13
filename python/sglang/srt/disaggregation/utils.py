@@ -22,6 +22,10 @@ import torch.distributed as dist
 from sglang.srt.configs.model_config import get_dsa_index_topk
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.environ import envs
+from sglang.srt.observability.flat_memory_metrics import (
+    FLAT_PD_FIRST_SLOT,
+    encode_flat_pd_metrics,
+)
 from sglang.srt.runtime_context import (
     get_disagg,
 )
@@ -451,8 +455,8 @@ class MetadataBuffers:
 
         self.output_ids[req.metadata_buffer_index][0] = req.output_ids[0]
         # The cached_tokens buffer is (size, 16); slots 0-3 hold cached token
-        # counts and slots 4-6 are reused for multimodal prompt token counts
-        # (slots 7-15 remain spare). This avoids adding new RDMA buffers.
+        # counts and slots 4-6 hold multimodal prompt token counts.
+        # FLAT_MEMORY: Slots 7-15 carry a versioned optional metrics extension.
         # Slot map: 0=cached 1=device 2=host 3=storage 4=image 5=audio 6=video.
         self.cached_tokens[req.metadata_buffer_index][0] = req.cached_tokens
         self.cached_tokens[req.metadata_buffer_index][1] = req.cached_tokens_device
@@ -468,12 +472,7 @@ class MetadataBuffers:
         self.cached_tokens[req.metadata_buffer_index][4] = image_t
         self.cached_tokens[req.metadata_buffer_index][5] = audio_t
         self.cached_tokens[req.metadata_buffer_index][6] = video_t
-        self.cached_tokens[req.metadata_buffer_index][7] = 1
-        for slot, value in enumerate((
-            req.kvcache_page_size, req.kvcache_bytes_per_page,
-            int(req.storage_read_latency_ms * 1000), req.storage_read_tokens,
-            req.d2h_tokens, req.storage_write_tokens,
-        ), start=8):
+        for slot, value in enumerate(encode_flat_pd_metrics(req), FLAT_PD_FIRST_SLOT):
             self.cached_tokens[req.metadata_buffer_index][slot] = value
         if req.return_logprob:
             if req.logprob.output_token_logprobs_val:  # not none or empty list

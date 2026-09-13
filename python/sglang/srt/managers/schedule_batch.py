@@ -129,6 +129,11 @@ from sglang.srt.multimodal.transport.cuda_ipc import (
     DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY,
     CudaIpcTensorTransportProxy,
 )
+from sglang.srt.observability.flat_memory_metrics import (
+    FLAT_CACHE_FIELDS,
+    FLAT_PREFETCH_FIELDS,
+    finalize_flat_cache_accounting,
+)
 from sglang.srt.observability.metrics_collector import (
     DPCooperationInfo,
     SchedulerMetricsCollector,
@@ -1201,13 +1206,18 @@ class Req(ReqDllmMixin):
         self._cache_breakdown_computed = (
             False  # Track if breakdown was already computed
         )
-
-        self.kvcache_page_size = 0
-        self.kvcache_bytes_per_page = 0
-        self.storage_read_latency_ms = 0.0
-        self.d2h_tokens = 0
-        self.storage_write_tokens = 0
-        self.storage_read_tokens = 0
+        # FLAT_MEMORY: None denotes unavailable metadata, including older PD peers.
+        self.flat_storage_backend = False
+        self.flat_prefetch_stats = dict.fromkeys(
+            (*FLAT_CACHE_FIELDS, *FLAT_PREFETCH_FIELDS), None
+        )
+        self.flat_cached_tokens = dict.fromkeys(FLAT_CACHE_FIELDS, None)
+        self.kvcache_page_size: Optional[int] = None
+        self.kvcache_bytes_per_page: Optional[int] = None
+        self.storage_read_latency_ms: Optional[float] = None
+        self.storage_read_tokens: Optional[int] = None
+        self.d2h_tokens: Optional[int] = None
+        self.storage_write_tokens: Optional[int] = None
 
         # Per-request count of verification forward passes.
         self.spec_verify_ct = 0
@@ -2627,7 +2637,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                         host_hit_len=req.host_hit_length,
                         storage_hit_len=req.storage_hit_length,
                     )
-                    req.kvcache_page_size = self.tree_cache.page_size
+                    if req.flat_storage_backend:
+                        finalize_flat_cache_accounting(
+                            req, prefix_len=len(req.prefix_indices)
+                        )
                     req._cache_breakdown_computed = True
 
                 req.already_computed = seq_len

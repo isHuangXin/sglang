@@ -91,6 +91,7 @@ from sglang.srt.mem_cache.memory_pool import (
     ReqToTokenPool,
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+from sglang.srt.observability.flat_memory_metrics import decode_flat_pd_metrics
 from sglang.srt.observability.req_time_stats import (
     set_schedule_time_batch,
     set_time_batch,
@@ -2161,13 +2162,9 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         decode_req.req.mm_image_tokens = cached_tokens[4].item()
         decode_req.req.mm_audio_tokens = cached_tokens[5].item()
         decode_req.req.mm_video_tokens = cached_tokens[6].item()
-        if cached_tokens[7].item() == 1:
-            decode_req.req.kvcache_page_size = cached_tokens[8].item()
-            decode_req.req.kvcache_bytes_per_page = cached_tokens[9].item()
-            decode_req.req.storage_read_latency_ms = cached_tokens[10].item() / 1000.0
-            decode_req.req.storage_read_tokens = cached_tokens[11].item()
-            decode_req.req.d2h_tokens = cached_tokens[12].item()
-            decode_req.req.storage_write_tokens = cached_tokens[13].item()
+        # FLAT_MEMORY: Unknown versions and out-of-range fields remain unavailable.
+        for name, value in decode_flat_pd_metrics(cached_tokens.tolist()).items():
+            setattr(decode_req.req, name, value)
         if not self.spec_algorithm.is_none():
             decode_req.req.output_topk_p = output_topk_p
             decode_req.req.output_topk_index = output_topk_index

@@ -114,6 +114,10 @@ from sglang.srt.entrypoints.request_headers import apply_header_overrides
 from sglang.srt.entrypoints.warmup import execute_warmups
 from sglang.srt.environ import envs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
+from sglang.srt.managers.flat_memory_io_window import (
+    flat_io_window_response,
+    validate_flat_window_request,
+)
 from sglang.srt.managers.io_struct import (
     AbortReq,
     AttachHiCacheStorageReqInput,
@@ -124,6 +128,7 @@ from sglang.srt.managers.io_struct import (
     DestroyWeightsUpdateGroupReqInput,
     DumperControlReqInput,
     EmbeddingReqInput,
+    FlatMemoryIOWindowReq,
     GenerateReqInput,
     GetWeightsByNameReqInput,
     InitWeightsSendGroupForRemoteInstanceReqInput,
@@ -838,6 +843,25 @@ async def server_info():
             "kv_events": describe_kv_events_publisher(server_args),
         }
     )
+
+
+# FLAT_MEMORY: A window owns completed I/O across all TP ranks, not an HTTP timer.
+@app.post("/flat_memory/io_window")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def flat_memory_io_window(obj: FlatMemoryIOWindowReq):
+    try:
+        validate_flat_window_request(obj.action, obj.window_id)
+    except ValueError as exc:
+        return ORJSONResponse({"error": str(exc)}, status_code=400)
+    states = await _global_state.tokenizer_manager.get_internal_state(
+        flat_io_action=obj.action, flat_io_window_id=obj.window_id
+    )
+    try:
+        return flat_io_window_response(
+            states, action=obj.action, window_id=obj.window_id
+        )
+    except ValueError as exc:
+        return ORJSONResponse({"error": str(exc)}, status_code=409)
 
 
 @app.get("/get_load")

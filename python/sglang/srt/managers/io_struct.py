@@ -1384,7 +1384,8 @@ TokenIdsLogprobValues = Optional[List[Optional[List[Optional[List[float]]]]]]
 TokenIdsLogprobIndices = Optional[List[Optional[List[Optional[List[int]]]]]]
 HiddenStateChunk = List[Optional[Union[float, List[float]]]]
 OutputHiddenStates = Optional[List[Optional[List[HiddenStateChunk]]]]
-CachedTokensDetails = Dict[str, Union[int, str]]
+# FLAT_MEMORY: Missing telemetry is null, not a measured zero.
+CachedTokensDetails = Dict[str, Union[int, float, str, None]]
 # Serialized form of BaseFinishReason.to_json() — all values are primitives.
 FinishReasonDict = Dict[str, Optional[Union[str, int, List[int]]]]
 
@@ -2082,8 +2083,15 @@ class ScaleElasticEPReqOutput(BaseReq, kw_only=True):
     scale_phase: str = "idle"
 
 
+# FLAT_MEMORY: HTTP control uses the existing ordered internal-state fan-out.
+class FlatMemoryIOWindowReq(BaseReq, kw_only=True):
+    action: str
+    window_id: str
+
+
 class GetInternalStateReq(BaseReq, kw_only=True):
-    pass
+    flat_io_action: Optional[str] = None
+    flat_io_window_id: Optional[str] = None
 
 
 class GetInternalStateReqOutput(BaseReq, kw_only=True):

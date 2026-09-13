@@ -329,6 +329,10 @@ class GPUStorageOperation(StorageOperation):
         self.addresses = addresses or []
         self.arrival_time = time.monotonic() if arrival_time is None else arrival_time
         self.done = threading.Event()
+        self.tp_ready = False
+        self.completed_at = 0.0
+        self.ready_latency_ms = 0.0
+        self.page_media = []
         self.cancelled = False
         self.error = None
         self.start_event = torch.cuda.Event()

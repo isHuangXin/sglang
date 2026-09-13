@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Set, Union
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.observability.flat_memory_prometheus import FlatStorageMetrics
 from sglang.srt.observability.utils import exponential_buckets, generate_buckets
 from sglang.srt.runtime_context import (
     exports_expert_balancedness_to_prometheus,
@@ -1851,7 +1852,7 @@ class StorageMetrics:
     backup_pgs: List[int] = field(default_factory=list)
     prefetch_bandwidth: List[float] = field(default_factory=list)
     backup_bandwidth: List[float] = field(default_factory=list)
-    # FLAT_MEMORY: C++ level per-backend bandwidth report
+    # FLAT_MEMORY: Native medium measurements and RPC proxies remain distinct.
     flat_memory_bandwidth: Optional[Dict[str, Any]] = None
     mooncake_client_io: Optional[Dict[str, Any]] = None
 
@@ -1943,170 +1944,8 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
             labelnames=labels.keys(),
             buckets=bucket_bandwidth,
         )
-
-        # FLAT_MEMORY: Additional transfer metrics
-        bucket_latency_ms = [10, 50, 100, 250, 500, 1000, 2000, 5000, 10000]
-
-        self.histogram_prefetch_latency_ms = Histogram(
-            name="sglang:prefetch_latency_ms",
-            documentation="Histogram of SSD/DRAM prefetch latency in milliseconds.",
-            labelnames=labels.keys(),
-            buckets=bucket_latency_ms,
-        )
-
-        self.d2h_tokens_total = Counter(
-            name="sglang:d2h_tokens_total",
-            documentation="Total tokens transferred GPU HBM to Host DRAM.",
-            labelnames=labels.keys(),
-        )
-
-        self.storage_write_tokens_total = Counter(
-            name="sglang:storage_write_tokens_total",
-            documentation="Total tokens written Host DRAM to Mooncake Storage.",
-            labelnames=labels.keys(),
-        )
-
-        self.host_eviction_ops_total = Counter(
-            name="sglang:host_eviction_ops_total",
-            documentation="Total number of Host DRAM eviction operations.",
-            labelnames=labels.keys(),
-        )
-
-        self.host_eviction_tokens_total = Counter(
-            name="sglang:host_eviction_tokens_total",
-            documentation="Total tokens evicted from Host DRAM.",
-            labelnames=labels.keys(),
-        )
-
-        # FLAT_MEMORY: C++ level per-backend bandwidth gauges
-        from prometheus_client import Gauge
-
-        self.flat_memory_dram_write_bw = Gauge(
-            name="sglang:flat_memory_dram_write_bw_gbps",
-            documentation="Flat Memory DRAM write bandwidth (GB/s).",
-            labelnames=labels.keys(),
-        )
-        self.flat_memory_dram_read_bw = Gauge(
-            name="sglang:flat_memory_dram_read_bw_gbps",
-            documentation="Flat Memory DRAM read bandwidth (GB/s).",
-            labelnames=labels.keys(),
-        )
-        self.flat_memory_ssd_write_bw = Gauge(
-            name="sglang:flat_memory_ssd_write_bw_gbps",
-            documentation="Flat Memory SSD write bandwidth (GB/s).",
-            labelnames=labels.keys(),
-        )
-        self.flat_memory_ssd_read_bw = Gauge(
-            name="sglang:flat_memory_ssd_read_bw_gbps",
-            documentation="Flat Memory SSD read bandwidth (GB/s).",
-            labelnames=labels.keys(),
-        )
-        self.flat_memory_dram_write_bytes = Gauge(
-            name="sglang:flat_memory_dram_write_total_bytes",
-            documentation="Flat Memory total bytes written to DRAM.",
-            labelnames=labels.keys(),
-        )
-        self.flat_memory_dram_read_bytes = Gauge(
-            name="sglang:flat_memory_dram_read_total_bytes",
-            documentation="Flat Memory total bytes read from DRAM.",
-            labelnames=labels.keys(),
-        )
-        self.flat_memory_ssd_write_bytes = Gauge(
-            name="sglang:flat_memory_ssd_write_total_bytes",
-            documentation="Flat Memory total bytes written to SSD.",
-            labelnames=labels.keys(),
-        )
-        self.flat_memory_ssd_read_bytes = Gauge(
-            name="sglang:flat_memory_ssd_read_total_bytes",
-            documentation="Flat Memory total bytes read from SSD.",
-            labelnames=labels.keys(),
-        )
-        self.flat_memory_dram_write_ops = Gauge(
-            name="sglang:flat_memory_dram_write_ops",
-            documentation="Flat Memory DRAM write operation count.",
-            labelnames=labels.keys(),
-        )
-        self.flat_memory_dram_read_ops = Gauge(
-            name="sglang:flat_memory_dram_read_ops",
-            documentation="Flat Memory DRAM read operation count.",
-            labelnames=labels.keys(),
-        )
-        self.flat_memory_ssd_write_ops = Gauge(
-            name="sglang:flat_memory_ssd_write_ops",
-            documentation="Flat Memory SSD write operation count.",
-            labelnames=labels.keys(),
-        )
-        self.flat_memory_ssd_read_ops = Gauge(
-            name="sglang:flat_memory_ssd_read_ops",
-            documentation="Flat Memory SSD read operation count.",
-            labelnames=labels.keys(),
-        )
-        self.flat_memory_dram_used_bytes = Gauge(
-            name="sglang:flat_memory_dram_used_bytes",
-            documentation="Flat Memory DRAM used bytes.",
-            labelnames=labels.keys(),
-        )
-        self.flat_memory_ssd_used_bytes = Gauge(
-            name="sglang:flat_memory_ssd_used_bytes",
-            documentation="Flat Memory SSD used bytes.",
-            labelnames=labels.keys(),
-        )
-        self.flat_memory_total_blocks = Gauge(
-            name="sglang:flat_memory_total_blocks",
-            documentation="Flat Memory total stored blocks.",
-            labelnames=labels.keys(),
-        )
-        # FLAT_MEMORY: Capacity management statistics
-        self.flat_memory_dram_overflow_count = Gauge(
-            name="sglang:flat_memory_dram_overflow_count",
-            documentation="Flat Memory DRAM overflow events (blocks placed on SSD because DRAM full).",
-            labelnames=labels.keys(),
-        )
-        self.flat_memory_dram_overflow_bytes = Gauge(
-            name="sglang:flat_memory_dram_overflow_bytes",
-            documentation="Flat Memory DRAM overflow total bytes.",
-            labelnames=labels.keys(),
-        )
-        self.flat_memory_duplicate_key_skips = Gauge(
-            name="sglang:flat_memory_duplicate_key_skips",
-            documentation="Flat Memory duplicate key skip count.",
-            labelnames=labels.keys(),
-        )
-        self.flat_memory_delete_count = Gauge(
-            name="sglang:flat_memory_delete_count",
-            documentation="Flat Memory delete operation count.",
-            labelnames=labels.keys(),
-        )
-        self.flat_memory_delete_bytes = Gauge(
-            name="sglang:flat_memory_delete_bytes",
-            documentation="Flat Memory deleted bytes total.",
-            labelnames=labels.keys(),
-        )
-        self.flat_memory_put_failures = Gauge(
-            name="sglang:flat_memory_put_failures",
-            documentation="Flat Memory put failures (no space).",
-            labelnames=labels.keys(),
-        )
-        self.flat_memory_dram_utilization_pct = Gauge(
-            name="sglang:flat_memory_dram_utilization_pct",
-            documentation="Flat Memory DRAM utilization percentage.",
-            labelnames=labels.keys(),
-        )
-        self.flat_memory_ssd_utilization_pct = Gauge(
-            name="sglang:flat_memory_ssd_utilization_pct",
-            documentation="Flat Memory SSD utilization percentage.",
-            labelnames=labels.keys(),
-        )
-
-        self.mooncake_client_io_bytes = Gauge(
-            name="sglang:mooncake_client_io_bytes",
-            documentation="Caller-visible Mooncake RPC bytes, storage medium unknown.",
-            labelnames=[*labels, "operation"],
-        )
-        self.mooncake_client_io_ns = Gauge(
-            name="sglang:mooncake_client_io_ns",
-            documentation="Caller-visible Mooncake RPC elapsed nanoseconds.",
-            labelnames=[*labels, "operation"],
+        self.flat_metrics = FlatStorageMetrics(
+            labels=labels, counter_cls=Counter, gauge_cls=Gauge, histogram_cls=Histogram
         )
 
     def log_prefetched_tokens(self, prefetched_tokens: int):
@@ -2117,6 +1956,20 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
         if backuped_tokens > 0:
             self.backuped_tokens_total.labels(**self.labels).inc(backuped_tokens)
 
+    # FLAT_MEMORY: These are completion events, not enqueue/query events.
+    def log_prefetch_latency_ms(self, latency_ms: float):
+        self.flat_metrics.log_prefetch_latency(latency_ms)
+
+    def log_d2h_tokens(self, tokens: int):
+        self.flat_metrics.log_transfer("d2h_tokens_total", tokens)
+
+    def log_storage_write_tokens(self, tokens: int):
+        self.flat_metrics.log_transfer("storage_write_tokens_total", tokens)
+
+    def log_host_eviction(self, ops: int, tokens: int):
+        self.flat_metrics.log_transfer("host_eviction_ops_total", ops)
+        self.flat_metrics.log_transfer("host_eviction_tokens_total", tokens)
+
     def log_backup_dropped_tokens(self, dropped_tokens: int):
         if dropped_tokens > 0:
             self.backup_dropped_tokens_total.labels(**self.labels).inc(dropped_tokens)
@@ -2126,23 +1979,6 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
             self.prefetch_aux_alloc_failed_tokens_total.labels(**self.labels).inc(
                 num_tokens
             )
-    def log_prefetch_latency_ms(self, latency_ms: float):
-        if latency_ms > 0:
-            self._log_histogram(self.histogram_prefetch_latency_ms, latency_ms)
-
-    def log_d2h_tokens(self, tokens: int):
-        if tokens > 0:
-            self.d2h_tokens_total.labels(**self.labels).inc(tokens)
-
-    def log_storage_write_tokens(self, tokens: int):
-        if tokens > 0:
-            self.storage_write_tokens_total.labels(**self.labels).inc(tokens)
-
-    def log_host_eviction(self, ops: int, tokens: int):
-        if ops > 0:
-            self.host_eviction_ops_total.labels(**self.labels).inc(ops)
-        if tokens > 0:
-            self.host_eviction_tokens_total.labels(**self.labels).inc(tokens)
 
     def _log_histogram(self, histogram, data: Union[int, float]):
         histogram.labels(**self.labels).observe(data)
@@ -2152,14 +1988,6 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
             return
 
         assert isinstance(storage_metrics, StorageMetrics)
-        if storage_metrics.mooncake_client_io is not None:
-            for operation in ("read", "write"):
-                self.mooncake_client_io_bytes.labels(**self.labels, operation=operation).set(
-                    storage_metrics.mooncake_client_io[f"{operation}_bytes"]
-                )
-                self.mooncake_client_io_ns.labels(**self.labels, operation=operation).set(
-                    storage_metrics.mooncake_client_io[f"{operation}_ns"]
-                )
 
         for v in storage_metrics.prefetch_pgs:
             self._log_histogram(self.histogram_prefetch_pgs, v)
@@ -2169,39 +1997,10 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
             self._log_histogram(self.histogram_prefetch_bandwidth, v)
         for v in storage_metrics.backup_bandwidth:
             self._log_histogram(self.histogram_backup_bandwidth, v)
-        logger.debug(
-            "Storage bandwidth samples: backup=%d, prefetch=%d",
-            len(storage_metrics.backup_bandwidth),
-            len(storage_metrics.prefetch_bandwidth),
+        self.flat_metrics.log(
+            bandwidth=storage_metrics.flat_memory_bandwidth,
+            client_io=storage_metrics.mooncake_client_io,
         )
-
-        # FLAT_MEMORY: Update C++ bandwidth gauges if available
-        if storage_metrics.flat_memory_bandwidth is not None:
-            bw = storage_metrics.flat_memory_bandwidth
-            self.flat_memory_dram_write_bw.labels(**self.labels).set(bw.get("dram_write_bw_gbps", 0))
-            self.flat_memory_dram_read_bw.labels(**self.labels).set(bw.get("dram_read_bw_gbps", 0))
-            self.flat_memory_ssd_write_bw.labels(**self.labels).set(bw.get("ssd_write_bw_gbps", 0))
-            self.flat_memory_ssd_read_bw.labels(**self.labels).set(bw.get("ssd_read_bw_gbps", 0))
-            self.flat_memory_dram_write_bytes.labels(**self.labels).set(bw.get("dram_write_total_bytes", 0))
-            self.flat_memory_dram_read_bytes.labels(**self.labels).set(bw.get("dram_read_total_bytes", 0))
-            self.flat_memory_ssd_write_bytes.labels(**self.labels).set(bw.get("ssd_write_total_bytes", 0))
-            self.flat_memory_ssd_read_bytes.labels(**self.labels).set(bw.get("ssd_read_total_bytes", 0))
-            self.flat_memory_dram_write_ops.labels(**self.labels).set(bw.get("dram_write_count", 0))
-            self.flat_memory_dram_read_ops.labels(**self.labels).set(bw.get("dram_read_count", 0))
-            self.flat_memory_ssd_write_ops.labels(**self.labels).set(bw.get("ssd_write_count", 0))
-            self.flat_memory_ssd_read_ops.labels(**self.labels).set(bw.get("ssd_read_count", 0))
-            self.flat_memory_dram_used_bytes.labels(**self.labels).set(bw.get("dram_used_bytes", 0))
-            self.flat_memory_ssd_used_bytes.labels(**self.labels).set(bw.get("ssd_used_bytes", 0))
-            self.flat_memory_total_blocks.labels(**self.labels).set(bw.get("total_blocks", 0))
-            # FLAT_MEMORY: Capacity management stats
-            self.flat_memory_dram_overflow_count.labels(**self.labels).set(bw.get("dram_overflow_count", 0))
-            self.flat_memory_dram_overflow_bytes.labels(**self.labels).set(bw.get("dram_overflow_bytes", 0))
-            self.flat_memory_duplicate_key_skips.labels(**self.labels).set(bw.get("duplicate_key_skips", 0))
-            self.flat_memory_delete_count.labels(**self.labels).set(bw.get("delete_count", 0))
-            self.flat_memory_delete_bytes.labels(**self.labels).set(bw.get("delete_bytes", 0))
-            self.flat_memory_put_failures.labels(**self.labels).set(bw.get("put_failures", 0))
-            self.flat_memory_dram_utilization_pct.labels(**self.labels).set(bw.get("dram_utilization_pct", 0))
-            self.flat_memory_ssd_utilization_pct.labels(**self.labels).set(bw.get("ssd_utilization_pct", 0))
 
 
 class ExpertDispatchCollector(_StatLoggerDIMixin):

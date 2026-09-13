@@ -32,6 +32,7 @@ from sglang.srt.managers.schedule_batch import (
     Req,
 )
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
+from sglang.srt.observability.flat_memory_metrics import flat_cached_tokens_details
 from sglang.srt.runtime_context import get_observability, get_serving
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -90,10 +91,13 @@ class SchedulerOutputStreamer:
             - {"device": X, "host": Y} without storage breakdown
             - {"device": X, "host": Y, "storage": Z} with storage breakdown
         """
+        # FLAT_MEMORY: A measured cold request still has useful zero-valued details.
+        flat_details = flat_cached_tokens_details(req)
         if (
             req.cached_tokens_device > 0
             or req.cached_tokens_host > 0
             or req.cached_tokens_storage > 0
+            or flat_details
         ):
             details = {
                 "device": req.cached_tokens_device,
@@ -105,14 +109,7 @@ class SchedulerOutputStreamer:
                 details["storage"] = req.cached_tokens_storage
             if self.enable_hicache_storage():
                 details["storage_backend"] = self._get_storage_backend_type()
-            details.update(
-                page_size=req.kvcache_page_size,
-                bytes_per_page=req.kvcache_bytes_per_page,
-                storage_read_latency_ms=req.storage_read_latency_ms,
-                storage_read_tokens=req.storage_read_tokens,
-                d2h_tokens=req.d2h_tokens,
-                storage_write_tokens=req.storage_write_tokens,
-            )
+            details.update(flat_details)
             return details
 
         if req.cached_tokens > 0:

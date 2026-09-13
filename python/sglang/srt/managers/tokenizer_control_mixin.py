@@ -844,11 +844,19 @@ class TokenizerControlMixin:
         self.auto_create_handle_loop()
         await self.slow_down_communicator(obj)
 
-    async def get_internal_state(self: TokenizerManager) -> List[Dict[Any, Any]]:
+    async def get_internal_state(
+        self: TokenizerManager,
+        flat_io_action: Optional[str] = None,
+        flat_io_window_id: Optional[str] = None,
+    ) -> List[Dict[Any, Any]]:
         self.auto_create_handle_loop()
-        req = GetInternalStateReq()
-        responses: List[GetInternalStateReqOutput] = (
-            await self.get_internal_state_communicator(req)
+        # FLAT_MEMORY: Keep window control serialized with ordinary state requests.
+        req = GetInternalStateReq(
+            flat_io_action=flat_io_action, flat_io_window_id=flat_io_window_id
+        )
+        # FLAT_MEMORY: An HTTP disconnect must not let the next window consume this reply.
+        responses: List[GetInternalStateReqOutput] = await asyncio.shield(
+            self.get_internal_state_communicator(req)
         )
         # Many DP ranks
         return [res.internal_state for res in responses]

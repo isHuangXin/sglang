@@ -16,6 +16,7 @@ Usage:
 """
 
 import logging
+import os
 import time
 from typing import Any, Dict, List, Optional
 
@@ -57,9 +58,6 @@ class FlatMemoryStore(HiCacheStorage):
         )
         fm_config = FlatMemoryConfig.from_dict(extra_config)
 
-        # Create the core manager (all storage logic lives there)
-        self.manager = FlatMemoryManager(fm_config)
-
         # SGLang-specific config
         if storage_config is not None:
             self.is_mla_backend = storage_config.is_mla_model
@@ -71,6 +69,15 @@ class FlatMemoryStore(HiCacheStorage):
             self.local_rank = 0
             self.pp_rank = 0
             self.pp_size = 1
+
+        self.tp_size = storage_config.tp_size if storage_config is not None else 1
+        # FLAT_MEMORY: TP shards must not share a GPU binding or backing file.
+        if fm_config.gds_mode == "compat":
+            fm_config.gpu_id = torch.cuda.current_device()
+            fm_config.ssd_path = os.path.join(
+                fm_config.ssd_path, f"tp_rank_{self.local_rank}"
+            )
+        self.manager = FlatMemoryManager(fm_config)
 
         self.enable_pp = self.pp_size > 1
         if self.enable_pp:

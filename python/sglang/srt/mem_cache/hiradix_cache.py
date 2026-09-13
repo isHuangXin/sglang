@@ -16,6 +16,7 @@ from sglang.srt.managers.cache_controller import (
     HiCacheController,
     PrefetchOperation,
     GPUStorageOperation,
+    TieredPrefetchOperation,
 )
 from sglang.srt.mem_cache.base_prefix_cache import (
     EvictParams,
@@ -82,7 +83,8 @@ class HiRadixCache(RadixCache):
             server_args.hicache_storage_backend == "flat_memory"
             and extra_config.get("gds_mode") == "compat"
         )
-        if gpu_storage and (
+        tiered_gds = server_args.hicache_storage_backend == "mooncake" and extra_config.get("gds_mode") == "compat"
+        if (gpu_storage or tiered_gds) and (
             type(self.kv_cache) is not MHATokenToKVPool
             or server_args.pp_size != 1
             or server_args.dp_size != 1
@@ -155,6 +157,7 @@ class HiRadixCache(RadixCache):
             storage_backend_extra_config=extra_config,
             pp_rank=self.pp_rank,
             pp_size=self.pp_size,
+            enable_metrics=params.enable_metrics,
         )
         self._apply_storage_runtime_config(
             storage_backend=server_args.hicache_storage_backend,
@@ -175,9 +178,12 @@ class HiRadixCache(RadixCache):
         self.ongoing_prefetch = {}
         self.ongoing_backup = {}
         self.flat_prefetch = {}
+        self.tiered_prefetch = {}
+        self.tiered_cache_sources_by_reqid = {}
         self._flat_prefetch_stats_by_reqid = {}
         self.flat_pending_backup = set()
         self.flat_gpu_mode = self.cache_controller.flat_gpu_mode
+        self.tiered_gds_mode = self.cache_controller.tiered_gds_mode
         # track per-request tokens loaded from storage (L3 hits)
         # key: request_id, value: number of tokens actually loaded from storage
         self.prefetch_loaded_tokens_by_reqid: dict[str, int] = {}
@@ -234,6 +240,7 @@ class HiRadixCache(RadixCache):
 
         self.enable_storage = enable_storage
         self.flat_gpu_mode = enable_storage and self.cache_controller.flat_gpu_mode
+        self.tiered_gds_mode = enable_storage and self.cache_controller.tiered_gds_mode
         self.flat_memory_mode = enable_storage and storage_backend == "flat_memory"
         self.prefetch_threshold = prefetch_threshold
         self.prefetch_timeout_base = prefetch_timeout_base
@@ -279,7 +286,7 @@ class HiRadixCache(RadixCache):
         requests to avoid races.
         """
         # Validate inputs first (no side effects).
-        if self.flat_gpu_mode and hicache_write_policy not in (None, "write_through"):
+        if (self.flat_gpu_mode or self.tiered_gds_mode) and hicache_write_policy not in (None, "write_through"):
             return False, "GDS (compat) requires write_through"
         if hicache_storage_prefetch_policy is not None:
             allowed = ["best_effort", "wait_complete", "timeout"]
@@ -393,6 +400,23 @@ class HiRadixCache(RadixCache):
         if self.token_to_kv_pool_host.kv_buffer is None and not shutdown:
             return False, "GDS (compat) has no Host cache; restart to change storage modes"
         try:
+            # FLAT_MEMORY: Shutdown may run independently per rank, so drain without TP collectives.
+            if self.tiered_gds_mode:
+                cc = self.cache_controller
+                for operation in self.tiered_prefetch.values():
+                    operation.cancelled = True
+                cc.write_stream.synchronize()
+                cc.load_stream.synchronize()
+                for _, finish_event, ack_list in cc.ack_write_queue:
+                    finish_event.synchronize()
+                    for ack_id in ack_list:
+                        node = self.ongoing_write_through.pop(ack_id)
+                        self.dec_lock_ref(node)
+                        self.write_backup_storage(node)
+                cc.ack_write_queue.clear()
+                self.loading_check()
+                if not cc.backup_idle_event.wait(timeout=float(os.environ.get("HICACHE_IO_DRAIN_TIMEOUT", "120"))):
+                    raise RuntimeError("Mooncake backup did not drain before detach")
             # Drain any pending control queues before tearing down storage threads/backend.
             # IMPORTANT: this must happen before we clear `ongoing_*`, otherwise acks/releases
             # cannot be matched to nodes and may leak host pages / locks.
@@ -416,6 +440,9 @@ class HiRadixCache(RadixCache):
         self.enable_storage_metrics = False
         self.flat_gpu_mode = False
         self.cache_controller.flat_gpu_mode = False
+        self.tiered_gds_mode = False
+        self.cache_controller.tiered_gds_mode = False
+        self.tiered_cache_sources_by_reqid.clear()
         return True, "Detached HiCache storage backend successfully."
 
     def _force_release_pending_storage_ops(self):
@@ -426,6 +453,10 @@ class HiRadixCache(RadixCache):
         to these structures should happen.
         """
         cc = self.cache_controller
+        if self.tiered_gds_mode:
+            for req_id, operation in list(self.tiered_prefetch.items()):
+                operation.cancelled = True
+                self._finish_tiered_prefetch(req_id, local=True)
         if self.flat_gpu_mode:
             for req_id, operation in list(self.flat_prefetch.items()):
                 operation.cancelled = True
@@ -637,6 +668,39 @@ class HiRadixCache(RadixCache):
         )
 
     def reset(self):
+        if self.tiered_gds_mode:
+            cc = self.cache_controller
+            for operation in self.tiered_prefetch.values():
+                operation.cancelled = True
+            cc.write_stream.synchronize()
+            cc.load_stream.synchronize()
+            self.writing_check()
+            self.loading_check()
+            drained = cc.backup_idle_event.wait(timeout=float(os.environ.get("HICACHE_IO_DRAIN_TIMEOUT", "120")))
+            if not all(self._flat_gather(drained)):
+                raise RuntimeError("Mooncake backup did not drain before GDS cache reset")
+            error = None
+            try:
+                cc._stop_storage_threads()
+            except RuntimeError as exc:
+                error = str(exc)
+            errors = self._flat_gather(error)
+            if any(errors):
+                raise RuntimeError(f"Mooncake GDS workers did not drain: {errors}")
+            self._drain_storage_control_queues_local()
+            self._force_release_pending_storage_ops()
+            cc.reset()
+            self.token_to_kv_pool_host.clear()
+            self.ongoing_write_through.clear()
+            self.ongoing_load_back.clear()
+            self.ongoing_prefetch.clear()
+            self.prefetch_loaded_tokens_by_reqid.clear()
+            self.tiered_cache_sources_by_reqid.clear()
+            self._prefetch_latency_by_reqid.clear()
+            self.evictable_host_leaves.clear()
+            TreeNode.counter = 0
+            super().reset()
+            return
         if self.flat_gpu_mode:
             error = None
             try:
@@ -660,7 +724,6 @@ class HiRadixCache(RadixCache):
             self.evictable_host_leaves.clear()
             super().reset()
             return
-        TreeNode.counter = 0
         # Flush the full GPU→Host→Storage pipeline before clearing queues.
         # Pipeline: ongoing_write_through (D2H) → writing_check → backup_queue → Storage
         # Without this, flush_cache discards in-flight data at any stage.
@@ -679,8 +742,18 @@ class HiRadixCache(RadixCache):
                         self.write_backup_storage(backuped_node)
                 self.cache_controller.ack_write_queue.clear()
             # Step 2: Wait for backup_thread to finish writing all queued data to Storage.
-            self.cache_controller.backup_idle_event.wait(timeout=60.0)
+            timeout = float(os.environ.get("HICACHE_IO_DRAIN_TIMEOUT", "120"))
+            if not 0 < timeout < float("inf"):
+                raise ValueError("HICACHE_IO_DRAIN_TIMEOUT must be finite and positive")
+            drained = self.cache_controller.backup_idle_event.wait(timeout=timeout)
+            if self.tp_world_size > 1:
+                state = torch.tensor(int(drained), dtype=torch.int)
+                torch.distributed.all_reduce(state, op=torch.distributed.ReduceOp.MIN, group=self.tp_group)
+                drained = bool(state.item())
+            if not drained:
+                raise TimeoutError("Host/backup pipeline did not drain; cache reset cancelled")
             logger.info("[FLUSH] All backup writes completed, proceeding with reset.")
+        TreeNode.counter = 0
         self.cache_controller.reset()
         self.token_to_kv_pool_host.clear()
         # Clear per-request tracking dicts
@@ -1062,7 +1135,7 @@ class HiRadixCache(RadixCache):
 
         # load it all or not at all
         host_indices = torch.cat([n.host_value for n in nodes_to_load])
-        if len(host_indices) < self.load_back_threshold or (
+        if (len(host_indices) < self.load_back_threshold and not self.tiered_gds_mode) or (
             len(host_indices) > mem_quota + delta if mem_quota is not None else False
         ):
             # skip loading back if the total size is too small or exceeding the memory quota
@@ -1198,6 +1271,8 @@ class HiRadixCache(RadixCache):
         self._drain_storage_control_queues_impl(0, count, 0, True)
 
     def check_hicache_events(self):
+        if self.tiered_gds_mode:
+            self._sync_tiered_prefetch()
         if self.flat_gpu_mode:
             self._sync_flat_io()
             for req_id, operation in list(self.flat_prefetch.items()):
@@ -1289,6 +1364,9 @@ class HiRadixCache(RadixCache):
         return can_terminate
 
     def check_prefetch_progress(self, req_id: str) -> bool:
+        if self.tiered_gds_mode:
+            self._sync_tiered_prefetch()
+            return req_id not in self.tiered_prefetch
         if self.flat_gpu_mode:
             return self._finish_gpu_prefetch(req_id)
         if req_id not in self.ongoing_prefetch:
@@ -1371,6 +1449,11 @@ class HiRadixCache(RadixCache):
         return True
 
     def terminate_prefetch(self, req_id: str):
+        if self.tiered_gds_mode:
+            operation = self.tiered_prefetch.get(req_id)
+            if operation is not None:
+                operation.cancelled = True
+            return
         if self.flat_gpu_mode:
             operation = self.flat_prefetch.get(req_id)
             if operation is not None:
@@ -1383,6 +1466,9 @@ class HiRadixCache(RadixCache):
         if operation.host_indices is None:
             return
         operation.mark_terminate()
+
+    def pop_tiered_cache_sources(self, req_id: str):
+        return self.tiered_cache_sources_by_reqid.pop(req_id, [])
 
     def pop_prefetch_loaded_tokens(self, req_id: str) -> int:
         """
@@ -1623,6 +1709,195 @@ class HiRadixCache(RadixCache):
             self._flat_prefetch_stats_by_reqid[req_id] = stats
         return True
 
+    # FLAT_MEMORY: Keep tiered ownership separate from FlatCake's placement/scheduler.
+    def _prefetch_tiered_gds(self, req_id, host_anchor, tokens, last_hash, prefix_keys, full_tokens):
+        cc = self.cache_controller
+        length = len(tokens) // self.page_size * self.page_size
+        if req_id in self.tiered_prefetch or length < self.prefetch_threshold:
+            return
+        operation = TieredPrefetchOperation(req_id, list(tokens[:length]), last_hash, prefix_keys, full_tokens)
+        anchor = host_anchor
+        while anchor.evicted:
+            anchor = anchor.parent
+        self.inc_lock_ref(anchor)
+        host_anchor.protect_host()
+        operation.anchor = anchor
+        operation.host_anchor = host_anchor
+        operation.extra_key = host_anchor.key.extra_key
+        operation.prefix_offset = 0
+        node = host_anchor
+        while node.parent is not None:
+            operation.prefix_offset += len(node.key)
+            node = node.parent
+        self.tiered_prefetch[req_id] = operation
+        cc.prefetch_queue.put(operation)
+
+    def _start_tiered_read(self, operation, hit_pages):
+        cc = self.cache_controller
+        allocator = cc.mem_pool_device_allocator
+        budget = max(0, cc.prefetch_capacity_limit - cc.prefetch_tokens_occupied)
+        count = min(hit_pages * self.page_size, budget) // self.page_size * self.page_size
+        count = min(self._flat_gather(count))
+        if count < self.prefetch_threshold:
+            operation.cancelled = True
+            operation.done.set()
+            operation.submitted = True
+            return
+        host_count = 0
+        node = operation.host_anchor
+        while node.evicted:
+            host_count += len(node.key)
+            node = node.parent
+        host_counts = self._flat_gather(host_count)
+        if any(other != host_count for other in host_counts):
+            raise RuntimeError("Mooncake GDS TP Host prefixes diverged")
+        reserve = 2 * self.page_size
+        available = min(self._flat_gather(allocator.available_size()))
+        if available < host_count + count + reserve:
+            self.evict(EvictParams(num_tokens=host_count + count + reserve - available))
+        available = min(self._flat_gather(allocator.available_size()))
+        count = min(count, max(0, available - host_count - reserve)) // self.page_size * self.page_size
+        if count < self.prefetch_threshold:
+            operation.cancelled = True
+            operation.done.set()
+            operation.submitted = True
+            return
+        if host_count:
+            loaded = self.load_back(operation.host_anchor)
+            success = self._flat_gather(loaded is not None)
+            if not all(success):
+                operation.cancelled = True
+                operation.done.set()
+                operation.submitted = True
+                return
+            producer = cc.start_loading()
+            if producer >= 0:
+                cc.layer_done_counter.events[producer].finish_event.synchronize()
+            self.tiered_cache_sources_by_reqid.setdefault(operation.request_id, []).append(
+                (operation.prefix_offset - len(loaded), operation.prefix_offset, 4)
+            )
+        self.inc_lock_ref(operation.host_anchor)
+        self.dec_lock_ref(operation.anchor)
+        operation.anchor = operation.host_anchor
+        indices = allocator.alloc(count)
+        if not all(self._flat_gather(indices is not None)):
+            if indices is not None:
+                allocator.free(indices)
+            operation.cancelled = True
+            operation.done.set()
+            operation.submitted = True
+            return
+        operation.device_indices = indices
+        operation.token_ids = operation.token_ids[:count]
+        operation.hash_value = operation.hash_value[: count // self.page_size]
+        operation.start_event.record()
+        operation.submitted = True
+        self.protected_size_ += count
+        cc.prefetch_tokens_occupied += count
+        cc.prefetch_buffer.put(operation)
+
+    def _sync_tiered_prefetch(self):
+        state = [(rid, op.query_ready.is_set(), op.done.is_set(), op.cancelled,
+                  op.error, len(op.hash_value), op.completed_tokens,
+                  list(op.page_media) if op.done.is_set() else [])
+                 for rid, op in self.tiered_prefetch.items()]
+        states = self._flat_gather(state)
+        identities = [[entry[0] for entry in rank] for rank in states]
+        if any(ids != identities[0] for ids in identities):
+            raise RuntimeError("Mooncake GDS TP prefetch queues diverged")
+        for index, (rid, operation) in enumerate(list(self.tiered_prefetch.items())):
+            reports = [rank[index] for rank in states]
+            operation.cancelled = any(report[3] or report[4] for report in reports)
+            if not operation.submitted and all(report[1] for report in reports):
+                if operation.cancelled:
+                    operation.submitted = True
+                    operation.done.set()
+                else:
+                    self._start_tiered_read(operation, min(report[5] for report in reports))
+            if all(report[2] for report in reports):
+                operation.completed_tokens = min(report[6] for report in reports)
+                pages = operation.completed_tokens // self.page_size
+                if not operation.cancelled:
+                    media = [report[7] for report in reports]
+                    if all(len(rank) >= pages and all(mask in (1, 2, 3) for mask in rank[:pages]) for rank in media):
+                        operation.page_media = [0] * pages
+                        for rank in media:
+                            for page in range(pages):
+                                operation.page_media[page] |= rank[page]
+                    else:
+                        # FLAT_MEMORY: Unknown provenance must fail statistics, not valid KV reads.
+                        operation.page_media = [255] * pages
+                        logger.warning("Mooncake GDS cache source metadata is incomplete for %s", rid)
+                operation.tp_ready = True
+                self._finish_tiered_prefetch(rid)
+
+    def _finish_tiered_prefetch(self, rid, local=False):
+        operation = self.tiered_prefetch[rid]
+        if not local and not operation.tp_ready:
+            return
+        cc = self.cache_controller
+        indices = operation.device_indices
+        loaded = 0
+        source_ranges = []
+        if indices is not None:
+            self.protected_size_ -= len(indices)
+            cc.prefetch_tokens_occupied -= len(indices)
+            completed = 0 if operation.cancelled else operation.completed_tokens
+            key = RadixKey(token_ids=operation.token_ids[:completed], extra_key=operation.extra_key)
+            value = indices[:completed]
+            hashes = operation.hash_value[: completed // self.page_size]
+            node = operation.anchor
+            backup_nodes = []
+            while len(key):
+                child_key = self.get_child_key_fn(key)
+                child = node.children.get(child_key)
+                if child is None:
+                    child = TreeNode(priority=node.priority)
+                    child.parent = node
+                    child.key = key
+                    child.hash_value = hashes
+                    node.children[child_key] = child
+                length = self.key_match_fn(child.key, key)
+                if length < len(child.key):
+                    child = self._split_node(child.key, child, length)
+                if child.evicted:
+                    child.value = value[:length].clone()
+                    self.evictable_size_ += length
+                    loaded += length
+                    first_page = (completed - len(key)) // self.page_size
+                    for page in range(first_page, first_page + length // self.page_size):
+                        start = operation.prefix_offset + page * self.page_size
+                        source_ranges.append((start, start + self.page_size, operation.page_media[page]))
+                    if not child.backuped:
+                        backup_nodes.append(child)
+                else:
+                    cc.mem_pool_device_allocator.free(value[:length])
+                self._update_leaf_status(child)
+                self._update_leaf_status(node)
+                self._update_host_leaf_status(child)
+                node = child
+                key, value = key[length:], value[length:]
+                hashes = hashes[length // self.page_size :]
+            cc.mem_pool_device_allocator.free(indices[completed:])
+            # FLAT_MEMORY: L2 population follows GPU readiness without another H2D.
+            for node in backup_nodes:
+                self.write_backup(node)
+        self.dec_lock_ref(operation.anchor)
+        operation.host_anchor.release_host()
+        del self.tiered_prefetch[rid]
+        if not operation.cancelled:
+            self.tiered_cache_sources_by_reqid.setdefault(rid, []).extend(source_ranges)
+            self.prefetch_loaded_tokens_by_reqid[rid] = loaded
+            latency = (time.monotonic() - operation.start_time) * 1000
+            self._prefetch_latency_by_reqid[rid] = (latency, loaded)
+            if self.enable_storage_metrics:
+                self.storage_metrics_collector.log_prefetched_tokens(loaded)
+                self.storage_metrics_collector.log_prefetch_latency_ms(latency)
+            logger.info("MOONCAKE_GDS_PREFETCH req=%s completed_tokens=%d inserted_tokens=%d ssd_tokens=%d dram_tokens=%d latency_ms=%.3f",
+                        rid, operation.completed_tokens, loaded,
+                        sum(mask in (2, 3) for mask in operation.page_media[:operation.completed_tokens // self.page_size]) * self.page_size,
+                        operation.page_media[:operation.completed_tokens // self.page_size].count(1) * self.page_size, latency)
+
     def prefetch_from_storage(
         self,
         req_id: str,
@@ -1632,6 +1907,10 @@ class HiRadixCache(RadixCache):
         prefix_keys: Optional[List[str]] = None,
         full_token_ids: Optional[List[int]] = None,
     ):
+        if self.tiered_gds_mode:
+            self._prefetch_tiered_gds(req_id, last_host_node, new_input_tokens,
+                                     last_hash, prefix_keys, full_token_ids)
+            return
         # align the number of fetching tokens to the page size
         prefetch_length = len(new_input_tokens) - (
             len(new_input_tokens) % self.page_size
@@ -1853,8 +2132,9 @@ class HiRadixCache(RadixCache):
         return InsertResult(prefix_len=total_prefix_length)
 
     def release_aborted_request(self, rid: str):
+        self.tiered_cache_sources_by_reqid.pop(rid, None)
         self._flat_prefetch_stats_by_reqid.pop(rid, None)
-        if self.flat_gpu_mode:
+        if self.flat_gpu_mode or self.tiered_gds_mode:
             self.terminate_prefetch(rid)
             self.prefetch_loaded_tokens_by_reqid.pop(rid, None)
             self._prefetch_latency_by_reqid.pop(rid, None)

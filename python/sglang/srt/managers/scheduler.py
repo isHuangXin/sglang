@@ -2137,14 +2137,18 @@ class Scheduler(
                     req.storage_hit_length += loaded_tokens
                     for name, value in self.tree_cache.pop_flat_prefetch_stats(req.rid).items():
                         req.flat_prefetch_stats[name] += value
+                elif getattr(self.tree_cache, "tiered_gds_mode", False):
+                    req.storage_hit_length += loaded_tokens
+                    req.tiered_cache_sources.extend(self.tree_cache.pop_tiered_cache_sources(req.rid))
                 else:
                     req.storage_hit_length = loaded_tokens
                 # FLAT_MEMORY: Pop prefetch latency and token count for this request
                 latency_ms, read_tokens = self.tree_cache.pop_prefetch_latency(
                     req.rid
                 )
-                if latency_ms > 0 or not getattr(
-                    self.tree_cache, "flat_gpu_mode", False
+                if latency_ms > 0 or not (
+                    getattr(self.tree_cache, "flat_gpu_mode", False)
+                    or getattr(self.tree_cache, "tiered_gds_mode", False)
                 ):
                     req.storage_read_latency_ms = latency_ms
                     req.storage_read_tokens = read_tokens
@@ -2759,6 +2763,71 @@ class Scheduler(
             return {"error": str(errors)}
         return {"error": None}
 
+    # FLAT_MEMORY: Negotiate common boundaries without resetting another caller's window.
+    def _control_gds_io_window(self, action, window_id):
+        if not getattr(self.tree_cache, "tiered_gds_mode", False):
+            return {"error": "GDS I/O windows require Mooncake tiered GDS (compat)"}
+        controller = self.tree_cache.cache_controller
+        storage = controller.storage_backend
+        error, current = None, None
+        try:
+            ident = int(window_id)
+            if action not in ("begin", "end", "abort") or not 0 < ident < 2**63:
+                raise ValueError("Invalid GDS I/O window action or ID")
+            snapshot = storage.get_gds_io_snapshot()
+            if snapshot.get("enabled") is not True:
+                raise ValueError("GDS I/O counters are disabled")
+            current = snapshot["window"]
+            if action == "begin":
+                if current["active"] and current["id"] != ident:
+                    error = "Another GDS I/O window is active"
+                elif not current["active"] and current["id"] == ident:
+                    error = "Use a fresh ID for a new GDS I/O window"
+            elif action == "end":
+                if current["id"] != ident or current.get("aborted", False):
+                    error = "GDS I/O window owner does not match or was aborted"
+            needs_idle = (action == "begin" and not current["active"]) or (action == "end" and current["active"])
+            if needs_idle and (not self._is_no_request() or self.waiting_queue
+                               or controller.pending_backup_count or self.tree_cache.tiered_prefetch):
+                error = "GDS I/O is not idle"
+            current = {key: current[key] for key in ("id", "active", "start_ns", "end_ns")}
+        except Exception as exc:
+            error = str(exc)
+        states = self.tree_cache._flat_gather((error, current))
+        if any(state[0] for state in states):
+            return {"error": str([state[0] for state in states])}
+        windows = [state[1] for state in states]
+        if action != "abort":
+            active = [window["active"] for window in windows]
+            if any(active) and not all(active):
+                return {"error": "GDS TP window states diverged"}
+            if (all(active) or action == "end") and any(window != windows[0] for window in windows):
+                return {"error": "GDS TP window boundaries diverged"}
+            if (action == "begin" and all(active)) or (action == "end" and not any(active)):
+                return {"error": None}
+        boundary = self.tree_cache._flat_gather(storage.gds_io_clock_ns())[0]
+        try:
+            accepted = True
+            if action == "begin":
+                accepted = storage.begin_gds_io_window(window_id, boundary)
+            elif current["id"] == ident:
+                accepted = storage.end_gds_io_window(window_id, boundary, abort=action == "abort")
+            if not accepted:
+                raise RuntimeError("GDS I/O window operation was rejected")
+        except Exception as exc:
+            error = str(exc)
+        errors = self.tree_cache._flat_gather(error)
+        if any(errors):
+            if action == "begin":
+                try:
+                    owned = storage.get_gds_io_snapshot()["window"]
+                    if owned["id"] == ident:
+                        storage.end_gds_io_window(window_id, storage.gds_io_clock_ns(), abort=True)
+                except Exception:
+                    logger.exception("Could not abort a partially opened GDS I/O window")
+            return {"error": str(errors)}
+        return {"error": None}
+
     def get_internal_state(self, recv_req: GetInternalStateReq):
         ret = vars(get_global_server_args()).copy()
         ret["last_gen_throughput"] = self.last_gen_throughput
@@ -2804,6 +2873,46 @@ class Scheduler(
                 ranks = [None] * self.tree_cache.tp_world_size
                 torch.distributed.all_gather_object(ranks, snapshot, group=controller.tp_group)
             ret["flat_memory"] = {"ranks": ranks}
+
+        if recv_req.gds_io_action:
+            if getattr(self.tree_cache, "tiered_gds_mode", False):
+                self.tree_cache.check_hicache_events()
+            ret["gds_io_control"] = self._control_gds_io_window(recv_req.gds_io_action, recv_req.gds_io_window_id)
+            if ret["gds_io_control"]["error"] is None:
+                controller = self.tree_cache.cache_controller
+                snapshot = controller.storage_backend.get_gds_io_snapshot()
+                snapshot.update(
+                    tp_rank=controller.tp_rank, tp_size=controller.tp_world_size,
+                    gpu_id=controller.storage_backend.gds_device,
+                    generation=controller._host_io_generation, gds_mode="compat",
+                )
+                ranks = self.tree_cache._flat_gather(snapshot)
+                ret["gds_io"] = {"ranks": ranks}
+
+        controller = getattr(self.tree_cache, "cache_controller", None)
+        if controller is not None and not getattr(self.tree_cache, "flat_gpu_mode", False):
+            storage = getattr(controller, "storage_backend", None)
+            if hasattr(storage, "get_storage_io_snapshot") and self._is_no_request():
+                # FLAT_MEMORY: Idle sampling must advance the final D2H backup callbacks.
+                self.tree_cache.check_hicache_events()
+            snapshot = controller.host_io_snapshot()
+            snapshot["idle"] = bool(self._is_no_request() and not self.waiting_queue)
+            if hasattr(storage, "get_storage_io_snapshot"):
+                with controller.pending_backup_lock:
+                    snapshot["storage_pending"] = int(controller.pending_backup_count)
+                    snapshot["storage_pending"] += len(getattr(self.tree_cache, "tiered_prefetch", {}))
+                    snapshot["mooncake_io"] = storage.get_storage_io_snapshot()
+            tp_size = torch.distributed.get_world_size(group=controller.tp_group)
+            if tp_size < 1 or snapshot["tp_size"] != tp_size:
+                raise RuntimeError("Invalid HiCache telemetry TP group size")
+            ranks = [None] * tp_size
+            if tp_size > 1:
+                torch.distributed.all_gather_object(ranks, snapshot, group=controller.tp_group)
+            else:
+                ranks[0] = snapshot
+            if any(rank["tp_rank"] != index or rank["tp_size"] != tp_size for index, rank in enumerate(ranks)):
+                raise RuntimeError("Inconsistent HiCache telemetry TP snapshots")
+            ret["hicache_io"] = {"ranks": ranks}
 
         if not self.spec_algorithm.is_none() and self.spec_total_num_forward_ct > 0:
             ret["avg_spec_accept_length"] = (

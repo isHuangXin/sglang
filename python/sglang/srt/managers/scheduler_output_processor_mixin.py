@@ -92,11 +92,13 @@ class SchedulerOutputProcessorMixin:
 
         # Only show if there are any cached tokens
         flat_storage = getattr(self.tree_cache, "flat_gpu_mode", False)
+        tiered_gds = getattr(self.tree_cache, "tiered_gds_mode", False)
         if (
             req.cached_tokens_device > 0
             or req.cached_tokens_host > 0
             or req.cached_tokens_storage > 0
             or flat_storage
+            or tiered_gds
         ):
             details = {
                 "device": req.cached_tokens_device,
@@ -106,6 +108,9 @@ class SchedulerOutputProcessorMixin:
             if getattr(self, "enable_hicache_storage", False):
                 details["storage"] = req.cached_tokens_storage
                 details["storage_backend"] = self._get_storage_backend_type()
+            if tiered_gds:
+                details["cache_source_mode"] = "mooncake_tiered_gds"
+                details["tiered_cache"] = req.tiered_cached_tokens
             if flat_storage:
                 details.update(req.flat_cached_tokens)
                 details.update({

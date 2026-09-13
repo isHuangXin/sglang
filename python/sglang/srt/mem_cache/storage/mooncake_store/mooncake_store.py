@@ -244,6 +244,16 @@ class MooncakeStore(HiCacheStorage):
                 if storage_config
                 else None
             )
+            # FLAT_MEMORY: Tiered GDS keeps the Host cache and native offload format.
+            gds_mode = (extra_config or {}).get("gds_mode", "off")
+            if gds_mode not in ("off", "compat"):
+                raise ValueError("Mooncake gds_mode must be off or compat")
+            self.tiered_gds_mode = gds_mode == "compat"
+            self.gds_config = extra_config or {}
+            self.gds_stage_bytes = int(self.gds_config.get("gds_stage_bytes", 128 << 20))
+            if self.tiered_gds_mode and not (16 << 20) <= self.gds_stage_bytes <= (256 << 20):
+                raise ValueError("gds_stage_bytes must be between 16 and 256 MiB")
+            self._previous_gds_stats = {}
             # Load configuration with master_server_address prioritized from extra_config if available
             if extra_config is not None and (
                 extra_config.get("master_server_address") is not None
@@ -346,7 +356,7 @@ class MooncakeStore(HiCacheStorage):
                     client_hostname,
                     self.config.metadata_server,
                     per_tp_global_segment_size,
-                    DEFAULT_LOCAL_BUFFER_SIZE,  # Zero copy interface does not need local buffer
+                    self.gds_stage_bytes if self.tiered_gds_mode else DEFAULT_LOCAL_BUFFER_SIZE,
                     self.config.protocol,
                     device_name,
                     self.config.master_server_address,
@@ -471,6 +481,71 @@ class MooncakeStore(HiCacheStorage):
 
         bytes_per_page = mem_pool_host.get_ksize_per_token() * mem_pool_host.page_size
         self.gb_per_page = bytes_per_page / (1 << 30)
+
+    # FLAT_MEMORY: GPU staging matches the native per-page, all-layer K/V objects.
+    def register_mem_pool_device(self, pool):
+        from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+
+        if (type(pool) is not MHATokenToKVPool or self.is_mla_backend
+                or pool.store_dtype not in (torch.float16, torch.bfloat16)
+                or self.mem_pool_host.layout != "page_first_direct"
+                or self.config.standalone_storage or self.config.protocol != "tcp"):
+            raise ValueError("Tiered GDS requires MHA/GQA FP16/BF16, page_first_direct and TCP RealClient")
+        if not all(hasattr(self.store, name) for name in (
+            "begin_gds_io_window", "end_gds_io_window", "get_gds_io_window", "gds_io_clock_ns"
+        )):
+            raise RuntimeError("Rebuild the isolated Mooncake GDS runtime with I/O window support and restart SGLang")
+        self.mem_pool_device = pool
+        self.gds_device = torch.cuda.current_device()
+        self.gpu_page_bytes = self.mem_pool_host.get_size_per_token() * pool.page_size
+        self.gpu_batch_pages = min(
+            int(os.environ.get("SGLANG_STORAGE_READ_BATCH_SIZE", "128")),
+            (self.gds_stage_bytes // 2) // self.gpu_page_bytes,
+        )
+        if self.gpu_batch_pages < 1:
+            raise ValueError("A KV page exceeds the configured GDS staging budget")
+        self.store.enable_gds(
+            self.gds_config["gds_ssd_root"], self.gds_device,
+            int(self.gds_config.get("gds_max_io_bytes", 16 << 20)),
+        )
+        logger.info("Mooncake tiered GDS (compat): L2 Host retained; native client buffer=%d bytes, GPU pack limit=%d bytes",
+                    self.gds_stage_bytes, self.gpu_batch_pages * self.gpu_page_bytes)
+
+    def read_gpu_pages(self, keys, device_indices):
+        pool = self.mem_pool_device
+        page_size = pool.page_size
+        media = []
+        for start in range(0, len(keys), self.gpu_batch_pages):
+            batch = keys[start : start + self.gpu_batch_pages]
+            names = [f"{self.extra_backend_tag}_{key}" if self.extra_backend_tag is not None else key for key in batch]
+            names = [f"{key}_{self.mha_suffix}_{kind}" for key in names for kind in ("k", "v")]
+            packed = torch.empty(
+                (len(batch), 2, pool.layer_num, page_size, pool.head_num, pool.head_dim),
+                dtype=pool.store_dtype, device=pool.device,
+            )
+            pointers = [part.data_ptr() for part in packed.flatten(0, 1)]
+            torch.cuda.current_stream().synchronize()
+            results = self.store.batch_get_into_gpu(
+                names, pointers, [self.gpu_page_bytes // 2] * len(pointers)
+            )
+            good = next((i for i in range(len(batch)) if not all(
+                source in (1, 2) for source in results[2 * i : 2 * i + 2]
+            )), len(batch))
+            if good:
+                indices = device_indices[start * page_size : (start + good) * page_size]
+                for layer in range(pool.layer_num):
+                    actual = pool.start_layer + layer
+                    pool._get_key_buffer(actual).index_copy_(
+                        0, indices, packed[:good, 0, layer].reshape(-1, pool.head_num, pool.head_dim)
+                    )
+                    pool._get_value_buffer(actual).index_copy_(
+                        0, indices, packed[:good, 1, layer].reshape(-1, pool.head_num, pool.head_dim)
+                    )
+                torch.cuda.current_stream().synchronize()
+                media.extend(results[2 * i] | results[2 * i + 1] for i in range(good))
+            if good != len(batch):
+                break
+        return len(media) * page_size, media
 
     def _get_mha_buffer_meta(self, keys, indices):
         ptr_list, element_size_list = self.mem_pool_host.get_page_buffer_meta(indices)
@@ -767,6 +842,25 @@ class MooncakeStore(HiCacheStorage):
     def _batch_exist(self, key_strs: List[str]) -> List[int]:
         return self.store.batch_is_exist(key_strs)
 
+    # FLAT_MEMORY: Consumer cuFile windows remain separate from native owner I/O.
+    def get_gds_io_snapshot(self):
+        return self.store.get_gds_io_window()
+
+    def begin_gds_io_window(self, window_id, start_ns):
+        return self.store.begin_gds_io_window(int(window_id), start_ns)
+
+    def end_gds_io_window(self, window_id, end_ns, abort=False):
+        return self.store.end_gds_io_window(int(window_id), end_ns, abort)
+
+    def gds_io_clock_ns(self):
+        return self.store.gds_io_clock_ns()
+
+    def get_storage_io_snapshot(self):
+        try:
+            return self.store.get_storage_io_stats()
+        except (AttributeError, RuntimeError, ValueError) as error:
+            return {"enabled": False, "error": str(error)}
+
     def get_stats(self):
         storage_metrics = StorageMetrics()
         storage_metrics.prefetch_pgs.extend(self.prefetch_pgs)
@@ -783,6 +877,27 @@ class MooncakeStore(HiCacheStorage):
         self.backup_pgs.clear()
         self.prefetch_bandwidth.clear()
         self.backup_bandwidth.clear()
+
+        # FLAT_MEMORY: SSD reads now execute in each consumer, not the SSD owner.
+        if self.tiered_gds_mode:
+            stats = self.store.get_gds_stats()
+            previous = self._previous_gds_stats
+            read_bytes = stats["ssd_read_bytes"] - previous.get("ssd_read_bytes", 0)
+            read_ns = stats["ssd_read_ns"] - previous.get("ssd_read_ns", 0)
+            storage_metrics.flat_memory_bandwidth = {
+                "ssd_read_bw_gbps": read_bytes / read_ns if read_ns else 0.0,
+                "ssd_read_total_bytes": stats["ssd_read_bytes"],
+                "ssd_read_count": stats["ssd_read_ops"],
+                "dram_read_total_bytes": stats["dram_payload_bytes"],
+                "dram_write_total_bytes": self._io_stats_dram_write_bytes,
+            }
+            if stats != previous:
+                logger.info("MOONCAKE_GDS_STATS %s", json.dumps(dict(
+                    stats, tp_rank=self.local_rank, native_client_buffer_bytes=self.gds_stage_bytes,
+                    gpu_pack_limit_bytes=self.gpu_batch_pages * self.gpu_page_bytes,
+                ), sort_keys=True))
+            self._previous_gds_stats = stats
+            return storage_metrics
 
         # FLAT_MEMORY: Get per-backend I/O stats.
         # Strategy: Try C++ io_stats_ first (works when store_ is RealClient).

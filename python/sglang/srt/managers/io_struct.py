@@ -1548,9 +1548,17 @@ class FlatMemoryIOWindowReq(BaseReq):
 
 
 @dataclass
+class MooncakeGDSIOWindowReq(BaseReq):
+    action: str
+    window_id: str
+
+
+@dataclass
 class GetInternalStateReq(BaseReq):
     flat_io_action: Optional[str] = None
     flat_io_window_id: Optional[str] = None
+    gds_io_action: Optional[str] = None
+    gds_io_window_id: Optional[str] = None
 
 
 @dataclass

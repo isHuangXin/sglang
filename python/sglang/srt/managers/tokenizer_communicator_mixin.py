@@ -858,9 +858,12 @@ class TokenizerCommunicatorMixin:
         self: TokenizerManager,
         flat_io_action: Optional[str] = None,
         flat_io_window_id: Optional[str] = None,
+        gds_io_action: Optional[str] = None,
+        gds_io_window_id: Optional[str] = None,
     ) -> List[Dict[Any, Any]]:
         req = GetInternalStateReq(
-            flat_io_action=flat_io_action, flat_io_window_id=flat_io_window_id
+            flat_io_action=flat_io_action, flat_io_window_id=flat_io_window_id,
+            gds_io_action=gds_io_action, gds_io_window_id=gds_io_window_id,
         )
         responses: List[GetInternalStateReqOutput] = (
             await self.get_internal_state_communicator(req)

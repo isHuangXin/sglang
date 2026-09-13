@@ -17,6 +17,7 @@ import logging
 import os
 import threading
 import time
+from collections import deque
 from queue import Empty, Full, Queue
 from typing import TYPE_CHECKING, List, NamedTuple, Optional
 
@@ -252,6 +253,23 @@ class PrefetchOperation(StorageOperation):
         return self._terminated_flag
 
 
+# FLAT_MEMORY: Tiered reads retain native hash queries and FIFO ordering.
+class TieredPrefetchOperation(PrefetchOperation):
+    def __init__(self, request_id, token_ids, last_hash, prefix_keys, full_token_ids):
+        super().__init__(request_id, None, token_ids, last_hash, prefix_keys, full_token_ids)
+        self.query_ready = threading.Event()
+        self.done = threading.Event()
+        self.device_indices = None
+        self.submitted = False
+        self.cancelled = False
+        self.error = None
+        self.page_media = []
+        self.start_event = torch.cuda.Event()
+        self.anchor = None
+        self.host_anchor = None
+        self.tp_ready = False
+
+
 # FLAT_MEMORY: Completion owns GPU pages until the scheduler consumes it.
 class GPUStorageOperation(StorageOperation):
     def __init__(
@@ -299,6 +317,7 @@ class HiCacheController:
         storage_backend_extra_config: Optional[dict] = None,
         pp_rank: int = 0,
         pp_size: int = 1,
+        enable_metrics: bool = False,
     ):
         self.tp_group = tp_group
         self.mem_pool_device_allocator = token_to_kv_pool_allocator
@@ -311,6 +330,7 @@ class HiCacheController:
         self.storage_backend = None
         self.storage_backend_type = None
         self.flat_gpu_mode = False
+        self.tiered_gds_mode = False
         self.flat_io_errors = 0
         self.pp_rank = pp_rank
         self.pp_size = pp_size
@@ -351,6 +371,19 @@ class HiCacheController:
 
         self.write_stream = device_module.Stream()
         self.load_stream = device_module.Stream()
+        self.enable_host_io_metrics = bool(
+            enable_metrics and torch.device(self.device).type == "cuda"
+            and (self.io_backend, self.mem_pool_host.layout) in (
+                ("direct", "layer_first"), ("direct", "page_first_direct"),
+                ("kernel", "layer_first"), ("kernel", "page_first"),
+            )
+        )
+        self._host_io_generation = 0
+        self._host_io_pending = {direction: deque() for direction in ("read", "write")}
+        self._host_io_totals = {
+            direction: {"bytes": 0, "batches": 0, "elapsed_ms": 0.0}
+            for direction in ("read", "write")
+        }
 
         # If a storage backend is provided at startup, treat it as an implicit attach,
         # so init/runtime share the same lifecycle semantics and code paths.
@@ -365,6 +398,66 @@ class HiCacheController:
             except ValueError as e:
                 # Preserve the historical error shape on init for unknown backends.
                 raise ValueError(f"Failed to create storage backend: {e}") from e
+
+    def _begin_host_io(self, direction: str, num_tokens: int) -> Optional[dict]:
+        if not self.enable_host_io_metrics or self.flat_gpu_mode or num_tokens <= 0:
+            return None
+        if direction not in self._host_io_pending:
+            raise ValueError(f"Unsupported host I/O direction: {direction}")
+        stream = self.load_stream if direction == "read" else self.write_stream
+        # FLAT_MEMORY: Timing events must outlive the reused layer-completion ring.
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+        start_event.record(stream)
+        return {
+            "direction": direction,
+            "bytes": int(num_tokens * self.mem_pool_host.get_size_per_token()),
+            "start_event": start_event, "end_event": end_event,
+        }
+
+    def _finish_host_io(self, measurement: Optional[dict]) -> None:
+        if measurement is None:
+            return
+        direction = measurement["direction"]
+        stream = self.load_stream if direction == "read" else self.write_stream
+        measurement["end_event"].record(stream)
+        self._host_io_pending[direction].append(measurement)
+
+    def collect_host_io_metrics(self) -> None:
+        for direction, pending in self._host_io_pending.items():
+            while pending:
+                measurement = pending[0]
+                if not measurement["end_event"].query():
+                    break
+                elapsed_ms = float(measurement["start_event"].elapsed_time(measurement["end_event"]))
+                totals = self._host_io_totals[direction]
+                totals["bytes"] += measurement["bytes"]
+                totals["batches"] += 1
+                totals["elapsed_ms"] += elapsed_ms
+                pending.popleft()
+
+    def host_io_snapshot(self) -> dict:
+        self.collect_host_io_metrics()
+        pending = len(self.load_queue) + len(self.write_queue)
+        pending += sum(len(queue) for queue in self._host_io_pending.values())
+        if not self.enable_host_io_metrics:
+            pending += sum(
+                not ack.finish_event.query()
+                for queue in (self.ack_load_queue, self.ack_write_queue) for ack in queue
+            )
+        bytes_per_token = int(self.mem_pool_host.get_size_per_token())
+        return {
+            "enabled": bool(self.enable_host_io_metrics and not self.flat_gpu_mode),
+            "pid": os.getpid(), "generation": self._host_io_generation,
+            "tp_rank": int(torch.distributed.get_rank(group=self.tp_group)),
+            "tp_size": int(torch.distributed.get_world_size(group=self.tp_group)),
+            "io_backend": self.io_backend,
+            "host_capacity_bytes": int(self.mem_pool_host.size) * bytes_per_token,
+            "device_capacity_bytes": int(self.mem_pool_device.size) * bytes_per_token,
+            "bytes_per_token": bytes_per_token, "pending": int(pending),
+            "read": self._host_io_totals["read"].copy(),
+            "write": self._host_io_totals["write"].copy(),
+        }
 
     def _start_storage_threads(self):
         """Start storage prefetch/backup threads and their queues.
@@ -395,9 +488,59 @@ class HiCacheController:
 
         if self.flat_gpu_mode:
             self._start_flat_io_workers()
+        elif self.tiered_gds_mode:
+            self.prefetch_buffer = Queue()
+            self.prefetch_thread = threading.Thread(target=self._tiered_query_worker, daemon=True)
+            self.prefetch_io_aux_threads = [threading.Thread(target=self._tiered_io_worker, daemon=True)]
+            self.prefetch_thread.start()
+            self.prefetch_io_aux_threads[0].start()
         else:
             self.prefetch_thread.start()
         self.backup_thread.start()
+
+    # FLAT_MEMORY: Queries do not allocate GPU pages or enter TP collectives.
+    def _tiered_query_worker(self):
+        timeout = float(os.environ.get("SGLANG_BACKUP_WAIT_TIMEOUT", "10.0"))
+        while not self.storage_stop_event.is_set() or not self.prefetch_queue.empty():
+            try:
+                operation = self.prefetch_queue.get(timeout=0.1)
+            except Empty:
+                continue
+            if operation is None:
+                continue
+            try:
+                if not operation.cancelled and not self.storage_stop_event.is_set():
+                    self.backup_idle_event.wait(timeout=timeout)
+                    operation.hash_value, _ = self._storage_hit_query(operation)
+            except Exception as error:
+                operation.error = str(error)
+                logger.exception("Mooncake GDS prefix query failed")
+            finally:
+                operation.query_ready.set()
+
+    def _tiered_io_worker(self):
+        torch.cuda.set_device(self.storage_backend.gds_device)
+        stream = torch.cuda.Stream()
+        while not self.storage_stop_event.is_set() or not self.prefetch_buffer.empty():
+            try:
+                operation = self.prefetch_buffer.get(timeout=0.1)
+            except Empty:
+                continue
+            if operation is None:
+                continue
+            try:
+                if not operation.cancelled:
+                    with torch.cuda.stream(stream):
+                        stream.wait_event(operation.start_event)
+                        operation.completed_tokens, operation.page_media = self.storage_backend.read_gpu_pages(
+                            operation.hash_value, operation.device_indices
+                        )
+            except Exception as error:
+                operation.error = str(error)
+                logger.exception("Mooncake GDS prefetch failed")
+            finally:
+                stream.synchronize()
+                operation.done.set()
 
     # FLAT_MEMORY: Separate workers prevent slow SSD I/O blocking DRAM copies.
     def _start_flat_io_workers(self):
@@ -542,7 +685,7 @@ class HiCacheController:
         elif hasattr(self, "prefetch_io_aux_thread"):
             threads.append(self.prefetch_io_aux_thread)
 
-        timeout = float(os.environ.get("HICACHE_IO_DRAIN_TIMEOUT", "120")) if self.flat_gpu_mode else 10.0
+        timeout = float(os.environ.get("HICACHE_IO_DRAIN_TIMEOUT", "120")) if (self.flat_gpu_mode or self.tiered_gds_mode) else 10.0
         if not 0 < timeout < float("inf"):
             raise ValueError("HICACHE_IO_DRAIN_TIMEOUT must be finite and positive")
         deadline = time.monotonic() + timeout
@@ -576,6 +719,7 @@ class HiCacheController:
             storage_backend == "flat_memory"
             and (storage_backend_extra_config or {}).get("gds_mode") == "compat"
         )
+        tiered_gds = storage_backend == "mooncake" and (storage_backend_extra_config or {}).get("gds_mode") == "compat"
         if self.mem_pool_host.kv_buffer is None and not gpu_storage:
             raise ValueError("A metadata-only Host pool requires GDS (compat); restart to change modes")
 
@@ -615,17 +759,18 @@ class HiCacheController:
                 )
                 self.storage_backend.register_mem_pool_host(self.mem_pool_host)
                 self.flat_gpu_mode = gpu_storage
-                if self.flat_gpu_mode:
+                self.tiered_gds_mode = tiered_gds
+                if self.flat_gpu_mode or self.tiered_gds_mode:
                     if self.write_policy != "write_through":
                         raise ValueError("GDS (compat) requires write_through")
                     if self.tp_size not in (1, 4) or self.pp_size != 1:
                         raise ValueError("GDS (compat) supports TP=1/4, PP=1")
                     self.storage_backend.register_mem_pool_device(self.mem_pool_device)
             except Exception as exc:
-                if not gpu_storage:
+                if not (gpu_storage or tiered_gds):
                     raise
                 initialization_error = f"{type(exc).__name__}: {exc}"
-            if gpu_storage:
+            if gpu_storage or tiered_gds:
                 errors = [initialization_error]
                 if self.tp_size > 1:
                     errors = [None] * self.tp_size
@@ -644,6 +789,8 @@ class HiCacheController:
             self.prefetch_capacity_limit = max(
                 0, int(0.8 * (self.mem_pool_host.size - self.mem_pool_device.size))
             )
+            if self.tiered_gds_mode:
+                self.prefetch_capacity_limit = max(0, self.mem_pool_device.size - 2 * self.page_size) // self.page_size * self.page_size
             # FLAT_MEMORY: Separate read and write batch sizes.
             # - READ batch size: large (8192) so C++ BatchReadByKeys sees all ~15 buckets
             #   in a single call, enabling parallel pread via io_pool_ (4-5 GB/s).
@@ -804,6 +951,26 @@ class HiCacheController:
         )
 
     def reset(self):
+        # FLAT_MEMORY: A new cache generation cannot inherit pending copy measurements.
+        self.write_stream.synchronize()
+        self.load_stream.synchronize()
+        self.collect_host_io_metrics()
+        self._host_io_generation += 1
+        for totals in self._host_io_totals.values():
+            totals.update(bytes=0, batches=0, elapsed_ms=0.0)
+        # FLAT_MEMORY: Drain native backup and GPU reads before resetting the hierarchy.
+        if self.tiered_gds_mode:
+            self._stop_storage_threads()
+            self.write_stream.synchronize()
+            self.load_stream.synchronize()
+            self.write_queue.clear()
+            self.load_queue.clear()
+            self.ack_write_queue.clear()
+            self.ack_load_queue.clear()
+            self.layer_done_counter.reset()
+            self.storage_stop_event.clear()
+            self._start_storage_threads()
+            return
         # FLAT_MEMORY: Direct I/O uses medium workers instead of the host coordinator.
         if self.flat_gpu_mode:
             self._stop_storage_threads()
@@ -811,6 +978,7 @@ class HiCacheController:
             self.storage_stop_event.clear()
             self._start_storage_threads()
             return
+        self.layer_done_counter.reset()
         self.stop_event.set()
         self.storage_stop_event.set()
 
@@ -877,9 +1045,11 @@ class HiCacheController:
         start_event.record()
         with device_module.stream(self.write_stream):
             start_event.wait(self.write_stream)
+            measurement = self._begin_host_io("write", len(host_indices))
             self.mem_pool_host.backup_from_device_all_layer(
                 self.mem_pool_device, host_indices, device_indices, self.io_backend
             )
+            self._finish_host_io(measurement)
             finish_event.record()
             # NOTE: We must save the host indices and device indices here,
             # this is because we need to guarantee that these tensors are
@@ -940,6 +1110,7 @@ class HiCacheController:
 
         with device_module.stream(self.load_stream):
             producer_event.start_event.wait(self.load_stream)
+            measurement = self._begin_host_io("read", len(host_indices))
             for i in range(self.layer_num):
                 self.mem_pool_host.load_to_device_per_layer(
                     self.mem_pool_device,
@@ -949,6 +1120,7 @@ class HiCacheController:
                     self.io_backend,
                 )
                 producer_event.complete(i)
+            self._finish_host_io(measurement)
             # NOTE: We must save the host indices and device indices here,
             # this is because we need to guarantee that these tensors are
             # still alive when the load stream is executing.

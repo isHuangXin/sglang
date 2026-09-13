@@ -120,6 +120,29 @@ def _compute_pad_value(hash: int) -> int:
     return MM_PAD_SHIFT_VALUE + (hash % (1 << 30))
 
 
+# FLAT_MEMORY: Later reloads override earlier sources; only the consumed prefix counts.
+def tiered_cache_breakdown(prefix_len, host_hit_length, source_ranges):
+    sources = bytearray(prefix_len)
+    for start, end, medium in source_ranges:
+        start, end = max(0, start), min(prefix_len, end)
+        if start < end:
+            sources[start:end] = bytes([medium]) * (end - start)
+    if host_hit_length:
+        start = max(0, prefix_len - host_hit_length)
+        sources[start:] = bytes([4]) * (prefix_len - start)
+    l2_host = sources.count(4)
+    dram = sources.count(1)
+    mixed = sources.count(3)
+    return {
+        "device": sources.count(0),
+        "host": l2_host + dram,
+        "l2_host": l2_host,
+        "mooncake_dram": dram,
+        "ssd": sources.count(2) + mixed,
+        "mixed": mixed,
+    }
+
+
 class BaseFinishReason:
     def __init__(self, is_error: bool = False):
         self.is_error = is_error
@@ -664,6 +687,8 @@ class Req(ReqDllmMixin):
         self.host_hit_length = 0
         # Tokens loaded from storage backend (L3) during prefetch for this request
         self.storage_hit_length = 0
+        self.tiered_cache_sources: List[Tuple[int, int, int]] = []
+        self.tiered_cached_tokens: Optional[Dict[str, int]] = None
         self.flat_prefetch_stats = dict.fromkeys(
             (
                 "flat_dram", "flat_ssd", "flat_mixed",
@@ -1585,6 +1610,20 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                             name: req.flat_prefetch_stats[name]
                             for name in ("flat_dram", "flat_ssd", "flat_mixed")
                         }
+
+                    # FLAT_MEMORY: Tiered GPU reads retain both L2 and direct L3 hits.
+                    elif getattr(self.tree_cache, "tiered_gds_mode", False):
+                        req.tiered_cached_tokens = tiered_cache_breakdown(
+                            len(req.prefix_indices), req.host_hit_length,
+                            req.tiered_cache_sources,
+                        )
+                        device_portion = req.tiered_cached_tokens["device"]
+                        host_portion = req.tiered_cached_tokens["l2_host"]
+                        storage_portion = (
+                            req.tiered_cached_tokens["mooncake_dram"]
+                            + req.tiered_cached_tokens["ssd"]
+                        )
+                        req.tiered_cache_sources.clear()
 
                     req.cached_tokens_device = device_portion
                     req.cached_tokens_host = host_portion

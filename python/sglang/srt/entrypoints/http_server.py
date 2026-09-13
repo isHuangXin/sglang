@@ -107,6 +107,7 @@ from sglang.srt.managers.io_struct import (
     DumperControlReqInput,
     EmbeddingReqInput,
     FlatMemoryIOWindowReq,
+    MooncakeGDSIOWindowReq,
     GenerateReqInput,
     GetWeightsByNameReqInput,
     InitWeightsSendGroupForRemoteInstanceReqInput,
@@ -623,6 +624,22 @@ async def flat_memory_io_window(obj: FlatMemoryIOWindowReq):
     if any(errors) or len(states) != 1:
         return ORJSONResponse({"error": str(errors)}, status_code=409)
     return {"ranks": states[0]["flat_memory"]["ranks"]}
+
+
+@app.post("/mooncake/gds_io_window")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def mooncake_gds_io_window(obj: MooncakeGDSIOWindowReq):
+    if (obj.action not in ("begin", "end", "abort") or not obj.window_id.isascii()
+            or not obj.window_id.isdecimal() or not 1 <= len(obj.window_id) <= 19
+            or not 0 < int(obj.window_id) < 2**63):
+        return ORJSONResponse({"error": "Invalid GDS I/O window action or ID"}, status_code=400)
+    states = await _global_state.tokenizer_manager.get_internal_state(
+        gds_io_action=obj.action, gds_io_window_id=obj.window_id
+    )
+    errors = [state.get("gds_io_control", {}).get("error", "Missing GDS I/O control") for state in states]
+    if len(states) != 1 or any(errors):
+        return ORJSONResponse({"error": str(errors)}, status_code=409)
+    return {"ranks": states[0]["gds_io"]["ranks"]}
 
 
 @app.get("/get_load")

@@ -883,11 +883,6 @@ class HiRadixCache(RadixCache):
         ):
             return 0
 
-        if self.enable_storage:
-            with self.cache_controller.pending_backup_lock:
-                self.cache_controller.pending_backup_count += 1
-                self.cache_controller.backup_idle_event.clear()
-
         host_indices = self.cache_controller.write(
             device_indices=node.value,
             node_id=node.id,
@@ -912,12 +907,6 @@ class HiRadixCache(RadixCache):
             if self.enable_storage_metrics:
                 self.storage_metrics_collector.log_d2h_tokens(len(host_indices))
         else:
-            # Host alloc failed — decrement pipeline counter
-            if self.enable_storage:
-                with self.cache_controller.pending_backup_lock:
-                    self.cache_controller.pending_backup_count -= 1
-                    if self.cache_controller.pending_backup_count == 0:
-                        self.cache_controller.backup_idle_event.set()
             return 0
 
         return len(host_indices)
@@ -965,6 +954,7 @@ class HiRadixCache(RadixCache):
             self.write_backup_storage(lock_node, backup_len)
         if release_lock:
             self.dec_lock_ref(lock_node)
+        self.cache_controller._complete_storage_d2h(ack_id)
 
     def write_backup_storage(self, node: TreeNode, backup_len: Optional[int] = None):
         # Recover pre-split data via walk-and-concat if node was split.
@@ -996,7 +986,9 @@ class HiRadixCache(RadixCache):
         self._storage_write_total_tokens += len(node.host_value)
         self._storage_write_total_ops += 1
         if self.enable_storage_metrics:
-            self.storage_metrics_collector.log_storage_write_tokens(len(node.host_value))
+            self.storage_metrics_collector.log_storage_write_tokens(
+                len(node.host_value)
+            )
 
     def _concat_split_chain(self, node: TreeNode, backup_len: int):
         """Recover enqueue-time key/hash/host by walking the split chain."""
@@ -1791,6 +1783,7 @@ class HiRadixCache(RadixCache):
         """Storage prefetch miss markers are not tracked on the dense path;
         the scheduler's paced availability-check retry is inert here."""
         return False
+
     def pop_prefetch_latency(self, req_id: str) -> tuple:
         """
         Pop and return (latency_ms, completed_tokens) for a request's prefetch.
@@ -1813,7 +1806,6 @@ class HiRadixCache(RadixCache):
             "host_eviction_total_ops": self._host_eviction_total_ops,
             "page_size": self.page_size,
         }
-
 
     def match_prefix(self, params: MatchPrefixParams):
         if self.disable:
@@ -1872,7 +1864,9 @@ class HiRadixCache(RadixCache):
         prefetch_key = prefetch_key.page_aligned(self.page_size)
         prefetch_length = len(prefetch_key)
         rate_limited = self.cache_controller.prefetch_rate_limited()
-        logger.debug("Storage prefetch: tokens=%d, limited=%s", prefetch_length, rate_limited)
+        logger.debug(
+            "Storage prefetch: tokens=%d, limited=%s", prefetch_length, rate_limited
+        )
         if (
             not self.enable_storage
             or prefetch_length < self.prefetch_threshold

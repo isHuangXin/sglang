@@ -4616,6 +4616,7 @@ class Scheduler(
             # destructive operations like attach/detach/flush_cache.
             if self.enable_hierarchical_cache and include_storage:
                 tc = self.tree_cache
+                idle &= tc.cache_controller.pending_storage_io() == 0
                 idle &= len(tc.ongoing_write_through) == 0
                 idle &= len(tc.ongoing_load_back) == 0
                 if tc.enable_storage:
@@ -4753,9 +4754,13 @@ class Scheduler(
                 else:
                     timeout = envs.HICACHE_IO_DRAIN_TIMEOUT.get()
                     if not 0 < timeout < float("inf"):
-                        raise ValueError("HICACHE_IO_DRAIN_TIMEOUT must be finite and positive")
+                        raise ValueError(
+                            "HICACHE_IO_DRAIN_TIMEOUT must be finite and positive"
+                        )
                     if not drain_hicache_io(cache=self.tree_cache, timeout=timeout):
-                        logger.error("Cache flush cancelled: native HiCache I/O did not drain")
+                        logger.error(
+                            "Cache flush cancelled: native HiCache I/O did not drain"
+                        )
                         return False
             try:
                 self.tree_cache.reset()
@@ -4814,7 +4819,10 @@ class Scheduler(
         )
         ret["startup_time"] = self.startup_time
         ret["effective_max_running_requests_per_dp"] = self.max_running_requests
-        if self.enable_hierarchical_cache and self.tree_cache.cache_controller is not None:
+        if (
+            self.enable_hierarchical_cache
+            and self.tree_cache.cache_controller is not None
+        ):
             from sglang.srt.managers.hicache_io_state import collect_hicache_io_state
 
             ret["hicache_io"] = collect_hicache_io_state(
@@ -5656,6 +5664,7 @@ def run_scheduler_process(
             # Graceful path only: on the exception path the GPU may be wedged
             # and the synchronize() in destroy() could itself hang.
             if scheduler.gracefully_exit:
+                scheduler.profiler_manager.close()
                 scheduler.release_host_resources()
 
 

@@ -572,10 +572,16 @@ class HybridCacheController(BaseHiCacheController):
             prefix_keys=prefix_keys,
             pool_transfers=extra_pools,
         )
-        self.backup_queue.put(operation)
+        self._enqueue_storage_operation(operation)
         return operation.id
 
     def _storage_hit_query(self, operation) -> tuple[list[str], int]:
+        if not operation.pool_transfers:
+            hash_values, hit_tokens = super()._storage_hit_query(operation)
+            operation.pool_storage_result.update_kv_hit_pages(
+                hit_tokens // self.page_size
+            )
+            return hash_values, hit_tokens
         hash_value = self.get_hash_str(
             operation.token_ids, operation.last_hash, page_size=self.page_size
         )
@@ -584,15 +590,9 @@ class HybridCacheController(BaseHiCacheController):
         extra_info = HiCacheStorageExtraInfo(
             prefix_keys=operation.prefix_keys.copy() if operation.prefix_keys else None
         )
-        if operation.pool_transfers:
-            hit_result = self.storage_backend.batch_exists_v2(
-                hash_value, operation.pool_transfers, extra_info
-            )
-        else:
-            kv_hit_count = self.storage_backend.batch_exists(hash_value, extra_info)
-            hit_result = PoolTransferResult(
-                kv_hit_pages=kv_hit_count, extra_pool_hit_pages={}
-            )
+        hit_result = self.storage_backend.batch_exists_v2(
+            hash_value, operation.pool_transfers, extra_info
+        )
 
         kv_hit_pages = hit_result.kv_hit_pages
         operation.pool_storage_result.update_kv_hit_pages(kv_hit_pages)
@@ -737,21 +737,8 @@ class HybridCacheController(BaseHiCacheController):
         return False
 
     def backup_thread_func(self):
-        """Back up rank-sharded sidecars on every TP rank.
-
-        The base implementation skips the entire operation on non-zero MLA TP
-        ranks. That optimization is valid for replicated MLA KV, but not for
-        hybrid rank-sharded pools such as Kimi-K3 Mamba state.
-        """
-        while not self.storage_stop_event.is_set():
-            try:
-                operation = self.backup_queue.get(block=True, timeout=1)
-                if operation is None:
-                    continue
-                self._page_backup(operation)
-                self.ack_backup_queue.put(operation)
-            except Empty:
-                continue
+        """Use ordered completion ownership while retaining per-rank sidecar writes."""
+        super().backup_thread_func()
 
     def _resolve_sidecar_kv_derived_pool_transfers(self, operation):
         for transfer in operation.pool_transfers:

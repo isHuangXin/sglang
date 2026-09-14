@@ -24,8 +24,7 @@ def pending_hicache_operations(cache) -> int:
     controller = cache.cache_controller
     if controller is not None:
         pending += len(controller.write_queue) + len(controller.load_queue)
-        if controller.enable_storage:
-            pending += controller.backup_queue.qsize()
+        pending += controller.pending_storage_io()
     return pending
 
 

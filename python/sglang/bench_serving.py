@@ -2403,10 +2403,14 @@ def summarize_flat_cache(outputs, total_prompt_tokens):
     return result
 
 
-def _flat_rank_map(snapshot):
+# FLAT_MEMORY: Snapshot length cannot distinguish smaller TP from missing ranks.
+def _flat_rank_map(snapshot, tp_size):
+    tp_size = _flat_counter(tp_size)
+    if not tp_size:
+        raise ValueError("Flat I/O requires a positive server TP size")
     ranks = snapshot["ranks"]
-    if not isinstance(ranks, list) or len(ranks) != 4:
-        raise ValueError("Flat I/O requires all four TP rank snapshots")
+    if not isinstance(ranks, list) or len(ranks) != tp_size:
+        raise ValueError(f"Flat I/O requires all {tp_size} TP rank snapshots")
     mapped = {}
     for rank in ranks:
         tp_rank = _flat_counter(rank["tp_rank"])
@@ -2414,7 +2418,7 @@ def _flat_rank_map(snapshot):
             raise ValueError("Duplicate TP rank or invalid PID")
         _flat_counter(rank["gpu_id"])
         mapped[tp_rank] = rank
-    if set(mapped) != set(range(4)) or len({r["pid"] for r in ranks}) != 4:
+    if set(mapped) != set(range(tp_size)) or len({r["pid"] for r in ranks}) != tp_size:
         raise ValueError("Incomplete or duplicate Flat TP identities")
     return mapped
 
@@ -2426,8 +2430,8 @@ _FLAT_WINDOW_COUNTERS = (
 )
 
 
-def _validate_flat_window(snapshot, window_id, active):
-    ranks = _flat_rank_map(snapshot)
+def _validate_flat_window(snapshot, window_id, active, tp_size):
+    ranks = _flat_rank_map(snapshot, tp_size)
     boundaries = set()
     for rank in ranks.values():
         window = rank["io_window"]
@@ -2460,9 +2464,9 @@ def _validate_flat_window(snapshot, window_id, active):
     return ranks, next(iter(boundaries))
 
 
-def summarize_flat_io(before, after, window_id):
-    first, (start, _) = _validate_flat_window(before, window_id, True)
-    last, (end_start, end) = _validate_flat_window(after, window_id, False)
+def summarize_flat_io(before, after, window_id, tp_size):
+    first, (start, _) = _validate_flat_window(before, window_id, True, tp_size)
+    last, (end_start, end) = _validate_flat_window(after, window_id, False, tp_size)
     if start != end_start:
         raise ValueError("Flat begin/end window start mismatch")
     seconds = (end - start) / 1e9
@@ -2528,6 +2532,7 @@ class FlatMemoryIOWindow:
         self.window_id = str(uuid.uuid4())
         self.begin_attempted = False
         self.ready = False
+        self.tp_size = None
         self.result = dict.fromkeys((
             "flat_io_window_seconds", "flat_dram_read_bw_gbps",
             "flat_dram_write_bw_gbps", "flat_ssd_read_bw_gbps",
@@ -2565,7 +2570,14 @@ class FlatMemoryIOWindow:
         deadline = time.monotonic() + timeout
         while True:
             info = await self._request()
-            ranks = _flat_rank_map(info["internal_states"][0]["flat_memory"])
+            tp_size = _flat_counter(info["tp_size"])
+            if self.tp_size is None:
+                self.tp_size = tp_size
+            elif self.tp_size != tp_size:
+                raise ValueError("Flat TP size changed during collection")
+            ranks = _flat_rank_map(
+                info["internal_states"][0]["flat_memory"], self.tp_size
+            )
             pending = sum(
                 _flat_counter(rank[name])
                 for rank in ranks.values()
@@ -2600,7 +2612,7 @@ class FlatMemoryIOWindow:
                 self.begin_attempted = True
                 before = await self._request("begin")
                 self.result["flat_io_metadata"]["before"] = before
-                _validate_flat_window(before, self.window_id, True)
+                _validate_flat_window(before, self.window_id, True, self.tp_size)
                 self.ready = True
             except Exception as exc:
                 self._unavailable(exc)
@@ -2619,7 +2631,10 @@ class FlatMemoryIOWindow:
                     after = await self._request("end")
                     self.result["flat_io_metadata"]["after"] = after
                     metrics = summarize_flat_io(
-                        self.result["flat_io_metadata"]["before"], after, self.window_id
+                        self.result["flat_io_metadata"]["before"],
+                        after,
+                        self.window_id,
+                        self.tp_size,
                     )
                     self.result.update(metrics, flat_io_status="ok", flat_io_error=None)
                     self.begin_attempted = False

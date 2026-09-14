@@ -3099,6 +3099,20 @@ class Scheduler(
             del self.sessions[session_id]
 
     def maybe_sleep_on_idle(self):
+        if (
+            self.tp_size == 1
+            and self.disaggregation_mode == DisaggregationMode.NULL
+            and getattr(self.tree_cache, "flat_gpu_mode", False)
+        ):
+            if any(
+                not operation.done.is_set()
+                for operation in self.tree_cache.flat_prefetch.values()
+            ) or self.tree_cache.cache_controller.pending_backup_count > 0:
+                # FLAT_MEMORY: Release the GIL so background GPU I/O can progress.
+                time.sleep(0.001)
+                return
+            if self.tree_cache.flat_prefetch or self.tree_cache.ongoing_backup:
+                return
         if self.idle_sleeper is not None:
             self.idle_sleeper.maybe_sleep()
 

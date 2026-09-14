@@ -1537,6 +1537,7 @@ class UnifiedRadixCache(BasePrefixCache):
     def _finish_write_through_ack(self, ack_id: int) -> None:
         if self.buffer_pipeline is not None:
             self.buffer_pipeline.finish_backup_ack(ack_id)
+            self.cache_controller._complete_storage_d2h(ack_id)
             return
 
         lock_node_id, lock_params, publish_node_ids = self.ongoing_write_through.pop(
@@ -1550,8 +1551,7 @@ class UnifiedRadixCache(BasePrefixCache):
             # suffix; the prefix fragment must be persisted as well.
             for node_id in publish_node_ids:
                 self.write_backup_storage(node_id)
-        if self.tiered_runtime is not None:
-            self.cache_controller.finish_tiered_host_backup()
+        self.cache_controller._complete_storage_d2h(ack_id)
 
     def load_back(
         self,

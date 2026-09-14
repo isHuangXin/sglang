@@ -4592,7 +4592,7 @@ class Scheduler(
         # sleep until next event
         self.maybe_sleep_on_idle()
 
-    def is_fully_idle(self, for_health_check=False) -> bool:
+    def is_fully_idle(self, for_health_check=False, include_storage=True) -> bool:
         # Health check piggybacks on running requests in process_output.
         # Only running_batch + waiting_queue guarantee active GPU processing;
         # disagg queues (bootstrap/prealloc/transfer) may have items without
@@ -4640,8 +4640,9 @@ class Scheduler(
 
             # HiCache: in-flight async ops (GPU↔Host↔L3) must drain before
             # destructive operations like attach/detach/flush_cache.
-            if self.enable_hierarchical_cache:
+            if self.enable_hierarchical_cache and include_storage:
                 tc = self.tree_cache
+                idle &= tc.cache_controller.pending_storage_io() == 0
                 idle &= len(tc.ongoing_write_through) == 0
                 idle &= len(tc.ongoing_load_back) == 0
                 if tc.enable_storage:
@@ -4778,10 +4779,33 @@ class Scheduler(
 
     def flush_cache(self, empty_cache: bool = True):
         """Flush memory pools (e.g., KV cache, Mamba cache) and optionally empty device allocator cache."""
-        if self.is_fully_idle():
+        if self.is_fully_idle(include_storage=False):
+            if self.enable_hierarchical_cache:
+                from sglang.srt.managers.hicache_io_state import drain_hicache_io
+
+                controller = self.tree_cache.cache_controller
+                cp_size = controller.get_attn_cp_rank_and_size()[1]
+                if get_parallel().pp_size != 1 or cp_size != 1:
+                    if not self.is_fully_idle():
+                        return False
+                else:
+                    timeout = envs.HICACHE_IO_DRAIN_TIMEOUT.get()
+                    if not 0 < timeout < float("inf"):
+                        raise ValueError(
+                            "HICACHE_IO_DRAIN_TIMEOUT must be finite and positive"
+                        )
+                    if not drain_hicache_io(cache=self.tree_cache, timeout=timeout):
+                        logger.error(
+                            "Cache flush cancelled: native HiCache I/O did not drain"
+                        )
+                        return False
+            try:
+                self.tree_cache.reset()
+            except (TimeoutError, RuntimeError) as exc:
+                logger.error("Cache flush cancelled before releasing pools: %s", exc)
+                return False
             self.cur_batch_for_debug = None
             self.last_batch = None
-            self.tree_cache.reset()
             self.req_to_token_pool.clear()
             self.token_to_kv_pool_allocator.clear()
             self.req_to_token_pool.reset_aux_cache_allocator()
@@ -4877,12 +4901,11 @@ class Scheduler(
         snapshot["idle"] = idle
         snapshot["storage_pending"] = 0
         if controller.enable_storage:
-            with controller.pending_backup_lock:
-                snapshot["storage_pending"] = controller.pending_backup_count + len(
-                    self.tree_cache.tiered_prefetch
-                )
-                if isinstance(storage, MooncakeStore):
-                    snapshot["mooncake_io"] = storage.get_storage_io_snapshot()
+            snapshot["storage_pending"] = controller.pending_storage_io() + len(
+                self.tree_cache.tiered_prefetch
+            )
+            if isinstance(storage, MooncakeStore):
+                snapshot["mooncake_io"] = storage.get_storage_io_snapshot()
         ranks = self.tree_cache._tiered_gather(snapshot)
         if any(
             rank["tp_rank"] != index or rank["tp_size"] != len(ranks)
@@ -5753,6 +5776,7 @@ def run_scheduler_process(
             # Graceful path only: on the exception path the GPU may be wedged
             # and the synchronize() in destroy() could itself hang.
             if scheduler.gracefully_exit:
+                scheduler.profiler_manager.close()
                 scheduler.release_host_resources()
 
 

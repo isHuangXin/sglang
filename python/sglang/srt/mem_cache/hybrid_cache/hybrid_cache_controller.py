@@ -388,18 +388,8 @@ class HybridCacheController(BaseHiCacheController):
                 pool_transfers=pool_transfers or None,
             )
         )
-        if self.tiered_gds_mode and self.tiered_runtime_managed:
-            with self.pending_backup_lock:
-                self.pending_backup_count += 1
-                self.backup_idle_event.clear()
         self.start_writing()
         return host_indices
-
-    def finish_tiered_host_backup(self):
-        with self.pending_backup_lock:
-            self.pending_backup_count -= 1
-            if self.pending_backup_count == 0:
-                self.backup_idle_event.set()
 
     def _move_op_indices(
         self, op: CacheOperation
@@ -647,14 +637,16 @@ class HybridCacheController(BaseHiCacheController):
             prefix_keys=prefix_keys,
             pool_transfers=extra_pools,
         )
-        if self.tiered_gds_mode and self.tiered_runtime_managed:
-            with self.pending_backup_lock:
-                self.pending_backup_count += 1
-                self.backup_idle_event.clear()
-        self.backup_queue.put(operation)
+        self._enqueue_storage_operation(operation)
         return operation.id
 
     def _storage_hit_query(self, operation) -> tuple[list[str], int]:
+        if not operation.pool_transfers:
+            hash_values, hit_tokens = super()._storage_hit_query(operation)
+            operation.pool_storage_result.update_kv_hit_pages(
+                hit_tokens // self.page_size
+            )
+            return hash_values, hit_tokens
         hash_value = self.get_hash_str(
             operation.token_ids, operation.last_hash, page_size=self.page_size
         )
@@ -663,15 +655,9 @@ class HybridCacheController(BaseHiCacheController):
         extra_info = HiCacheStorageExtraInfo(
             prefix_keys=operation.prefix_keys.copy() if operation.prefix_keys else None
         )
-        if operation.pool_transfers:
-            hit_result = self.storage_backend.batch_exists_v2(
-                hash_value, operation.pool_transfers, extra_info
-            )
-        else:
-            kv_hit_count = self.storage_backend.batch_exists(hash_value, extra_info)
-            hit_result = PoolTransferResult(
-                kv_hit_pages=kv_hit_count, extra_pool_hit_pages={}
-            )
+        hit_result = self.storage_backend.batch_exists_v2(
+            hash_value, operation.pool_transfers, extra_info
+        )
 
         kv_hit_pages = hit_result.kv_hit_pages
         operation.pool_storage_result.update_kv_hit_pages(kv_hit_pages)
@@ -816,36 +802,8 @@ class HybridCacheController(BaseHiCacheController):
         return False
 
     def backup_thread_func(self):
-        """Back up rank-sharded sidecars on every TP rank.
-
-        The base implementation skips the entire operation on non-zero MLA TP
-        ranks. That optimization is valid for replicated MLA KV, but not for
-        hybrid rank-sharded pools such as Kimi-K3 Mamba state.
-        """
-        tracked = self.tiered_gds_mode and self.tiered_runtime_managed
-        while not self.storage_stop_event.is_set() or (
-            tracked and not self.backup_queue.empty()
-        ):
-            try:
-                operation = self.backup_queue.get(block=True, timeout=1)
-            except Empty:
-                continue
-            if operation is None:
-                continue
-            try:
-                self._page_backup(operation)
-            except Exception:
-                if not tracked:
-                    raise
-                operation.completed_tokens = 0
-                logger.exception("Mooncake Host backup failed")
-            finally:
-                self.ack_backup_queue.put(operation)
-                if tracked:
-                    with self.pending_backup_lock:
-                        self.pending_backup_count -= 1
-                        if self.pending_backup_count == 0:
-                            self.backup_idle_event.set()
+        """Use ordered completion ownership while retaining per-rank sidecar writes."""
+        super().backup_thread_func()
 
     def _resolve_sidecar_kv_derived_pool_transfers(self, operation):
         for transfer in operation.pool_transfers:

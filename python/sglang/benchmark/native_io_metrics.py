@@ -19,6 +19,44 @@ def _auth_headers(headers):
     return {"Authorization": token} if token else {}
 
 
+def sanitize_server_info(info: dict | None) -> dict | None:
+    """Keep scalar benchmark configuration, not credentials or runtime state."""
+    if not isinstance(info, dict):
+        return None
+    fields = (
+        "model_path",
+        "served_model_name",
+        "dtype",
+        "kv_cache_dtype",
+        "tp_size",
+        "pp_size",
+        "dp_size",
+        "disable_radix_cache",
+        "enable_hierarchical_cache",
+        "hicache_size",
+        "hicache_ratio",
+        "hicache_write_policy",
+        "hicache_io_backend",
+        "hicache_mem_layout",
+        "hicache_storage_backend",
+        "disaggregation_mode",
+        "context_length",
+        "max_total_num_tokens",
+        "max_req_input_len",
+        "mem_fraction_static",
+        "chunked_prefill_size",
+        "max_running_requests",
+        "stream_interval",
+        "version",
+    )
+    return {
+        name: info[name]
+        for name in fields
+        if name in info
+        and (info[name] is None or type(info[name]) in (str, bool, int, float))
+    }
+
+
 def fetch_hicache_io_snapshot(
     base_url: str, timeout: float = 120.0, *, headers=None
 ) -> dict:
@@ -138,35 +176,9 @@ def fetch_hicache_io_snapshot(
             and rank.get("storage_pending", 0) == 0
             for rank in ranks
         ):
-            fields = (
-                "model_path",
-                "served_model_name",
-                "dtype",
-                "kv_cache_dtype",
-                "tp_size",
-                "pp_size",
-                "dp_size",
-                "disable_radix_cache",
-                "enable_hierarchical_cache",
-                "hicache_size",
-                "hicache_ratio",
-                "hicache_write_policy",
-                "hicache_io_backend",
-                "hicache_mem_layout",
-                "hicache_storage_backend",
-                "disaggregation_mode",
-                "context_length",
-                "max_total_num_tokens",
-                "max_req_input_len",
-                "mem_fraction_static",
-                "chunked_prefill_size",
-                "max_running_requests",
-                "stream_interval",
-                "version",
-            )
             return {
                 "sampled_at": time.perf_counter(),
-                "server_config": {name: info[name] for name in fields if name in info},
+                "server_config": sanitize_server_info(info),
                 "ranks": sorted(ranks, key=lambda rank: rank["tp_rank"]),
             }
         time.sleep(min(0.05, max(0.0, deadline - time.perf_counter())))

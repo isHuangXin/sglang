@@ -66,6 +66,7 @@ from sglang.benchmark.native_io_metrics import (
     fetch_mooncake_storage_capacity as fetch_mooncake_storage_capacity,
     print_gds_io_metrics as print_gds_io_metrics,
     print_mooncake_io_metrics as print_mooncake_io_metrics,
+    sanitize_server_info,
     unavailable_gds_io_metrics as unavailable_gds_io_metrics,
     unavailable_mooncake_io_metrics as unavailable_mooncake_io_metrics,
     validate_gds_io_window as validate_gds_io_window,
@@ -1948,7 +1949,7 @@ async def benchmark(
             "random_output_len": args.random_output_len,
             "random_range_ratio": args.random_range_ratio,
             # Information
-            "server_info": server_info,
+            "server_info": sanitize_server_info(server_info),
             # Results
             "duration": benchmark_duration,
             "completed": metrics.completed,

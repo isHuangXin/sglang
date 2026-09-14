@@ -4571,6 +4571,14 @@ class Scheduler(
                 self.load_publisher.publish_load_stat(
                     self.load_inquirer.get_loads, force=True, snapshot=snapshot
                 )
+            if (
+                self.ps.tp_size == 1
+                and self.disaggregation_mode == DisaggregationMode.NULL
+                and self.flat_memory_cache is not None
+                and self.flat_memory_cache.has_unfinished_io()
+            ):
+                # FLAT_MEMORY: Yield the GIL only while TP1 storage workers are busy.
+                time.sleep(0.001)
             return
 
         if self.enable_unified_memory:

@@ -357,11 +357,15 @@ class FlatMemoryIOWindow:
         deadline = time.monotonic() + timeout
         while True:
             info = await self._request()
-            snapshot = info["internal_states"][0]["flat_memory"]
+            tp_size = info.get("tp_size")
+            if type(tp_size) is not int or tp_size < 1:
+                raise ValueError("Flat server must report a positive integer TP size")
             if self.expected_tp_size is None:
-                self.expected_tp_size = snapshot.get("tp_size", info.get("tp_size"))
+                self.expected_tp_size = tp_size
+            elif tp_size != self.expected_tp_size:
+                raise ValueError("Flat server TP size changed during collection")
+            snapshot = info["internal_states"][0]["flat_memory"]
             ranks = _flat_rank_map(snapshot, self.expected_tp_size)
-            self.expected_tp_size = len(ranks)
             pending = sum(
                 _flat_counter(rank[name])
                 for rank in ranks.values()

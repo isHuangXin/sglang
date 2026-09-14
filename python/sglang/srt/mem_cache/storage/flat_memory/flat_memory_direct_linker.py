@@ -485,6 +485,15 @@ class FlatMemoryDirectLinker(UnifiedCacheLinker):
                 raise RuntimeError("No Flat offload has completed")
             return self._offloads.popleft().result()
 
+    def has_unfinished_io(self) -> bool:
+        # FLAT_MEMORY: Ready or failed futures need retirement, not an idle delay.
+        with self._lock:
+            return any(
+                not future.done()
+                for jobs in (self._query_jobs, self._loads.values(), self._offloads)
+                for future in jobs
+            )
+
     def drain(self, timeout: float | None = None) -> bool:
         self.start_preparing_loads()
         with self._lock:

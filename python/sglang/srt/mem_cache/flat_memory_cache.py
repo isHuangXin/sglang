@@ -445,6 +445,9 @@ class FlatMemoryCache:
     def is_idle(self) -> bool:
         return not self.prefetches and not self.pending_offloads
 
+    def has_unfinished_io(self) -> bool:
+        return self.cache_linker.has_unfinished_io()
+
     def drain(self, timeout: float | None = None) -> bool:
         deadline = time.monotonic() + (
             self.drain_timeout if timeout is None else timeout

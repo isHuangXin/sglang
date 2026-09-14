@@ -338,6 +338,14 @@ def _build_dsa_device_pool_group(kvcache: Any, page_size: int) -> DevicePoolGrou
         )
     num_layers = kvcache.layer_num
     identity = {layer: layer for layer in range(num_layers)}
+    # FLAT_MEMORY: Shared-topk placeholders are not physical GPU payloads.
+    index_layers = [
+        layer
+        for layer, buffer in enumerate(kvcache.index_k_with_scale_buffer)
+        if buffer.shape[0] > 0
+    ]
+    index_buffers = [kvcache.index_k_with_scale_buffer[layer] for layer in index_layers]
+    index_mapping = {layer: index for index, layer in enumerate(index_layers)}
     entries = [
         DevicePoolEntry(
             name=PoolName.KV,
@@ -352,13 +360,62 @@ def _build_dsa_device_pool_group(kvcache: Any, page_size: int) -> DevicePoolGrou
             name=PoolName.INDEXER,
             indices_from_pool=PoolName.KV,
             device_pool=kvcache,
-            components=[kvcache.index_k_with_scale_buffer],
-            layer_mapping=identity,
+            components=[index_buffers],
+            layer_mapping=index_mapping,
             page_size=page_size,
             rows_are_pages=True,
         ),
     ]
     return DevicePoolGroup(entries, num_layers, page_size, rank_replicated=True)
+
+
+def resolve_tiered_device_pool_group(
+    *, kvcache: Any, page_size: int, params: Any, components: set[ComponentType]
+) -> DevicePoolGroup:
+    # FLAT_MEMORY: Only physical metadata is shared with direct linkers, not transport.
+    from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+    from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool, MHATokenToKVPool
+
+    if params.is_eagle or params.mtp_draft_device_pools:
+        raise ValueError("Tiered Mooncake GDS does not support speculative side pools")
+    if type(kvcache) is MHATokenToKVPool:
+        if (
+            components != {ComponentType.FULL}
+            or kvcache.kv_cache_layout != "nhd"
+            or kvcache.post_capture_active
+            or kvcache.store_dtype not in (torch.float16, torch.bfloat16)
+            or kvcache.head_dim != kvcache.v_head_dim
+            or kvcache.page_size != page_size
+        ):
+            raise ValueError("Tiered MHA GDS requires a dense FP16/BF16 NHD pool")
+        layers = range(kvcache.start_layer, kvcache.start_layer + kvcache.layer_num)
+        entry = DevicePoolEntry(
+            name=PoolName.KV,
+            indices_from_pool=PoolName.KV,
+            device_pool=kvcache,
+            components=[
+                [kvcache._get_key_buffer(layer) for layer in layers],
+                [kvcache._get_value_buffer(layer) for layer in layers],
+            ],
+            layer_mapping={layer: layer for layer in range(kvcache.layer_num)},
+            page_size=page_size,
+            rows_are_pages=False,
+            packed=False,
+        )
+        return DevicePoolGroup([entry], kvcache.layer_num, page_size)
+    if isinstance(kvcache, DeepSeekV4TokenToKVPool):
+        if page_size != 256 or components != {ComponentType.FULL, ComponentType.SWA}:
+            raise ValueError("Tiered V4 GDS requires FULL+SWA and 256-token boundaries")
+    elif isinstance(kvcache, DSATokenToKVPool):
+        if page_size != 64 or components != {ComponentType.FULL}:
+            raise ValueError("Tiered DSA GDS requires FULL and page_size=64")
+    else:
+        raise ValueError(
+            f"Unsupported tiered Mooncake GPU pool: {type(kvcache).__name__}"
+        )
+    return resolve_hybrid_device_pool_group(
+        kvcache=kvcache, page_size=page_size, params=params, components=components
+    )
 
 
 def resolve_hybrid_device_pool_group(

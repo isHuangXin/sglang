@@ -504,8 +504,8 @@ def validate_gds_io_window(snapshot, window_id, active):
     if not isinstance(snapshot, dict) or not isinstance(snapshot.get("ranks"), list):
         raise ValueError("Missing GDS TP snapshots")
     ranks = snapshot["ranks"]
-    if len(ranks) not in (1, 4):
-        raise ValueError("GDS I/O requires all TP1/TP4 ranks")
+    if len(ranks) not in (1, 4, 8):
+        raise ValueError("GDS I/O requires all TP1/TP4/TP8 ranks")
     mapped, pids, boundaries = {}, set(), set()
     for rank in ranks:
         validate_mooncake_io_snapshot(rank)

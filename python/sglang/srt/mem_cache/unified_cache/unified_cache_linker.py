@@ -23,6 +23,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, NamedTuple
 
+import msgspec
 import torch
 
 from sglang.srt.mem_cache.base_prefix_cache import (
@@ -125,6 +126,18 @@ class ExternalCacheHitMarker(NamedTuple):
     device_hit_len: int
 
 
+# FLAT_MEMORY: Private allocations remain outside the tree until I/O and TP consensus.
+class PreparedLinkerLoad(msgspec.Struct, kw_only=True):
+    req: object
+    hit: ExternalCacheHitMarker
+    prefix_indices: torch.Tensor
+    anchor: object
+    component_transfers: list
+    prefix_len: int
+    published: bool = False
+    adopted_ranges: dict | None = None
+
+
 class _PendingOffload(NamedTuple):
     lock_node_id: NodeId
     lock_params: DecLockRefParams
@@ -137,7 +150,9 @@ class UnifiedCacheLinkerWrapper:
     def __init__(
         self,
         cache: UnifiedRadixCache,
-        cache_linker: UnifiedCacheLinker,
+        cache_linker: UnifiedCacheLinker | None,
+        *,
+        configure_tree: bool = True,
     ):
         self.cache = cache
         self.cache_linker = cache_linker
@@ -148,8 +163,9 @@ class UnifiedCacheLinkerWrapper:
         # Offloads in flight, each holding a lock on its node until it lands.
         self.pending_offloads: list[_PendingOffload] = []
 
-        cache.tree_core.enable_external_cache_linker = True
-        cache.write_through_threshold = 1
+        if configure_tree:
+            cache.tree_core.enable_external_cache_linker = True
+            cache.write_through_threshold = 1
 
     @property
     def layer_done_counter(self) -> object:
@@ -258,44 +274,80 @@ class UnifiedCacheLinkerWrapper:
     # ---- init_load_back: remote -> device, then insert ----
 
     def load_back(self, req: Req) -> tuple[torch.Tensor, NodeId]:
-        cache = self.cache
-        empty_indices = cache.tree_core.empty_match_result.device_indices
-        hit = self.hit_markers.pop(req.rid, None)
+        prepared = self.prepare_load(req)
+        if prepared is None:
+            return self.cache.tree_core.empty_match_result.device_indices, req.last_node
+        return self.commit_prepared_load(prepared)
+
+    def prepare_load(
+        self,
+        req: Req,
+        *,
+        hit: ExternalCacheHitMarker | None = None,
+        prefix_indices: torch.Tensor | None = None,
+        anchor: NodeId | None = None,
+    ) -> PreparedLinkerLoad | None:
+        hit = self.hit_markers.pop(req.rid, None) if hit is None else hit
         if hit is None:
-            return empty_indices, req.last_node
-
-        device_hit_len = hit.device_hit_len
-        tail_hashes = hit.tail_hashes
-        prefix_len = device_hit_len + len(tail_hashes) * cache.page_size
-
-        # Build per-component linker transfers.
-        component_transfers: list[tuple[TreeComponent, PoolTransfer]] = []
-        for component in cache._components_tuple:
-            transfer = component.build_external_linker_transfer(
-                LinkerTransferPhase.LOAD, None, tail_hashes
-            )
-            if transfer is None:
-                self._update_load(
-                    ExternalLinkerLoadPhase.ABORT,
-                    req,
-                    component_transfers,
-                    prefix_len,
+            return None
+        prefix_len = hit.device_hit_len + len(hit.tail_hashes) * self.cache.page_size
+        component_transfers = []
+        try:
+            for component in self.cache._components_tuple:
+                transfer = component.build_external_linker_transfer(
+                    LinkerTransferPhase.LOAD, None, hit.tail_hashes
                 )
-                return empty_indices, req.last_node
-            component_transfers.append((component, transfer))
-
-        full_transfer = component_transfers[0][1]
-        assert full_transfer.name == PoolName.KV
-        self._update_load(
-            ExternalLinkerLoadPhase.PREPARE,
-            req,
-            component_transfers,
-            prefix_len,
+                if transfer is None:
+                    self._update_load(
+                        ExternalLinkerLoadPhase.ABORT,
+                        req,
+                        component_transfers,
+                        prefix_len,
+                    )
+                    return None
+                component_transfers.append((component, transfer))
+            assert component_transfers[0][1].name == PoolName.KV
+            self._update_load(
+                ExternalLinkerLoadPhase.PREPARE, req, component_transfers, prefix_len
+            )
+        except BaseException:
+            self._update_load(
+                ExternalLinkerLoadPhase.ABORT, req, component_transfers, prefix_len
+            )
+            raise
+        return PreparedLinkerLoad(
+            req=req,
+            hit=hit,
+            prefix_indices=(
+                req.prefix_indices if prefix_indices is None else prefix_indices
+            ).to(torch.int64),
+            anchor=req.last_node if anchor is None else anchor,
+            component_transfers=component_transfers,
+            prefix_len=prefix_len,
         )
 
-        # Insert the newly loaded tail into the tree.
+    def abort_prepared_load(self, prepared: PreparedLinkerLoad) -> None:
+        if prepared.published:
+            raise RuntimeError("Cannot abort a published cache load")
+        self._update_load(
+            ExternalLinkerLoadPhase.ABORT,
+            prepared.req,
+            prepared.component_transfers,
+            prepared.prefix_len,
+        )
+        prepared.component_transfers = []
+
+    def commit_prepared_load(
+        self, prepared: PreparedLinkerLoad, *, queue_io: bool = True
+    ) -> tuple[torch.Tensor, NodeId]:
+        cache = self.cache
+        req, hit = prepared.req, prepared.hit
+        component_transfers = prepared.component_transfers
+        device_hit_len, tail_hashes = hit.device_hit_len, hit.tail_hashes
+        prefix_len = prepared.prefix_len
+        full_transfer = component_transfers[0][1]
         prefix_indices = torch.cat(
-            [req.prefix_indices.to(torch.int64), full_transfer.device_indices]
+            [prepared.prefix_indices, full_transfer.device_indices]
         )
         mamba_transfer = next(
             (
@@ -323,13 +375,15 @@ class UnifiedCacheLinkerWrapper:
                 track_adopted_ranges=True,
             )
         )
+        prepared.published = True
+        prepared.adopted_ranges = insert_result.adopted_ranges
         if mamba_transfer is not None and insert_result.mamba_exist:
             cache.req_to_token_pool.mamba_allocator.free(
                 mamba_transfer.device_indices[:1]
             )
 
         canonical_tail = cache.tree_core.collect_full_device_indices(
-            insert_result.last_device_node, req.last_node
+            insert_result.last_device_node, prepared.anchor
         )
         assert canonical_tail.numel() == len(tail_hashes) * cache.page_size
         load_transfers = self._update_load(
@@ -341,12 +395,12 @@ class UnifiedCacheLinkerWrapper:
             canonical_full=canonical_tail,
         )
 
-        self._queue_load(req.rid, insert_result.last_device_node, load_transfers)
-
-        node = cache.resolve_node_handle(insert_result.last_device_node)
-        while node.id != req.last_node:
-            node.external_cache_stored = True
-            node = node.parent
+        if queue_io:
+            self._queue_load(req.rid, insert_result.last_device_node, load_transfers)
+            node = cache.resolve_node_handle(insert_result.last_device_node)
+            while node.id != prepared.anchor:
+                node.external_cache_stored = True
+                node = node.parent
         return canonical_tail, insert_result.last_device_node
 
     def _queue_load(
@@ -379,6 +433,14 @@ class UnifiedCacheLinkerWrapper:
         if not component_transfers:
             return []
         full = component_transfers[0][1]
+        if self.cache.is_swa_enabled and phase in (
+            ExternalLinkerLoadPhase.PREPARE,
+            ExternalLinkerLoadPhase.ABORT,
+        ):
+            # FLAT_MEMORY: Unpublished FULL slots cannot retain freed SWA associations.
+            self.cache.token_to_kv_pool_allocator.clear_full_to_swa_mapping(
+                full.device_indices
+            )
         result = []
         transfers = (
             reversed(component_transfers)

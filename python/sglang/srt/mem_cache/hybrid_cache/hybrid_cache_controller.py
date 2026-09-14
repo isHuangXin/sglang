@@ -111,6 +111,8 @@ class HybridCacheController(BaseHiCacheController):
         host_memory_mode: str = "cache",
     ):
         startup_storage_backend = storage_backend
+        self.tiered_device_pools = None
+        self.tiered_payload = None
         self.extra_host_mem_release_queues: dict[PoolName, Queue[torch.Tensor]] = {}
         super().__init__(
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
@@ -165,8 +167,60 @@ class HybridCacheController(BaseHiCacheController):
             storage_backend_extra_config=storage_backend_extra_config,
         )
 
-        for entry in host_pools or []:
+    def configure_tiered_gds(self, device_pools) -> None:
+        if self.enable_storage:
+            raise RuntimeError("Configure Mooncake GPU pools before attaching storage")
+        self.tiered_device_pools = device_pools
+        self.supports_tiered_gds = True
+        self.tiered_runtime_managed = True
+
+    def _register_storage_host_pools(self):
+        super()._register_storage_host_pools()
+        for entry in self.mem_pool_host.entries:
             self.storage_backend.register_mem_host_pool_v2(entry.host_pool, entry.name)
+
+    def _register_storage_device_pool(self):
+        if self.tiered_device_pools is None:
+            raise ValueError("Unified Mooncake GDS physical pools are not configured")
+        self.storage_backend.register_mem_pool_device(
+            self.tiered_device_pools, host_pool_group=self.mem_pool_host
+        )
+        self.tiered_payload = self.storage_backend.gds_payload
+
+    def detach_storage_backend(self):
+        super().detach_storage_backend()
+        self.tiered_payload = None
+
+    def _host_io_capacities(self):
+        if self.tiered_payload is not None:
+            payload = self.tiered_payload
+            return (
+                payload.logical_page_bytes // self.page_size,
+                payload.host_capacity_bytes,
+                payload.device_capacity_bytes,
+            )
+        # Host groups can have a logical-only anchor and differently sized side pools.
+        from sglang.srt.mem_cache.memory_pool_host import LogicalHostPool
+        from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
+            MooncakeStore,
+        )
+
+        host_bytes = 0
+        page_bytes = 0
+        for entry in self.mem_pool_host.entries:
+            host = entry.host_pool
+            if isinstance(host, LogicalHostPool):
+                continue
+            capacity = sum(
+                buffer.nbytes for buffer in MooncakeStore._iter_host_pool_buffers(host)
+            )
+            host_bytes += capacity
+            page_bytes += capacity * self.page_size // max(1, host.size)
+        return (
+            page_bytes // self.page_size,
+            host_bytes,
+            int(self.mem_pool_device.mem_usage * (1 << 30)),
+        )
 
     def register_host_pool_entry(self, entry: PoolEntry) -> None:
         if not isinstance(self.mem_pool_host, HostPoolGroup):
@@ -334,8 +388,18 @@ class HybridCacheController(BaseHiCacheController):
                 pool_transfers=pool_transfers or None,
             )
         )
+        if self.tiered_gds_mode and self.tiered_runtime_managed:
+            with self.pending_backup_lock:
+                self.pending_backup_count += 1
+                self.backup_idle_event.clear()
         self.start_writing()
         return host_indices
+
+    def finish_tiered_host_backup(self):
+        with self.pending_backup_lock:
+            self.pending_backup_count -= 1
+            if self.pending_backup_count == 0:
+                self.backup_idle_event.set()
 
     def _move_op_indices(
         self, op: CacheOperation
@@ -479,6 +543,17 @@ class HybridCacheController(BaseHiCacheController):
         Sidecar transfers riding another pool's indices are included here but
         excluded from the per-pool token counts.
         """
+        if self.tiered_gds_mode and self.tiered_payload is not None:
+            sizes = self.tiered_payload.physical_page_bytes
+            total = len(op.device_indices) * sizes.get(PoolName.KV, 0) // self.page_size
+            for transfer in op.pool_transfers or []:
+                if transfer.device_indices is not None:
+                    total += (
+                        len(transfer.device_indices)
+                        * sizes.get(transfer.name, 0)
+                        // self.page_size
+                    )
+            return total
         kv_tokens = len(op.device_indices)
         num_bytes = kv_tokens * self.mem_pool_host.anchor_entry.host_pool.size_per_token
         # Slot counts of the pools sidecars can ride on.
@@ -572,6 +647,10 @@ class HybridCacheController(BaseHiCacheController):
             prefix_keys=prefix_keys,
             pool_transfers=extra_pools,
         )
+        if self.tiered_gds_mode and self.tiered_runtime_managed:
+            with self.pending_backup_lock:
+                self.pending_backup_count += 1
+                self.backup_idle_event.clear()
         self.backup_queue.put(operation)
         return operation.id
 
@@ -743,15 +822,30 @@ class HybridCacheController(BaseHiCacheController):
         ranks. That optimization is valid for replicated MLA KV, but not for
         hybrid rank-sharded pools such as Kimi-K3 Mamba state.
         """
-        while not self.storage_stop_event.is_set():
+        tracked = self.tiered_gds_mode and self.tiered_runtime_managed
+        while not self.storage_stop_event.is_set() or (
+            tracked and not self.backup_queue.empty()
+        ):
             try:
                 operation = self.backup_queue.get(block=True, timeout=1)
-                if operation is None:
-                    continue
-                self._page_backup(operation)
-                self.ack_backup_queue.put(operation)
             except Empty:
                 continue
+            if operation is None:
+                continue
+            try:
+                self._page_backup(operation)
+            except Exception:
+                if not tracked:
+                    raise
+                operation.completed_tokens = 0
+                logger.exception("Mooncake Host backup failed")
+            finally:
+                self.ack_backup_queue.put(operation)
+                if tracked:
+                    with self.pending_backup_lock:
+                        self.pending_backup_count -= 1
+                        if self.pending_backup_count == 0:
+                            self.backup_idle_event.set()
 
     def _resolve_sidecar_kv_derived_pool_transfers(self, operation):
         for transfer in operation.pool_transfers:

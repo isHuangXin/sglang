@@ -2420,7 +2420,7 @@ def cli_main():
     parser.add_argument(
         "--collect-mooncake-gds-io",
         action="store_true",
-        help="Collect TP1/TP4 consumer cuFile read bandwidth and aligned 100 ms peaks after warmup/flush; requires the GDS-window runtime.",
+        help="Collect TP1/TP4/TP8 consumer cuFile read bandwidth and aligned 100 ms peaks after warmup/flush; requires the GDS-window runtime.",
     )
     parser.add_argument(
         "--collect-mooncake-gds-cache-metrics",

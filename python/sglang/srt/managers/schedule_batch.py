@@ -143,7 +143,10 @@ from sglang.srt.observability.req_time_stats import (
     DPControllerReqTimeStats,
     SchedulerReqTimeStats,
 )
-from sglang.srt.observability.tiered_cache_metrics import tiered_cache_breakdown
+from sglang.srt.observability.tiered_cache_metrics import (
+    tiered_cache_breakdown as tiered_cache_breakdown,
+    update_tiered_cache_accounting as _update_tiered_cache_accounting,
+)
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.utils import flatten_nested_list
@@ -1209,8 +1212,10 @@ class Req(ReqDllmMixin):
         )
         # FLAT_MEMORY: None denotes unavailable metadata, including older PD peers.
         self.flat_storage_backend = False
-        # FLAT_MEMORY: Absolute restored ranges, consumed only on the first chunk.
+        # FLAT_MEMORY: Reloads reclassify only the prefix counted on first admission.
         self.tiered_cache_sources: List[Tuple[int, int, int]] = []
+        self.tiered_cached_prefix_len: Optional[int] = None
+        self._tiered_cache_source_history: Tuple[Tuple[int, int, int], ...] = ()
         self.tiered_cached_tokens: Optional[Dict[str, int]] = None
         self.flat_prefetch_stats = dict.fromkeys(
             (*FLAT_CACHE_FIELDS, *FLAT_PREFETCH_FIELDS), None
@@ -1308,6 +1313,46 @@ class Req(ReqDllmMixin):
 
         # For hisparse
         self.hisparse_staging = False
+
+    def update_tiered_cache_accounting(
+        self, *, prefix_len: Optional[int] = None, host_hit_length: int = 0
+    ) -> None:
+        if self.tiered_cached_prefix_len is None:
+            if prefix_len is None:
+                return
+            if type(prefix_len) is not int or prefix_len < 0:
+                raise ValueError("Invalid initial tiered-cache prefix length")
+            self.tiered_cached_prefix_len = prefix_len
+        else:
+            if not self.tiered_cache_sources:
+                return
+            # FLAT_MEMORY: Later Host reloads come from actual absolute ranges, not a suffix guess.
+            host_hit_length = 0
+        try:
+            self._tiered_cache_source_history, self.tiered_cached_tokens = (
+                _update_tiered_cache_accounting(
+                    prefix_len=self.tiered_cached_prefix_len,
+                    source_history=self._tiered_cache_source_history,
+                    source_ranges=self.tiered_cache_sources,
+                    host_hit_length=host_hit_length,
+                )
+            )
+        except ValueError as error:
+            self._tiered_cache_source_history = (
+                ((0, self.tiered_cached_prefix_len, 255),)
+                if self.tiered_cached_prefix_len
+                else ()
+            )
+            self.tiered_cached_tokens = None
+            logger.warning("Tiered cache provenance unavailable: %s", error)
+        self.tiered_cache_sources = []
+        if self.tiered_cached_tokens is not None:
+            self.cached_tokens_device = self.tiered_cached_tokens["device"]
+            self.cached_tokens_host = self.tiered_cached_tokens["l2_host"]
+            self.cached_tokens_storage = (
+                self.tiered_cached_tokens["mooncake_dram"]
+                + self.tiered_cached_tokens["ssd"]
+            )
 
     @property
     def seqlen(self) -> int:
@@ -2646,28 +2691,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                             req, prefix_len=len(req.prefix_indices)
                         )
                     elif getattr(self.tree_cache, "tiered_gds_mode", False):
-                        # FLAT_MEMORY: Report only consumed ranges, not speculative reads.
-                        try:
-                            req.tiered_cached_tokens = tiered_cache_breakdown(
-                                len(req.prefix_indices),
-                                req.host_hit_length,
-                                req.tiered_cache_sources,
-                            )
-                        except ValueError as error:
-                            req.tiered_cached_tokens = None
-                            logger.warning(
-                                "Tiered cache provenance unavailable: %s", error
-                            )
-                        if req.tiered_cached_tokens is not None:
-                            req.cached_tokens_device = req.tiered_cached_tokens[
-                                "device"
-                            ]
-                            req.cached_tokens_host = req.tiered_cached_tokens["l2_host"]
-                            req.cached_tokens_storage = (
-                                req.tiered_cached_tokens["mooncake_dram"]
-                                + req.tiered_cached_tokens["ssd"]
-                            )
-                        req.tiered_cache_sources = []
+                        req.update_tiered_cache_accounting(
+                            prefix_len=len(req.prefix_indices),
+                            host_hit_length=req.host_hit_length,
+                        )
                     req._cache_breakdown_computed = True
 
                 req.already_computed = seq_len

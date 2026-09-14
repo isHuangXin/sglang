@@ -198,6 +198,22 @@ def _create_unified_radix_cache(
 
 def create_tree_cache(ctx: TreeCacheBuildContext) -> BasePrefixCache:
     """Route to the matching factory to construct Radix Cache."""
+    tiered_gds = False
+    if get_memory().hicache_storage_backend == "mooncake":
+        from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
+            HybridCacheController,
+        )
+
+        extra, *_ = HybridCacheController.parse_storage_backend_extra_config(
+            get_memory().hicache_storage_backend_extra_config
+        )
+        tiered_gds = extra.get("gds_mode") == "compat"
+        if tiered_gds and (
+            not ctx.enable_hierarchical_cache or ctx.disable_radix_cache
+        ):
+            raise ValueError(
+                "Tiered Mooncake GDS requires hierarchical and radix caches to remain enabled"
+            )
     name = get_memory().radix_cache_backend
     if name:
         factory = get_radix_cache_factory(name)
@@ -234,6 +250,15 @@ def create_tree_cache(ctx: TreeCacheBuildContext) -> BasePrefixCache:
             "option that selected another tree cache for this model."
         )
 
+    if tiered_gds:
+        from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
+        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+        if (
+            not isinstance(cache, (HiRadixCache, UnifiedRadixCache))
+            or not cache.tiered_gds_mode
+        ):
+            raise ValueError("Selected cache does not implement tiered Mooncake GDS")
     hicache_attached = cache.cache_controller is not None
     streaming_wrapped = False
     if (

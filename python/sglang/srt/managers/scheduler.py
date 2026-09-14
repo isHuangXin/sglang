@@ -2943,6 +2943,14 @@ class Scheduler(
                 self.tree_cache.check_hicache_events()
             req.init_next_round_input(self.tree_cache, cow_mamba=False)
             tree_cache = self.tree_cache
+            from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+            if (
+                isinstance(tree_cache, UnifiedRadixCache)
+                and tree_cache.tiered_runtime is not None
+            ):
+                tree_cache.tiered_runtime.prefetch(req)
+                return
             buffer_mode = get_memory().hicache_host_memory_mode == "buffer_only"
             last_host_node = req.last_host_node
             # Buffer mode host-backups nothing, so match_prefix anchors at
@@ -3681,19 +3689,21 @@ class Scheduler(
                     continue
                 # Pop the number of tokens loaded from storage (L3 hits)
                 from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
+                from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
                 loaded_tokens = self.tree_cache.pop_prefetch_loaded_tokens(req.rid)
-                if (
-                    isinstance(self.tree_cache, HiRadixCache)
+                tiered_gds = (
+                    isinstance(self.tree_cache, (HiRadixCache, UnifiedRadixCache))
                     and self.tree_cache.tiered_gds_mode
-                ):
+                )
+                if tiered_gds:
                     req.storage_hit_length += loaded_tokens
                     req.tiered_cache_sources.extend(
                         self.tree_cache.pop_tiered_cache_sources(req.rid)
                     )
                 elif loaded_tokens > 0:
                     req.storage_hit_length = loaded_tokens
-                if isinstance(self.tree_cache, HiRadixCache):
+                if isinstance(self.tree_cache, HiRadixCache) or tiered_gds:
                     latency_ms, read_tokens = self.tree_cache.pop_prefetch_latency(
                         req.rid
                     )
@@ -3701,7 +3711,9 @@ class Scheduler(
                         req.storage_read_latency_ms = latency_ms
                         req.storage_read_tokens = read_tokens
                     req.kvcache_bytes_per_page = (
-                        self.tree_cache.token_to_kv_pool_host.get_size_per_token()
+                        self.tree_cache.cache_controller.storage_backend.gpu_page_bytes
+                        if tiered_gds
+                        else self.tree_cache.token_to_kv_pool_host.get_size_per_token()
                         * self.tree_cache.page_size
                     )
 
@@ -3783,6 +3795,9 @@ class Scheduler(
             self.chunked_req.inflight_middle_chunks += 1
 
         set_time_batch(can_run_list, "set_forward_entry_time")
+        if self.enable_hicache_storage:
+            for req in can_run_list:
+                req.update_tiered_cache_accounting()
 
         # Create a new batch
         new_batch = ScheduleBatch.init_new(
@@ -4633,9 +4648,16 @@ class Scheduler(
                     idle &= len(tc.ongoing_prefetch) == 0
                     idle &= len(tc.ongoing_backup) == 0
                     from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
+                    from sglang.srt.mem_cache.unified_radix_cache import (
+                        UnifiedRadixCache,
+                    )
 
-                    if isinstance(tc, HiRadixCache) and tc.tiered_gds_mode:
+                    if (
+                        isinstance(tc, (HiRadixCache, UnifiedRadixCache))
+                        and tc.tiered_gds_mode
+                    ):
                         idle &= not tc.tiered_prefetch
+                        idle &= tc.cache_controller.pending_backup_count == 0
                     if get_memory().hicache_host_memory_mode == "buffer_only":
                         # Queued writes, staged prefetches, and in-flight
                         # storage writes still hold host staging
@@ -4788,9 +4810,10 @@ class Scheduler(
     def _control_gds_io_window(self, action, window_id):
         from sglang.srt.managers.tiered_gds_io_window import control_gds_io_window
         from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
+        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
         if (
-            not isinstance(self.tree_cache, HiRadixCache)
+            not isinstance(self.tree_cache, (HiRadixCache, UnifiedRadixCache))
             or not self.tree_cache.tiered_gds_mode
         ):
             return {"error": "GDS I/O windows require Mooncake tiered GDS (compat)"}
@@ -4812,12 +4835,16 @@ class Scheduler(
 
     def _hicache_io_state(self, recv_req: GetInternalStateReq):
         from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
+        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
         from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
             MooncakeStore,
         )
 
         ret = {}
-        if not isinstance(self.tree_cache, HiRadixCache):
+        if (
+            not isinstance(self.tree_cache, (HiRadixCache, UnifiedRadixCache))
+            or self.tree_cache.cache_controller is None
+        ):
             if recv_req.gds_io_action:
                 ret["gds_io_control"] = self._control_gds_io_window(
                     recv_req.gds_io_action, recv_req.gds_io_window_id

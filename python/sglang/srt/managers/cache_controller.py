@@ -384,6 +384,7 @@ class HiCacheController:
         enable_metrics: bool = False,
     ):
         self.supports_tiered_gds = enable_tiered_gds
+        self.tiered_runtime_managed = False
         self.tiered_gds_mode = False
         self.tp_group = tp_group
         self.host_memory_mode = host_memory_mode
@@ -504,7 +505,7 @@ class HiCacheController:
                 for queue in (self.ack_load_queue, self.ack_write_queue)
                 for ack in queue
             )
-        bytes_per_token = int(self.mem_pool_host.get_size_per_token())
+        bytes_per_token, host_capacity, device_capacity = self._host_io_capacities()
         return {
             "enabled": self.enable_host_io_metrics,
             "pid": os.getpid(),
@@ -512,13 +513,21 @@ class HiCacheController:
             "tp_rank": torch.distributed.get_rank(group=self.tp_group),
             "tp_size": torch.distributed.get_world_size(group=self.tp_group),
             "io_backend": self.io_backend,
-            "host_capacity_bytes": int(self.mem_pool_host.size) * bytes_per_token,
-            "device_capacity_bytes": int(self.mem_pool_device.size) * bytes_per_token,
+            "host_capacity_bytes": host_capacity,
+            "device_capacity_bytes": device_capacity,
             "bytes_per_token": bytes_per_token,
             "pending": int(pending),
             "read": self._host_io_totals["read"].copy(),
             "write": self._host_io_totals["write"].copy(),
         }
+
+    def _host_io_capacities(self):
+        bytes_per_token = int(self.mem_pool_host.get_size_per_token())
+        return (
+            bytes_per_token,
+            int(self.mem_pool_host.size) * bytes_per_token,
+            int(self.mem_pool_device.size) * bytes_per_token,
+        )
 
     def get_attn_cp_rank_and_size(self) -> tuple[int, int]:
         """Derive CP rank/size from the attn_cp process group."""
@@ -610,6 +619,10 @@ class HiCacheController:
         self.ack_backup_queue = Queue()
         self.host_mem_release_queue = Queue()
 
+        if self.tiered_gds_mode and self.tiered_runtime_managed:
+            # FLAT_MEMORY: Unified's runtime owns reads; this controller owns Host writes only.
+            self.backup_thread.start()
+            return
         if self.tiered_gds_mode:
             self.prefetch_thread = threading.Thread(
                 target=self._tiered_query_worker, daemon=True
@@ -775,15 +788,15 @@ class HiCacheController:
                 if tiered_gds:
                     if not self.supports_tiered_gds:
                         raise ValueError(
-                            "Mooncake tiered GDS requires the HiRadix integration; "
-                            "Unified/hybrid compatibility is not enabled"
+                            "Mooncake tiered GDS requires a configured GPU payload and cache runtime"
                         )
                     parallel = get_parallel()
                     if (
                         self.write_policy != "write_through"
                         or self.host_memory_mode != "cache"
                         or self.io_backend != "direct"
-                        or self.tp_size not in (1, 4)
+                        or self.tp_size
+                        not in ((1, 4, 8) if self.tiered_runtime_managed else (1, 4))
                         or self.pp_size != 1
                         or parallel.dp_size != 1
                         or parallel.enable_dp_attention
@@ -792,14 +805,14 @@ class HiCacheController:
                     ):
                         raise ValueError(
                             "Mooncake GDS (compat) requires write_through, retained "
-                            "Host cache with direct I/O, TP=1/4, PP=DP=CP=1"
+                            "Host cache with direct I/O, TP=1/4 (or Unified TP8), PP=DP=CP=1"
                         )
                 self.storage_backend = StorageBackendFactory.create_backend(
                     storage_backend, self.storage_config, self.storage_host_pool
                 )
-                self.storage_backend.register_mem_pool_host(self.storage_host_pool)
+                self._register_storage_host_pools()
                 if tiered_gds:
-                    self.storage_backend.register_mem_pool_device(self.mem_pool_device)
+                    self._register_storage_device_pool()
             except Exception as error:
                 if not tiered_gds:
                     raise
@@ -894,6 +907,12 @@ class HiCacheController:
             self.page_get_func = self._generic_page_get
             self.page_set_func = self._generic_page_set
             raise
+
+    def _register_storage_host_pools(self):
+        self.storage_backend.register_mem_pool_host(self.storage_host_pool)
+
+    def _register_storage_device_pool(self):
+        self.storage_backend.register_mem_pool_device(self.mem_pool_device)
 
     def detach_storage_backend(self):
         """Detach (disable) storage backend at runtime.

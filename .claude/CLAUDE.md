@@ -1,153 +1,79 @@
-# SGLang — Flat Memory System 子项目规范
+# SGLang — Tiered Mooncake GDS B200 子项目规范
 
 ## Author
 
 Xin Huang — [@isHuangXin](https://github.com/isHuangXin)
 
-> 本文档是 SGLang 在 KVCache Flat Memory System 项目中的开发规范。
-> 上层规范: `/home/huangxin/code_list/flat-memory-system/.claude/CLAUDE.md`
-> 版本: SGLang v0.5.9 (commit 884568516)
+## 范围与来源
 
----
+本文件补充主仓库 `.claude/CLAUDE.md`；同时遵守本目录上游 `.claude/rules/` 与组件 skills。
 
-## 0. 本文档范围
+- 当前分支：`upstream-v0.5.19-baseline-mooncake-gds-b200`。
+- 上游基线：`upstream-v0.5.19`，`0bcd822377da7b5718e674eaf9c870d349424dd1`。
+- 来源：`feature/mooncake-tiered-gds`，`fee32acf711c4e54b6d56bf64174e9ca91742fa6`。
+- 来源的前 26 个项目提交复用已迁移的 `f40a5b2d0`；第 27 个 `e4af9db2b` 复用其独立迁移 `b2ba8750d`；第 28 个 `fee32acf7` 独立迁移为 `1639b2462`。
+- 三模型 TP8、Unified 接线和最小启动配置另作兼容提交，不混入或替代来源提交。
+- 普通 Mooncake baseline 独有的 `16db2e906` 不属于本来源序列；不整包引入其分支或 Flat 分支尾部实现。
 
-本文档仅规范 SGLang 在 Flat Memory System 项目中涉及的模块。SGLang 的通用开发规范（JIT Kernel、sgl-kernel 等）请参考 `.claude/skills/` 下的 SKILL.md 文件。
+## 分层与所有权
 
----
+本分支是 **Tiered Mooncake GDS**，不是 Flat allocator：
 
-## 1. SGLang 在 Flat Memory 项目中的角色
+- 后端为 `mooncake`，extra config 使用 `gds_mode="compat"`；保留真正的 HiCache Host tier。
+- 保留 `init_hicache()`、`hicache_host_memory_mode="cache"`、原生 Host→Mooncake 写入与分层卸载。
+- 不使用 Flat 工厂、编码地址或 `put_gpu_file` / `lookup_addresses` / `read_gpu`；不关闭 HiCache，不用 `buffer_only` 冒充分层模式。
+- tiered runtime 与 Host controller 各负其责，不把它安装为会截断 Host 加载的 `cache.linker`。
+- 保留 Mooncake v2 的 `_tag_keys()`、`_get_hybrid_page_component_keys()`、`_pack_multi_buffer_meta()` 及 Host multi-buffer 对象格式；GPU 读侧不能擅自改 key、顺序、长度或 namespace。
+- GPU 直读完成后保留 L2 复用；Host 回填、备份与卸载保持单一所有权。
 
-SGLang 是 LLM 推理框架，在 Flat Memory 项目中承担：
+## GPU 读取与生命周期约束
 
-| 职责 | 说明 |
-|------|------|
-| **PD 分离调度** | Prefill (GPU 0) / Decode (GPU 1) 分离，KVCache 在两个 GPU 之间通过 RDMA 传输 |
-| **KVCache 生成** | 模型推理过程中产生 KVCache，由 Prefill 节点写入存储 |
-| **HiCache 缓存管理** | 通过 HiRadixCache 管理 GPU HBM / Host DRAM / Storage (SSD) 三级缓存 |
-| **Benchmark 测试** | 测量 TTFT、TBT、吞吐量、缓存命中率等指标 |
+- 原生 `batch_get_into_gpu` 每次最多 4096 个唯一 key，大小必须与存储对象的逻辑字节数一致，指针必须属于配置的 GPU。
+- 使用有界连续 GPU 字节 staging，再按实际模型布局 scatter；不可丢失 FP8 scale、indexer 或压缩状态。
+- 查询 worker 不分配 GPU 页面，不调用 TP collective；分配、共同恢复边界与发布由 scheduler 顺序协调。
+- GPU 页面、锚点、staging 和完成事件在 native I/O、scatter 及全 rank 共识结束前保持私有且存活。
+- 失败、取消、reset、detach 必须先完成本任务 I/O，再释放资源。退出时不得新增依赖已退出 rank 的 collective。
+- 清理本次运行的 GPU/Host cache 不等于删除 Mooncake 对象；不得对共享或既有数据调用无范围的删除操作。
+- 曾启用 tiered GDS 的实例拒绝原地权重更新或 pool 重建；即使已经 detach，也需使用新 namespace 重启，避免旧 native KV 或缓存的设备布局被重新使用。
 
----
+## 三模型目标
 
-## 2. Flat Memory 相关的核心文件
+| 本地目录（`/data/xinhuang/model_list/` 下） | TP | Page size | 必须保留的布局 |
+|---|---:|---:|---|
+| `DeepSeek-V3.2` | 8 | 64 | MLA、indexer 与 scale 原始字节 |
+| `GLM-5.3` | 8 | 64 | 实际物理 indexer 层；跳过零行占位 |
+| `DeepSeek-V4-Flash-0731` | 8 | 256 | SWA、C4/C128、indexer 和压缩状态 |
 
-### 2.1 KVCache 缓存管理
+- KV 目标为 `fp8_e4m3`，按实际 pool 元数据处理原始字节，不依赖普通 MHA 的 FP16/BF16 假设。
+- V4 仅在合法 256-token 对齐边界省略请求级 C128 state；共同恢复边界必须对所有 pool 和 TP rank 求交。
+- 不改 attention、MLP 或量化计算内核来绕过缓存适配。
+- 初始运行边界为单机、PP1/DP1、无 PD、无 speculative/CP/SSM；未经适配的组合明确拒绝。
 
-| 文件 | 说明 | Flat Memory 改动点 |
-|------|------|-------------------|
-| `python/sglang/srt/mem_cache/hiradix_cache.py` | HiRadixCache 核心 — GPU/Host/Storage 三级 RadixTree 缓存 | `evict_host()` (L891) 仍用 `children.pop()` (L916) 删除节点；**无需** Ghost Node 改造 — 取回不依赖 RadixTree 残留节点 |
-| `python/sglang/srt/mem_cache/hiradix_cache.py:1264` | `prefetch_from_storage()` — 从 SSD/DRAM 预取 KVCache 到 Host DRAM | **已激活**（Issue #4 修复后）；通过 `token_ids` 重算 prefix-hash 链去 Mooncake 查询 |
-| `python/sglang/srt/mem_cache/radix_cache.py` | RadixTree 基类 — `match_prefix()` 前缀匹配逻辑 | 无需改动 — prefetch 触发不依赖 `match_prefix()` 命中残留节点（见 §3.1） |
+## 指标与接口
 
-### 2.2 MooncakeStore 存储后端
+- 原生 GPU 读取返回 `0=失败`、`1=DRAM`、`2=SSD`，不是读取字节数。
+- 来源按对象和 TP rank 合并；mixed=3 只计入一次 SSD-dependent tokens，Host reload=4 更新此前来源；unknown/unavailable 不当作零或 SSD 命中。
+- 只统计实际消费的前缀及新插入范围；保留逐请求 tier 数组与上游 PD 0–6 槽位。
+- 同一请求的首次缓存前缀长度固定；后续 chunk/retraction 的真实 Host reload 只在该范围内重分类，不增加 `cached_tokens`，不把新 prefill 或生成 token 算作缓存命中。
+- 分别报告已完成的 Host 复制、owner 原生存储 I/O 和 consumer cuFile 读取，不把提交态 transfer 字节或 RPC 耗时冒充介质 I/O。
+- 使用专门的 GDS begin/end/window/clock API；不要与普通 `storage_io` 窗口混淆。窗口关闭不替代上层 drain。
+- 只有已对齐的桶数据可聚合为跨 rank 峰值；不直接相加各 rank 独立峰值。
+- Benchmark 实现在 `python/sglang/benchmark/`，保留 `bench_serving.py` shim；输出逻辑位于 `scheduler_components/output_streamer.py`，控制入口位于 `tokenizer_control_mixin.py`。
 
-| 文件 | 说明 |
-|------|------|
-| `python/sglang/srt/mem_cache/storage/mooncake_store/mooncake_store.py` | `MooncakeStore` — HiCacheStorage 后端，桥接 SGLang 与 Mooncake DistributedStore |
-| `python/sglang/srt/mem_cache/storage/mooncake_store/mooncake_store.py:635` | `MooncakeStore.get()` — 调用 Mooncake `batch_get_into()` 从 DRAM/SSD 读取 KVCache |
+## 运行与验证边界
 
-### 2.3 PD 分离 / RDMA 直传
+最小入口位于 `benchmark/mooncake_gds_b200/`：默认只预览，执行需显式指定同一套 native build/runtime 与新建的隔离数据、日志目录。拓扑为 master、本地 bucket owner 和 8 个 GPU consumers；使用 TCP RealClient、本地 GDS owner 许可及兼容模式，不复用 Flat-only 启动参数。
 
-| 文件 | 说明 |
-|------|------|
-| `python/sglang/srt/disaggregation/mooncake/conn.py` | `MooncakeKVManager/Sender/Receiver` — GPUDirect RDMA KVCache 直传 |
-| `python/sglang/srt/distributed/mooncake_utils.py` | `MooncakeTransferEngine` — Transfer Engine Python 封装 |
+需要支持 `enable_gds`、`batch_get_into_gpu`、`get_gds_stats`、GDS begin/end/window/clock API 的真实绑定。现有构建目录名称或二进制字符串不能代替来源、ABI 和运行能力确认；缺少必要能力时应明确报错。
 
-### 2.4 调度器
+**当前状态：** 28 个来源提交已迁移，已加入三模型 TP8/Unified 兼容代码；三模型实机验收尚未执行。
 
-| 文件 | 说明 |
-|------|------|
-| `python/sglang/srt/managers/scheduler.py:1656` | `_prefetch_kvcache()` — 预取触发入口 |
-| `python/sglang/srt/managers/scheduler.py:1671` | 触发条件 `req.last_node.backuped or req.last_node is root_node` — root 分支从 `token_ids` 重算 hash 链（PR #19663），即使节点被 `children.pop()` 删光仍能触发 |
+2026-09-14 的最小检查在批准的 `/data/xinhuang/flat-kvcache-storage-dir` 下使用全新 4 KiB 文件：`cuFileDriverOpen=0`，`cuFileHandleRegister=5027`。日志指向 `udev property not found: ID_FS_USAGE md1`，当前容器缺少 `/run/udev`。记录保留在 `gds-handle-probe-20260914-pnr2f8ji/`。不得伪造 udev 数据、自动挂载或重建容器来绕过此问题；环境调整由用户确认并先保全仓库与未发布数据。
 
----
+不新增大型测试套件、性能矩阵或长压测。只做必要语法/导入检查；环境修复后，逐模型做少量生成、真实 SSD 卸载与恢复、Host 复用和有界退出验证。仅服务启动或 HBM/DRAM 命中不证明 SSD GDS 路径通过；compat 也不等于严格硬件 GDS。
 
-## 3. 已知问题 (Flat Memory 相关)
+## 修改与交付
 
-### 3.1 Ghost Node 问题 (P0) — ✅ 已修复（通过 PR #19663 root_node 特判，非 Ghost Node 改造）
+SGLang 修改留在本仓库，原生 Mooncake 与主仓库变更分开处理。项目专用注释按约定使用 `# FLAT_MEMORY:`，保持简短英文；保留上游命名、msgspec 和 RuntimeContext 约束。
 
-**原始根因:** `hiradix_cache.py` 的 `evict_host()` (L891) 使用 `children.pop(key)` (L916) 从 RadixTree 中彻底删除已驱逐节点，导致 `_prefetch_kvcache()` 的旧触发条件 `req.last_node.backuped` 永远为 False。
-
-**原始影响:** SSD/DRAM 中的 KVCache 无法被取回，`cached_tokens_storage` 始终为 0。
-
-**实际修复方案（已落地）:** **保留 `children.pop()` 不动**，改为在触发条件上加 root_node 特判（`scheduler.py:1671`，上游 PR #19663）：
-
-```python
-# scheduler.py:1671
-if req.last_node.backuped or req.last_node is self.tree_cache.root_node:
-    # root 分支：节点被 evict 删光后 last_node 退化为 root，
-    # 此时从 req.fill_ids (token_ids) 重算 SHA256 prefix-hash 链去 Mooncake 查询
-    last_hash = req.last_host_node.get_last_hash_value()
-    ...
-    self.tree_cache.prefetch_from_storage(req.rid, req.last_host_node,
-                                          new_input_tokens, last_hash, ...)
-```
-
-**关键认知:** KVCache 取回**不依赖 RadixTree 是否残留节点**，而是靠 **prefix hash**：SGLang 用 token_ids 重算 hash → Mooncake Master 用该 hash 查询 → `is_local_disk_replica()` 决定从 **mooncake-DRAM**（RDMA 直读）还是 **mooncake-SSD**（RPC + preadv + RDMA 取回）读取。因此原先设想的「Ghost Node 标记 + 扩展 `match_prefix()`」方案**没有采用、也不需要**。
-
-**关键代码位置:**
-- `scheduler.py:1671` — 修复点（root_node 特判）
-- `evict_host()`: L891-925 — 维持 `children.pop()` 原样
-- `prefetch_from_storage()`: hiradix_cache.py:1264 — 修复后已激活
-
-### 3.2 Duplicate DRAM 问题 (P0)
-
-**根因:** `write_through` 无条件将 KVCache 写入 MooncakeStore DRAM。当 GPU HBM 满触发 `evict_to_host()` 后，同一份数据在 HiRadixCache L2 DRAM 和 MooncakeStore DRAM 中各存一份。
-
-**影响:** 40GB DRAM 实际有效容量仅 20GB。
-
-**修复方案:** Flat Memory Manager 统一管理 DRAM 池，消除双写。
-
-### 3.3 索引层级
-
-```
-L1 (GPU HBM)   — RadixTree 索引（hiradix_cache.py）
-L2 (Host DRAM)  — RadixTree 索引（与 L1 共用同一棵树）
-L3 (SSD/DRAM)   — Prefix Hash 索引（Mooncake Master 维护）
-
-L1/L2 与 L3 的衔接（已修复，§3.1）:
-  evict_host() 的 children.pop() 仍会清空 L1/L2 RadixTree 节点，
-  但取回不依赖残留节点 —— scheduler.py:1671 在 last_node==root 时
-  从 token_ids 重算 prefix-hash 链，直接用 hash 查询 L3，打通 L1/L2 → L3。
-```
-
----
-
-## 4. Benchmark 配置
-
-| 参数 | 值 |
-|------|---|
-| 模型 | `meta-llama/Llama-3.1-8B-Instruct` |
-| Benchmark 工具 | `python -m sglang.bench_serving` |
-| 数据集 | ShareGPT / GSP (Generated Shared Prefix) |
-| Prefill 端口 | 30010 (bootstrap 8998) |
-| Decode 端口 | 30011 |
-| GPU 绑定 | Prefill: GPU 0 + mlx5_0, Decode: GPU 1 + mlx5_1 |
-
-**关键环境变量:**
-
-| 变量 | 说明 |
-|------|------|
-| `SGLANG_HICACHE_STORAGE` | 存储后端类型 (mooncake) |
-| `SGLANG_HICACHE_WRITE_POLICY` | 写入策略 (write_through / write_back) |
-| `MOONCAKE_CONFIG_PATH` | Mooncake 配置文件路径 |
-
----
-
-## 5. 代码修改约束
-
-- SGLang 代码修改在 `third_party/sglang/` 中进行
-- 修改必须与顶层 CLAUDE.md 和 Mooncake CLAUDE.md 保持一致
-- 所有 Flat Memory 相关修改需标注 `# FLAT_MEMORY:` 注释前缀，便于追踪
-- 不得修改 SGLang 的通用推理逻辑（attention、MLP 等），仅修改缓存管理和存储层
-
----
-
-## 6. 详细文档参考
-
-| 文档 | 说明 |
-|------|------|
-| [顶层规范](../../../.claude/CLAUDE.md) | Flat Memory System 项目总规范 |
-| [Issues 跟踪](../../../.claude/issues.md) | 待解决问题清单 |
-| [Ghost Node 分析](../../../experiments/experiment_4_single_node_Flat_Memory/ghost_node_and_ssd_kvcache_reuse_analysis.md) | Ghost Node + Duplicate DRAM 根因分析 |
-| [PD 分离文档](../../docs/advanced_features/pd_disaggregation.md) | SGLang PD 分离官方文档 |
+所有补充测试代码、数据、结果、日志和已有分支均保留。不自动 push，不改主仓库 gitlink，不清理既有缓存。报告各模型的实际通过/阻塞状态，不把配置识别或静态检查当作实机成功。

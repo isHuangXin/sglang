@@ -385,6 +385,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         self, storage_config: HiCacheStorageConfig = None, mem_pool: HostKVCache = None
     ):
         MooncakeBaseStore.__init__(self)
+        self.gds_payload = None
         MooncakeDistributedStore = self._import_mooncake_store()
         self._replicate_config_cls, self._supports_group_ids = (
             self._import_mooncake_group_semantics()
@@ -723,10 +724,15 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         bytes_per_page = mem_pool_host.get_ksize_per_token() * mem_pool_host.page_size
         self.gb_per_page = bytes_per_page / (1 << 30)
 
-    # FLAT_MEMORY: This codec is limited to the original dense MHA/GQA layout.
-    def register_mem_pool_device(self, pool):
+    def register_mem_pool_device(self, pool, *, host_pool_group=None):
+        from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
+            DevicePoolGroup,
+        )
         from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 
+        if isinstance(pool, DevicePoolGroup):
+            self._register_gds_group(pool, host_pool_group)
+            return
         if (
             type(pool) is not MHATokenToKVPool
             or self.is_mla_backend
@@ -789,6 +795,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         )
         if self.gpu_batch_pages < 1:
             raise ValueError("A KV page exceeds the configured GDS staging budget")
+        self.gpu_pack_limit_bytes = self.gpu_batch_pages * self.gpu_page_bytes
         self.store.enable_gds(
             self.gds_config["gds_ssd_root"],
             self.gds_device,
@@ -798,6 +805,58 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             "Mooncake tiered GDS (compat): Host retained, client buffer=%d, GPU pack limit=%d",
             self.gds_stage_bytes,
             self.gpu_batch_pages * self.gpu_page_bytes,
+        )
+
+    def _register_gds_group(self, device_pools, host_pools):
+        from sglang.srt.mem_cache.storage.mooncake_store.gds_payload import (
+            MooncakeGDSPayload,
+        )
+
+        if (
+            not self.tiered_gds_mode
+            or host_pools is None
+            or self.should_split_heads
+            or self.config.standalone_storage
+            or self.config.protocol != "tcp"
+        ):
+            raise ValueError(
+                "Tiered Mooncake GPU groups require native TCP storage and retained Host pools"
+            )
+        required = (
+            "enable_gds",
+            "batch_get_into_gpu",
+            "get_gds_stats",
+            "begin_gds_io_window",
+            "end_gds_io_window",
+            "get_gds_io_window",
+            "gds_io_clock_ns",
+        )
+        if not all(callable(getattr(self.store, name, None)) for name in required):
+            raise RuntimeError("Mooncake binding lacks tiered GDS and I/O window APIs")
+        self.gds_payload = MooncakeGDSPayload(
+            storage=self,
+            device_pools=device_pools,
+            host_pools=host_pools,
+            stage_bytes=self.gds_stage_bytes // 2,
+        )
+        self.mem_pool_device = device_pools
+        self.gds_device = self.gds_payload.device.index
+        self.gpu_page_bytes = self.gds_payload.logical_page_bytes
+        self.gpu_batch_pages = max(
+            1, self.gds_payload.stage_bytes // self.gpu_page_bytes
+        )
+        self.gpu_pack_limit_bytes = self.gds_payload.stage_bytes
+        self.store.enable_gds(
+            self.gds_config["gds_ssd_root"],
+            self.gds_device,
+            int(self.gds_config.get("gds_max_io_bytes", 16 << 20)),
+        )
+        logger.info(
+            "Mooncake tiered GDS: GPU=%d pools=%s logical_page_bytes=%d staging_bytes=%d Host retained",
+            self.gds_device,
+            list(self.gds_payload.layouts),
+            self.gpu_page_bytes,
+            self.gds_payload.stage_bytes,
         )
 
     def read_gpu_pages(self, keys, device_indices):
@@ -1475,9 +1534,8 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         return len(query_keys) // key_multiplier
 
     def close(self):
-        # MooncakeDistributedStore will automatically call the destructor, so
-        # it is unnecessary to close it manually.
-        pass
+        # FLAT_MEMORY: Break the codec's owner cycle only after the runtime has drained.
+        self.gds_payload = None
 
     def clear(self) -> None:
         self.store.remove_all()
@@ -1576,7 +1634,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                         stats,
                         tp_rank=self.local_rank,
                         native_client_buffer_bytes=self.gds_stage_bytes,
-                        gpu_pack_limit_bytes=self.gpu_batch_pages * self.gpu_page_bytes,
+                        gpu_pack_limit_bytes=self.gpu_pack_limit_bytes,
                     ),
                     sort_keys=True,
                 ),

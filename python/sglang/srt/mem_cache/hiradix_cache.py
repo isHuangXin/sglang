@@ -1831,7 +1831,7 @@ class HiRadixCache(RadixCache):
 
         logger.info(
             f"[PREFETCH-DEBUG] check_prefetch_progress: req={req_id[:8]}, "
-            f"completed_tokens={completed_tokens}, min_completed={min_completed_tokens}, "
+            f"completed_tokens={operation.completed_tokens}, min_completed={min_completed_tokens}, "
             f"matched_length={matched_length}, loaded_from_storage={loaded_from_storage}"
         )
 

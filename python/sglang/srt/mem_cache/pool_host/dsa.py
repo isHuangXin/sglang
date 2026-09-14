@@ -140,6 +140,11 @@ class DSAIndexerPoolHost(HostKVCache):
         self.packed_device_index_buffers = [
             buffer for pool in device_pools for buffer in pool.index_k_with_scale_buffer
         ]
+        self.empty_index_layers = tuple(
+            layer
+            for layer, buffer in enumerate(self.packed_device_index_buffers)
+            if buffer.shape[0] == 0
+        )
         self.index_k_device_ptrs = torch.tensor(
             [x.data_ptr() for x in self.packed_device_index_buffers],
             dtype=torch.uint64,
@@ -233,6 +238,8 @@ class DSAIndexerPoolHost(HostKVCache):
         # MTP draft layers do not participate in CP layer sharding.
         host_layer_id = layer_id if is_draft else self._host_layer_index(layer_id)
         device_layer_id = 0 if is_draft else layer_id
+        if device_pool.index_k_with_scale_buffer[device_layer_id].shape[0] == 0:
+            return
 
         host_page_indices, device_page_indices = self._get_indexer_page_indices(
             host_indices, device_indices
@@ -336,6 +343,14 @@ class DSAIndexerPoolHost(HostKVCache):
     def backup_from_device_all_layer(
         self, device_pool, host_indices, device_indices, io_backend
     ):
+        if (
+            self.empty_index_layers
+            and self.layout == "page_first_direct"
+            and io_backend == "direct"
+            and not self._is_device_layer_sharded(device_pool)
+        ):
+            self._backup_sparse_index_layers(host_indices, device_indices)
+            return
         if self._is_device_layer_sharded(device_pool):
             for layer_id in self._owned_device_layer_ids(device_pool):
                 self._backup_from_device_per_layer(
@@ -412,6 +427,25 @@ class DSAIndexerPoolHost(HostKVCache):
                 raise ValueError(f"Unsupported layout: {self.layout}")
         else:
             raise ValueError(f"Unsupported IO backend: {io_backend}")
+
+    def _backup_sparse_index_layers(self, host_indices, device_indices):
+        host_pages, device_pages = self._get_indexer_page_indices(
+            host_indices, device_indices
+        )
+        for layer, buffer in enumerate(self.packed_device_index_buffers):
+            host_view = self.index_k_with_scale_buffer[:, layer : layer + 1]
+            if buffer.shape[0] == 0:
+                # FLAT_MEMORY: Keep the wire-format layer slot, never read a zero-row GPU buffer.
+                host_view.index_fill_(0, host_pages.cpu(), 0)
+            else:
+                # The direct copy honors the sliced Host view's page stride.
+                transfer_kv_all_layer_direct_lf_pf(
+                    src_ptrs=[buffer],
+                    dst_ptrs=[host_view],
+                    src_indices=device_pages,
+                    dst_indices=host_pages,
+                    page_size=1,
+                )
 
     def get_data_page(self, index, flat: bool = True) -> torch.Tensor:
         page_idx = int(index) // self.page_size

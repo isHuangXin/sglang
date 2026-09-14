@@ -110,8 +110,25 @@ class SchedulerWeightUpdaterManager:
     def record_weight_version_after_update(self, weight_version: Optional[str]) -> None:
         self.scheduler.record_weight_version_change(new_version=weight_version)
 
+    def _tiered_mutation_error(self):
+        if self.scheduler is None:
+            return None
+        from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
+        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+        cache = self.scheduler.tree_cache
+        active = (
+            isinstance(cache, UnifiedRadixCache) and cache.tiered_storage_ever_attached
+        ) or (isinstance(cache, HiRadixCache) and cache.tiered_gds_mode)
+        if active:
+            # FLAT_MEMORY: Old native KV and physical pointer leases cannot follow an in-place model mutation.
+            return "Tiered Mooncake GDS requires restart with a fresh storage namespace before changing weights or GPU pools"
+        return None
+
     def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
         """In-place update of the weights from disk."""
+        if (error := self._tiered_mutation_error()) is not None:
+            return UpdateWeightFromDiskReqOutput(success=False, message=error)
         with self._observe_weight_load("disk"):
             success, message = self.tp_worker.update_weights_from_disk(recv_req)
             tp_success = success
@@ -145,6 +162,8 @@ class SchedulerWeightUpdaterManager:
         recv_req: UpdateWeightsFromDistributedReqInput,
     ) -> Tuple[bool, str]:
         """Update the online model parameter."""
+        if (error := self._tiered_mutation_error()) is not None:
+            return UpdateWeightsFromDistributedReqOutput(success=False, message=error)
         with self._observe_weight_load("distributed"):
             success, message = self.tp_worker.update_weights_from_distributed(recv_req)
             if success:
@@ -158,6 +177,8 @@ class SchedulerWeightUpdaterManager:
 
     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
         """Update the online model parameter from tensors."""
+        if (error := self._tiered_mutation_error()) is not None:
+            return UpdateWeightsFromTensorReqOutput(success=False, message=error)
         with self._observe_weight_load("tensor"):
             if recv_req.disable_draft_model:
                 worker = self.tp_worker
@@ -174,6 +195,8 @@ class SchedulerWeightUpdaterManager:
 
     def update_weights_from_ipc(self, recv_req: UpdateWeightsFromIPCReqInput):
         """Update the online model parameter from IPC for checkpoint-engine integration."""
+        if (error := self._tiered_mutation_error()) is not None:
+            return UpdateWeightsFromIPCReqOutput(success=False, message=error)
         with self._observe_weight_load("ipc"):
             success, message = self.tp_worker.update_weights_from_ipc(recv_req)
             tp_success = success
@@ -209,6 +232,8 @@ class SchedulerWeightUpdaterManager:
             )
 
     def release_memory_occupation(self, recv_req: ReleaseMemoryOccupationReqInput):
+        if (error := self._tiered_mutation_error()) is not None:
+            raise RuntimeError(error)
         assert (
             self.is_fully_idle()
         ), "release_memory_occupation should be called only when server is idle."
@@ -255,6 +280,8 @@ class SchedulerWeightUpdaterManager:
         return ReleaseMemoryOccupationReqOutput()
 
     def resume_memory_occupation(self, recv_req: ResumeMemoryOccupationReqInput):
+        if (error := self._tiered_mutation_error()) is not None:
+            raise RuntimeError(error)
         tags = recv_req.tags
 
         if tags is None or len(tags) == 0:

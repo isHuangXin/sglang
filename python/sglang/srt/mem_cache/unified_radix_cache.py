@@ -87,9 +87,14 @@ from sglang.srt.observability.metrics_collector import (
     StorageMetricsCollector,
 )
 from sglang.srt.runtime_context import (
+    get_disagg,
+    get_exec,
     get_memory,
     get_model,
     get_observability,
+    get_parallel,
+    get_serving,
+    get_spec,
 )
 from sglang.srt.session.streaming_session import StreamingSession
 from sglang.srt.utils.common import ceil_align
@@ -244,6 +249,9 @@ class UnifiedRadixCache(BasePrefixCache):
         # Owns the storage backend lifecycle; built by init_hicache.
         self._storage_attachment: Optional[StorageAttachment] = None
         self.linker: Optional[UnifiedCacheLinkerWrapper] = None
+        self.tiered_runtime = None
+        self.tiered_storage_ever_attached = False
+        self._tiered_gds_init_params = None
         self.prefetch_stop_policy = "best_effort"
         self.prefetch_threshold = 256
         self.prefetch_timeout_base = 1.0
@@ -350,9 +358,95 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def init_cache_linker(self, cache_linker: UnifiedCacheLinker) -> None:
         """Attach an external KV store directly to the device pools."""
+        if self.tiered_runtime is not None:
+            raise ValueError(
+                "A direct linker cannot replace the tiered Mooncake Host path"
+            )
         self.linker = UnifiedCacheLinkerWrapper(self, cache_linker)
 
+    @property
+    def tiered_gds_mode(self):
+        return self.tiered_runtime is not None
+
+    @property
+    def tiered_prefetch(self):
+        return self.tiered_runtime.pending if self.tiered_runtime is not None else {}
+
+    def _tiered_gather(self, value):
+        if self.tp_world_size == 1:
+            return [value]
+        values = [None] * self.tp_world_size
+        torch.distributed.all_gather_object(values, value, group=self.tp_group)
+        return values
+
+    def configure_tiered_gds(self):
+        from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
+            resolve_tiered_device_pool_group,
+        )
+
+        parallel = get_parallel()
+        if (
+            self.disable
+            or self.linker is not None
+            or self.host_memory_mode != "cache"
+            or get_disagg().disaggregation_mode not in (None, "null")
+            or get_spec().speculative_algorithm is not None
+            or get_memory().enable_hisparse
+            or get_memory().enable_unified_memory
+            or get_exec().features.enable_memory_saver
+            or parallel.tp_size not in (1, 4, 8)
+            or parallel.pp_size != 1
+            or parallel.dp_size != 1
+            or parallel.enable_dp_attention
+            or parallel.attn_cp_size != 1
+            or parallel.dcp_size != 1
+        ):
+            raise ValueError(
+                "Tiered Mooncake GDS requires retained Unified HiCache, TP1/4/8, "
+                "PP1/DP1, without PD/speculative/CP/HiSparse/memory-saver"
+            )
+        pools = resolve_tiered_device_pool_group(
+            kvcache=self.token_to_kv_pool_allocator.get_kvcache(),
+            page_size=self.page_size,
+            params=self._tiered_gds_init_params,
+            components=set(self.tree_components),
+        )
+        self.cache_controller.configure_tiered_gds(pools)
+
+    def activate_tiered_gds(self):
+        from sglang.srt.mem_cache.unified_cache.tiered_mooncake_runtime import (
+            TieredMooncakeRuntime,
+        )
+
+        self.tiered_runtime = TieredMooncakeRuntime(cache=self)
+        self.tiered_storage_ever_attached = True
+        self.load_back_threshold = 1
+
+    def _drain_tiered_storage(self, *, local):
+        self.tiered_runtime.drain(local=local)
+        cc = self.cache_controller
+        error = None
+        try:
+            cc.start_loading()
+            cc.l2_transfer_engine.device_to_host_stream.synchronize()
+            cc.l2_transfer_engine.host_to_device_stream.synchronize()
+            self.writing_check(finish_count=len(cc.ack_write_queue))
+            self.loading_check(finish_count=len(cc.ack_load_queue))
+            if not cc.backup_idle_event.wait(timeout=120.0):
+                raise TimeoutError("Mooncake Host backup pipeline did not drain")
+            cc._stop_storage_threads()
+            self.drain_storage_control_queues_local()
+        except Exception as exc:
+            error = str(exc)
+        errors = [error] if local else self._tiered_gather(error)
+        if any(errors):
+            raise RuntimeError(
+                f"Mooncake Host drain failed; resources retained: {errors}"
+            )
+
     def reset(self) -> None:
+        if self.tiered_runtime is not None:
+            self._drain_tiered_storage(local=False)
         if self.linker is not None:
             self.linker.reset()
         self._reset_full()
@@ -385,6 +479,7 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def init_hicache(self, server_args: ServerArgs, params: CacheInitParams) -> None:
         """Initialize HiCache infrastructure."""
+        self._tiered_gds_init_params = params
         self.host_memory_mode = get_memory().hicache_host_memory_mode
         if self.host_memory_mode == "buffer_only":
             # TODO(Jialin): Extend buffer-only state handoff to Mamba in a
@@ -427,12 +522,16 @@ class UnifiedRadixCache(BasePrefixCache):
                 get_memory().hicache_storage_backend_extra_config
             )
 
+        tiered_gds = (
+            storage_backend == "mooncake"
+            and (storage_extra_config or {}).get("gds_mode") == "compat"
+        )
         attach_hybrid_pool_to_unified_cache(
             self,
             params,
             server_args,
             load_cache_event=self.load_cache_event,
-            storage_backend=storage_backend,
+            storage_backend=None if tiered_gds else storage_backend,
             storage_extra_config=storage_extra_config,
             storage_prefetch_threshold=storage_prefetch_threshold,
         )
@@ -489,7 +588,17 @@ class UnifiedRadixCache(BasePrefixCache):
         self._storage_attachment = StorageAttachment(self)
         atexit.register(self.shutdown)
 
-        if storage_backend is not None:
+        if tiered_gds:
+            ok, message = self._storage_attachment.attach(
+                storage_backend=storage_backend,
+                storage_backend_extra_config_json=get_memory().hicache_storage_backend_extra_config,
+                served_model_name=get_serving().served_model_name,
+                hicache_storage_prefetch_policy=self.prefetch_stop_policy,
+                hicache_write_policy=get_memory().hicache_write_policy,
+            )
+            if not ok:
+                raise RuntimeError(message)
+        elif storage_backend is not None:
             self._storage_attachment.apply_runtime_config(
                 storage_backend=storage_backend,
                 prefetch_threshold=storage_prefetch_threshold,
@@ -504,6 +613,10 @@ class UnifiedRadixCache(BasePrefixCache):
     def register_sidecar_pool(
         self, spec: SidecarPoolSpec, entry: Optional[PoolEntry] = None
     ) -> None:
+        if self.tiered_runtime is not None:
+            raise RuntimeError(
+                "Detach tiered Mooncake GDS before changing physical side pools"
+            )
         if entry is not None:
             if self.cache_controller is None:
                 raise RuntimeError("HiCache controller is not attached.")
@@ -511,6 +624,10 @@ class UnifiedRadixCache(BasePrefixCache):
         self.sidecar_pool_specs.append(spec)
 
     def release_host_resources(self) -> None:
+        if self.tiered_runtime is not None:
+            ok, message = self.detach_storage_backend()
+            if not ok:
+                raise RuntimeError(message)
         if self.linker is not None:
             self.linker.close()
         if self.host_pool_group is not None:
@@ -1433,6 +1550,8 @@ class UnifiedRadixCache(BasePrefixCache):
             # suffix; the prefix fragment must be persisted as well.
             for node_id in publish_node_ids:
                 self.write_backup_storage(node_id)
+        if self.tiered_runtime is not None:
+            self.cache_controller.finish_tiered_host_backup()
 
     def load_back(
         self,
@@ -1641,6 +1760,10 @@ class UnifiedRadixCache(BasePrefixCache):
         prefix_keys: Optional[list[str]] = None,
     ) -> int:
         """Synchronously probe L3 storage for the reusable prefix length."""
+        if self.tiered_runtime is not None:
+            return self.tiered_runtime.query_storage_hit_length(
+                last_host_node_id, new_input_tokens, last_hash
+            )
         if (
             not self.enable_storage
             or self.cache_controller is None
@@ -1687,7 +1810,12 @@ class UnifiedRadixCache(BasePrefixCache):
         matched_prefix_tokens: Optional[list[int]] = None,
         extra_key: Optional[str] = None,
         cache_salt: Optional[str] = None,
+        req: Optional[Req] = None,
     ) -> None:
+        if self.tiered_runtime is not None:
+            if req is not None:
+                self.tiered_runtime.prefetch(req)
+            return
         if not self.enable_storage or self.cache_controller is None:
             return
 
@@ -1861,6 +1989,9 @@ class UnifiedRadixCache(BasePrefixCache):
 
     @rank_consensus(same_params=True, same_results=True)
     def check_prefetch_progress(self, req_id: str) -> bool:
+        if self.tiered_runtime is not None:
+            self.tiered_runtime.poll()
+            return req_id not in self.tiered_runtime.pending
         if req_id not in self.ongoing_prefetch:
             return True
 
@@ -2074,7 +2205,23 @@ class UnifiedRadixCache(BasePrefixCache):
     def pop_prefetch_loaded_tokens(self, req_id: str) -> int:
         # The request is being scheduled; a still-unserved miss marker is moot.
         self._storage_prefetch_missed_rids.discard(req_id)
+        if self.tiered_runtime is not None:
+            return self.tiered_runtime.loaded.pop(req_id, 0)
         return self.prefetch_loaded_tokens_by_reqid.pop(req_id, 0)
+
+    def pop_tiered_cache_sources(self, req_id: str):
+        return (
+            self.tiered_runtime.sources.pop(req_id, [])
+            if self.tiered_runtime is not None
+            else []
+        )
+
+    def pop_prefetch_latency(self, req_id: str):
+        return (
+            self.tiered_runtime.latencies.pop(req_id, (0.0, 0))
+            if self.tiered_runtime is not None
+            else (0.0, 0)
+        )
 
     def pop_storage_prefetch_miss(self, req_id: str) -> bool:
         """True once per resolved storage-prefetch miss for a live request;
@@ -2102,6 +2249,9 @@ class UnifiedRadixCache(BasePrefixCache):
 
     @rank_consensus(same_params=True)
     def release_aborted_request(self, rid: str) -> None:
+        if self.tiered_runtime is not None:
+            self.tiered_runtime.cancel(rid)
+            return
         if self.linker is not None:
             self.linker.release_request(rid)
         self.prefetch_loaded_tokens_by_reqid.pop(rid, None)
@@ -2760,6 +2910,11 @@ class UnifiedRadixCache(BasePrefixCache):
                 new_indices = self.tree_core.collect_full_device_indices(
                     best_match_node_id, last_best_match_device_node_id
                 )
+                if self.tiered_runtime is not None:
+                    end = len(req.prefix_indices) + len(new_indices)
+                    start = max(0, end - max(len(new_indices), req.swa_host_hit_length))
+                    if start < end:
+                        req.tiered_cache_sources.append((start, end, 4))
                 if new_indices.numel() == 0:
                     return (
                         self.tree_core.empty_match_result.device_indices,
@@ -2780,6 +2935,8 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def check_hicache_events(self) -> None:
         """Called per scheduler step to poll async HiCache events."""
+        if self.tiered_runtime is not None:
+            self.tiered_runtime.poll()
         if self.linker is not None:
             finish_counts = torch.tensor(
                 [
@@ -2965,13 +3122,23 @@ class UnifiedRadixCache(BasePrefixCache):
         return self.tree_core.evictable_size()
 
     def protected_size(self) -> int:
-        return self.tree_core.protected_size()
+        reserved = (
+            self.tiered_runtime.full_reserved_tokens
+            if self.tiered_runtime is not None
+            else 0
+        )
+        return self.tree_core.protected_size() + reserved
 
     def full_evictable_size(self) -> int:
         return self.tree_core.full_evictable_size()
 
     def full_protected_size(self) -> int:
-        return self.tree_core.full_protected_size()
+        reserved = (
+            self.tiered_runtime.full_reserved_tokens
+            if self.tiered_runtime is not None
+            else 0
+        )
+        return self.tree_core.full_protected_size() + reserved
 
     def swa_evictable_size(self) -> int:
         return self.tree_core.swa_evictable_size()
@@ -2980,7 +3147,12 @@ class UnifiedRadixCache(BasePrefixCache):
         return self.tree_core.mamba_evictable_size()
 
     def swa_protected_size(self) -> int:
-        return self.tree_core.swa_protected_size()
+        reserved = (
+            self.tiered_runtime.swa_reserved_tokens
+            if self.tiered_runtime is not None
+            else 0
+        )
+        return self.tree_core.swa_protected_size() + reserved
 
     def mamba_protected_size(self) -> int:
         return self.tree_core.mamba_protected_size()

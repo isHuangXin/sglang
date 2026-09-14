@@ -59,6 +59,11 @@ class StorageAttachment:
         cache = self._cache
 
         # Validate first: a rejected request must have no side effects.
+        if cache.tiered_gds_mode and (
+            hicache_write_policy not in (None, "write_through")
+            or hicache_storage_prefetch_policy not in (None, "wait_complete")
+        ):
+            return False, "Tiered Mooncake GDS requires write_through and wait_complete"
         invalid = self._validate_policies(
             hicache_storage_prefetch_policy, hicache_write_policy
         )
@@ -113,6 +118,25 @@ class StorageAttachment:
                 f"'{storage_backend_extra_config_json}': {e}",
             )
 
+        tiered_gds = (
+            storage_backend == "mooncake" and extra_config.get("gds_mode") == "compat"
+        )
+        if tiered_gds:
+            error = None
+            try:
+                if (
+                    controller.write_policy != "write_through"
+                    or cache.prefetch_stop_policy != "wait_complete"
+                ):
+                    raise ValueError(
+                        "Tiered Mooncake GDS requires write_through and wait_complete"
+                    )
+                cache.configure_tiered_gds()
+            except Exception as exc:
+                error = str(exc)
+            errors = cache._tiered_gather(error)
+            if any(errors):
+                return False, f"Tiered Mooncake configuration failed: {errors}"
         try:
             controller.attach_storage_backend(
                 storage_backend=storage_backend,
@@ -127,6 +151,19 @@ class StorageAttachment:
             )
             return False, f"Failed to attach storage backend '{storage_backend}': {e}"
 
+        if tiered_gds:
+            error = None
+            try:
+                cache.activate_tiered_gds()
+            except Exception as exc:
+                error = str(exc)
+            errors = cache._tiered_gather(error)
+            if any(errors):
+                if cache.tiered_runtime is not None:
+                    cache.tiered_runtime.close()
+                    cache.tiered_runtime = None
+                controller.detach_storage_backend()
+                return False, f"Tiered Mooncake runtime initialization failed: {errors}"
         self.apply_runtime_config(
             storage_backend=storage_backend,
             prefetch_threshold=prefetch_threshold,
@@ -160,6 +197,10 @@ class StorageAttachment:
             return False, "HiCache storage backend is not initialized."
 
         try:
+            if cache.tiered_runtime is not None:
+                # FLAT_MEMORY: Exit drains locally; another TP rank may already have exited.
+                cache._drain_tiered_storage(local=True)
+                cache.tiered_runtime.close()
             cache.drain_storage_control_queues_local()
             # Idempotent: ask the controller to clean up even when `enable_storage`
             # is already False, since that may be leftover state from an earlier
@@ -180,6 +221,7 @@ class StorageAttachment:
 
         cache.enable_storage = False
         cache.enable_storage_metrics = False
+        cache.tiered_runtime = None
         return True, "Detached HiCache storage backend successfully."
 
     def shutdown(self) -> None:
@@ -196,6 +238,11 @@ class StorageAttachment:
 
     def clear(self) -> bool:
         """Drop everything the backend has stored, keeping it attached."""
+        if self._cache.tiered_gds_mode:
+            logger.warning(
+                "Tiered Mooncake cannot clear an unscoped shared store; flush GPU/Host cache instead"
+            )
+            return False
         try:
             ok = self._cache.cache_controller.clear_storage_backend()
         except Exception as e:

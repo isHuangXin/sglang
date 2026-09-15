@@ -44,6 +44,12 @@ class FlatLoadResult(msgspec.Struct, frozen=True):
     unsafe: bool = False
 
 
+# FLAT_MEMORY: Source consumption never retires the durable job or lookup dependency.
+class _Offload(msgspec.Struct, eq=False):
+    future: Future
+    source_consumed: Future
+
+
 class _LookupQuery(msgspec.Struct, eq=False):
     transfers: list[PoolTransfer]
     keys: list[str]
@@ -191,7 +197,7 @@ class FlatMemoryDirectLinker(UnifiedCacheLinker):
         self._storage_generation = 0
         self._offload_coverage: dict[Future, frozenset[PageRecord]] = {}
         self._load_batches: deque[tuple[int, dict[str, Future]]] = deque()
-        self._offloads: deque[Future] = deque()
+        self._offloads: deque[_Offload] = deque()
         self._prefetch_samples = []
         self._backup_samples = []
         self._last_capacity_warning = float("-inf")
@@ -575,8 +581,11 @@ class FlatMemoryDirectLinker(UnifiedCacheLinker):
         coverage = self.layout.coverage(expanded)
         ready_event = self._ready_event()
         with self._lock:
-            future = self._write_executor.submit(self._write, expanded, ready_event)
-            self._offloads.append(future)
+            source_consumed = Future()
+            future = self._write_executor.submit(
+                self._write, expanded, ready_event, source_consumed
+            )
+            self._offloads.append(_Offload(future, source_consumed))
             self._offload_coverage[future] = coverage
             future.add_done_callback(self._offload_finished)
         return True
@@ -590,11 +599,18 @@ class FlatMemoryDirectLinker(UnifiedCacheLinker):
                 if future in query.dependencies:
                     query.eligible = True
 
-    def _write(self, transfers, ready_event) -> FlatWriteResult:
+    def _write(self, transfers, ready_event, source_consumed=None) -> FlatWriteResult:
         started = time.perf_counter()
         try:
             self._wait_ready(ready_event)
-            self.transfer.write(transfers)
+            self.transfer.write(
+                transfers,
+                on_source_consumed=(
+                    (lambda: source_consumed.set_result(None))
+                    if source_consumed is not None
+                    else None
+                ),
+            )
             pages = len({key for transfer in transfers for key in transfer.keys or []})
             with self._lock:
                 self._backup_samples.append(
@@ -640,11 +656,21 @@ class FlatMemoryDirectLinker(UnifiedCacheLinker):
                     f"Flat GPU producer did not quiesce: {error}"
                 ) from error
 
+    def num_source_safe_offloads(self) -> int:
+        with self._lock:
+            count = 0
+            for offload in self._offloads:
+                if not offload.source_consumed.done():
+                    break
+                offload.source_consumed.result()
+                count += 1
+            return count
+
     def num_completed_offloads(self) -> int:
         with self._lock:
             count = 0
-            for future in self._offloads:
-                if not future.done():
+            for offload in self._offloads:
+                if not offload.future.done():
                     break
                 count += 1
             return count
@@ -657,9 +683,9 @@ class FlatMemoryDirectLinker(UnifiedCacheLinker):
 
     def pop_completed_offload_result(self) -> FlatWriteResult:
         with self._lock:
-            if not self._offloads or not self._offloads[0].done():
+            if not self._offloads or not self._offloads[0].future.done():
                 raise RuntimeError("No Flat offload has completed")
-            result = self._offloads.popleft().result()
+            result = self._offloads.popleft().future.result()
             return (
                 FlatWriteResult(success=result) if isinstance(result, bool) else result
             )
@@ -672,7 +698,10 @@ class FlatMemoryDirectLinker(UnifiedCacheLinker):
                 or bool(self._physical_query_jobs or self._offload_coverage)
                 or any(
                     not future.done()
-                    for jobs in (self._loads.values(), self._offloads)
+                    for jobs in (
+                        self._loads.values(),
+                        (offload.future for offload in self._offloads),
+                    )
                     for future in jobs
                 )
             )
@@ -700,7 +729,7 @@ class FlatMemoryDirectLinker(UnifiedCacheLinker):
                     future
                     for jobs in (
                         self._loads.values(),
-                        self._offloads,
+                        (offload.future for offload in self._offloads),
                         self._physical_query_jobs.values(),
                     )
                     for future in jobs

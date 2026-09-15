@@ -122,7 +122,9 @@ class TestFlatLookupDependencies(CustomTestCase):
             linker._lookup_executor.shutdown(wait=True)
             linker._lookup_executor = _SteppedExecutor()
 
-        def write(transfers):
+        def write(transfers, *, on_source_consumed=None):
+            if on_source_consumed is not None:
+                on_source_consumed()
             for transfer in transfers:
                 manager.publish(linker.layout, transfer.name, transfer.keys)
 
@@ -146,6 +148,49 @@ class TestFlatLookupDependencies(CustomTestCase):
     def run_probe(self, linker):
         linker._lookup_executor.run_next()
 
+    def test_source_receipt_does_not_retire_durable_lookup_dependency(self):
+        linker = self.make_linker()
+        linker.offload(_request(["a"]))
+        record = linker._offloads[0]
+        query = linker.submit_lookup("waiting", _request(["a"]))
+        self.run_probe(linker)
+        record.source_consumed.set_result(None)
+        self.assertEqual(linker.num_source_safe_offloads(), 1)
+        self.assertEqual(linker.num_completed_offloads(), 0)
+        self.assertIn(record.future, linker._offload_coverage)
+        self.assertEqual(linker.storage_generation, 0)
+        linker.poll_queries()
+        self.assertFalse(query.done())
+        self.assertFalse(linker._lookup_executor.jobs)
+        self.assertFalse(linker.drain(timeout=0))
+        linker.transfer.write.side_effect = lambda transfers, **kwargs: self.publish(
+            linker, ["a"]
+        )
+        linker._write_executor.run_next()
+        linker.poll_queries()
+        self.run_probe(linker)
+        self.assertEqual(query.result(), [1])
+        self.assertTrue(linker.pop_completed_offload())
+        self.assertEqual(linker.num_source_safe_offloads(), 0)
+
+    def test_failed_no_receipt_prefix_only_unblocks_after_durable_retirement(self):
+        linker = self.make_linker()
+        linker.offload(_request(["failed"]))
+        linker.offload(_request(["safe"]))
+        linker.offload(_request(["queued"]))
+        write = linker.transfer.write.side_effect
+        linker.transfer.write.side_effect = FlatCapacityError("full")
+        linker._write_executor.run_next()
+        linker.transfer.write.side_effect = write
+        linker._write_executor.run_next()
+        self.assertEqual(linker.num_source_safe_offloads(), 0)
+        self.assertEqual(linker.num_completed_offloads(), 2)
+        self.assertFalse(linker.pop_completed_offload())
+        self.assertEqual(linker.num_source_safe_offloads(), 1)
+        self.assertTrue(linker.pop_completed_offload())
+        self.assertEqual(linker.num_source_safe_offloads(), 0)
+        self.assertEqual(linker.num_completed_offloads(), 0)
+
     def test_unrelated_backup_does_not_block_partial_or_next_request(self):
         """An absent new tail must not occupy the single query worker for ten seconds."""
         linker = self.make_linker(real_queries=True)
@@ -155,7 +200,7 @@ class TestFlatLookupDependencies(CustomTestCase):
         self.assertEqual(partial.result(timeout=1), [1])
         next_query = linker.submit_lookup("next", _request(["cached"]))
         self.assertEqual(next_query.result(timeout=1), [1])
-        self.assertFalse(linker._offloads[0].done())
+        self.assertFalse(linker._offloads[0].future.done())
         self.assertEqual(linker.transfer.lookup_probe.call_count, 2)
 
     def test_relevant_backup_defers_logically_and_improves_boundary(self):
@@ -191,7 +236,7 @@ class TestFlatLookupDependencies(CustomTestCase):
         )
         transfers = _request(["a"])
         linker.offload(transfers)
-        job = linker._offloads[0]
+        job = linker._offloads[0].future
         coverage = linker._offload_coverage[job]
         self.assertIsInstance(coverage, frozenset)
         self.assertEqual(
@@ -283,7 +328,7 @@ class TestFlatLookupDependencies(CustomTestCase):
         self.run_probe(linker)
         self.assertEqual(old.result(), [])
 
-        def publish_then_fail(transfers):
+        def publish_then_fail(transfers, *, on_source_consumed=None):
             self.publish(linker, ["a"])
             raise OSError("later batch failed")
 
@@ -405,7 +450,7 @@ class TestFlatLookupDependencies(CustomTestCase):
             self.assertEqual(len(linker._lookup_executor.jobs), 1)
             self.run_probe(linker)
             self.assertEqual(result.result(), [1])
-            self.assertFalse(linker._offloads[0].done())
+            self.assertFalse(linker._offloads[0].future.done())
             linker._write_executor.run_next()
             linker.poll_queries()
             self.assertEqual(result.result(), [1])

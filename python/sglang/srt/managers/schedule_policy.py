@@ -946,9 +946,17 @@ class PrefillAdder:
                 False, never_fits=True, reason="full_pool_capacity"
             )
         extra_full, extra_swa = self._flat_running_headroom()
-        if full_tokens + full_reservation + extra_full >= self.rem_total_tokens:
-            return FlatRestoreAdmission(False, reason="full_decode_headroom")
+        full_required = full_tokens + full_reservation + extra_full
+        full_available = self.rem_total_tokens
+        if full_required >= full_available:
+            return FlatRestoreAdmission(
+                False,
+                reason="full_decode_headroom",
+                full_required_tokens=full_required,
+                full_available_tokens=full_available,
+            )
         swa_reservation = 0
+        swa_required = swa_available = None
         if self.is_hybrid_swa:
             swa_reservation = self._swa_budget_for_req(
                 real_input, max_new, swa_host_hit_length=0
@@ -956,14 +964,33 @@ class PrefillAdder:
             if swa_tokens + swa_reservation >= self.token_to_kv_pool_allocator.size_swa:
                 # Normal admission retains ownership of its existing safe chunk fallback.
                 return FlatRestoreAdmission(
-                    False, never_fits=True, reason="swa_restore_and_chunk_capacity"
+                    False,
+                    never_fits=True,
+                    reason="swa_restore_and_chunk_capacity",
+                    full_required_tokens=full_required,
+                    full_available_tokens=full_available,
+                    swa_required_tokens=swa_tokens + swa_reservation,
+                    swa_available_tokens=self.token_to_kv_pool_allocator.size_swa,
                 )
-            if swa_tokens + swa_reservation + extra_swa >= self.rem_swa_tokens:
-                return FlatRestoreAdmission(False, reason="swa_decode_headroom")
+            swa_required = swa_tokens + swa_reservation + extra_swa
+            swa_available = self.rem_swa_tokens
+            if swa_required >= swa_available:
+                return FlatRestoreAdmission(
+                    False,
+                    reason="swa_decode_headroom",
+                    full_required_tokens=full_required,
+                    full_available_tokens=full_available,
+                    swa_required_tokens=swa_required,
+                    swa_available_tokens=swa_available,
+                )
         return FlatRestoreAdmission(
             True,
             full_reservation=full_reservation,
             swa_reservation=swa_reservation,
+            full_required_tokens=full_required,
+            full_available_tokens=full_available,
+            swa_required_tokens=swa_required,
+            swa_available_tokens=swa_available,
         )
 
     def budget_state(self):

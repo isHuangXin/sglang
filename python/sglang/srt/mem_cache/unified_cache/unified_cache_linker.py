@@ -19,8 +19,9 @@ The tree only needs a handful of guarded hooks:
 
 from __future__ import annotations
 
+import time
 from abc import ABC, abstractmethod
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from typing import TYPE_CHECKING, NamedTuple
 
 import msgspec
@@ -96,6 +97,10 @@ class UnifiedCacheLinker(ABC):
     def offload(self, transfers: list[PoolTransfer]) -> bool:
         """Queue every transfer for atomic persistence."""
 
+    def num_source_safe_offloads(self) -> int:
+        """Return the source-consumed FIFO prefix; default backends unlock at durability."""
+        return 0
+
     @abstractmethod
     def num_completed_offloads(self) -> int:
         """Return the number of completed offloads waiting to be consumed."""
@@ -136,10 +141,15 @@ class PreparedLinkerLoad(msgspec.Struct, kw_only=True):
     prefix_len: int
 
 
-class _PendingOffload(NamedTuple):
+# FLAT_MEMORY: Ack identity and lock ownership outlive evictable publication nodes.
+class _PendingOffload(msgspec.Struct):
     lock_node_id: NodeId
     lock_params: DecLockRefParams
     publish_node_ids: list[NodeId]
+    token_count: int
+    queued_at: float
+    source_lock_held: bool = True
+    source_released_at: float | None = None
 
 
 class UnifiedCacheLinkerWrapper:
@@ -149,6 +159,8 @@ class UnifiedCacheLinkerWrapper:
         self,
         cache: UnifiedRadixCache,
         cache_linker: UnifiedCacheLinker,
+        *,
+        resolve_pending_node: Callable[[NodeId], object | None] | None = None,
     ):
         self.cache = cache
         self.cache_linker = cache_linker
@@ -156,8 +168,12 @@ class UnifiedCacheLinkerWrapper:
         self.hit_markers: dict[str, ExternalCacheHitMarker] = {}
         # Loads in flight, each pinning its inserted endpoint until DMA completes.
         self.pending_loads: dict[str, tuple[NodeId, DecLockRefParams]] = {}
-        # Offloads in flight, each holding a lock on its node until it lands.
+        # FLAT_MEMORY: Durable-pending records survive source release and node eviction.
         self.pending_offloads: list[_PendingOffload] = []
+        self._resolve_pending_node = resolve_pending_node
+        self._source_lock_seconds = 0.0
+        self._source_released_offloads = 0
+        self._source_safe_to_durable_seconds = 0.0
 
         cache.tree_core.enable_external_cache_linker = True
         cache.write_through_threshold = 1
@@ -544,6 +560,7 @@ class UnifiedCacheLinkerWrapper:
                     transfer.keys = [key_namespace + key for key in transfer.keys]
                 transfers.append(transfer)
 
+        queued_at = time.monotonic()
         lock_params = cache.inc_lock_ref(node_id).to_dec_params()
         try:
             queued = self.cache_linker.offload(transfers)
@@ -556,12 +573,14 @@ class UnifiedCacheLinkerWrapper:
 
         cache.tree_core.mark_write_through_pending(node_id)
         node.external_cache_stored = True
-        self.pending_offloads.append(_PendingOffload(node_id, lock_params, [node_id]))
+        self.pending_offloads.append(
+            _PendingOffload(node_id, lock_params, [node_id], len(node.key), queued_at)
+        )
 
     def replace_pending_offload_node(
         self, ack_id: NodeId, old_node_id: NodeId, new_node_ids: list[NodeId]
     ) -> None:
-        for index, pending in enumerate(self.pending_offloads):
+        for pending in self.pending_offloads:
             if pending.lock_node_id != ack_id:
                 continue
             publish_node_ids = []
@@ -570,10 +589,49 @@ class UnifiedCacheLinkerWrapper:
                     publish_node_ids.extend(new_node_ids)
                 else:
                     publish_node_ids.append(node_id)
-            self.pending_offloads[index] = pending._replace(
-                publish_node_ids=publish_node_ids
-            )
+            pending.publish_node_ids = publish_node_ids
             return
+
+    @property
+    def source_lock_count(self) -> int:
+        return sum(pending.source_lock_held for pending in self.pending_offloads)
+
+    def num_source_safe_offloads(self) -> int:
+        released = len(self.pending_offloads) - self.source_lock_count
+        return max(
+            0,
+            min(
+                self.cache_linker.num_source_safe_offloads(), len(self.pending_offloads)
+            )
+            - released,
+        )
+
+    def release_source_safe_offloads(self, finish_count: int) -> None:
+        # FLAT_MEMORY: Count is agreed before durable pops; do not re-query the backend.
+        assert 0 <= finish_count <= self.source_lock_count
+        for pending in self.pending_offloads:
+            if finish_count == 0:
+                break
+            if pending.source_lock_held:
+                self._release_source_lock(pending)
+                finish_count -= 1
+
+    def _release_source_lock(self, pending: _PendingOffload) -> None:
+        if pending.source_lock_held:
+            self.cache.dec_lock_ref(pending.lock_node_id, pending.lock_params)
+            pending.source_lock_held = False
+            pending.source_released_at = time.monotonic()
+            self._source_lock_seconds += pending.source_released_at - pending.queued_at
+            self._source_released_offloads += 1
+
+    def get_offload_stats(self) -> dict:
+        return {
+            "source_lock_count": self.source_lock_count,
+            "durable_pending_count": len(self.pending_offloads),
+            "source_released_offloads": self._source_released_offloads,
+            "source_lock_seconds": self._source_lock_seconds,
+            "source_safe_to_durable_seconds": self._source_safe_to_durable_seconds,
+        }
 
     def num_completed_offloads(self) -> int:
         return min(
@@ -597,12 +655,27 @@ class UnifiedCacheLinkerWrapper:
         assert len(successes) <= len(self.pending_offloads)
         for success in successes:
             pending = self.pending_offloads.pop(0)
-            for node_id in pending.publish_node_ids:
-                node = self.cache.resolve_node_handle(node_id)
-                if node.write_through_pending_id == pending.lock_node_id:
-                    node.write_through_pending_id = None
+            self._publish_offload(pending, success=success)
+            if pending.source_released_at is not None:
+                self._source_safe_to_durable_seconds += (
+                    time.monotonic() - pending.source_released_at
+                )
+            self._release_source_lock(pending)
+
+    def _publish_offload(self, pending: _PendingOffload, *, success: bool) -> None:
+        for node_id in pending.publish_node_ids:
+            node = (
+                self.cache.resolve_node_handle(node_id)
+                if self._resolve_pending_node is None
+                else self._resolve_pending_node(node_id)
+            )
+            # FLAT_MEMORY: Never recreate evicted targets or overwrite a newer operation.
+            if (
+                node is not None
+                and node.write_through_pending_id == pending.lock_node_id
+            ):
+                node.write_through_pending_id = None
                 node.external_cache_stored = success
-            self.cache.dec_lock_ref(pending.lock_node_id, pending.lock_params)
 
     def start_layer_wise_loading(self) -> int:
         return self.cache_linker.start_layer_wise_loading()
@@ -619,12 +692,8 @@ class UnifiedCacheLinkerWrapper:
             self.cache.dec_lock_ref(node_id, lock_params)
         self.pending_loads.clear()
         for pending in self.pending_offloads:
-            for node_id in pending.publish_node_ids:
-                node = self.cache.resolve_node_handle(node_id)
-                if node.write_through_pending_id == pending.lock_node_id:
-                    node.write_through_pending_id = None
-                node.external_cache_stored = False
-            self.cache.dec_lock_ref(pending.lock_node_id, pending.lock_params)
+            self._publish_offload(pending, success=False)
+            self._release_source_lock(pending)
         self.pending_offloads.clear()
 
     def release_request(self, rid: str) -> None:

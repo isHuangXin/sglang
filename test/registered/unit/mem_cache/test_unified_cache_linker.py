@@ -21,6 +21,7 @@ from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
 )
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
@@ -145,6 +146,7 @@ def test_async_offload_pins_node_until_completion():
     node_id = 7
     node = SimpleNamespace(
         id=node_id,
+        key=[1, 2],
         external_cache_stored=False,
         write_through_pending_id=None,
     )
@@ -234,6 +236,7 @@ def test_failed_offload_rolls_back_split_fragments():
     unlocks = []
     child = SimpleNamespace(
         id=7,
+        key=[1, 2],
         external_cache_stored=False,
         write_through_pending_id=None,
     )
@@ -312,6 +315,7 @@ def test_reset_quiesces_backend_before_releasing_pending_locks():
     linker = _QuiescentFakeLinker()
     node = SimpleNamespace(
         id=7,
+        key=[1, 2],
         external_cache_stored=False,
         write_through_pending_id=None,
     )
@@ -444,6 +448,163 @@ def test_component_commit_keeps_only_adopted_pages():
     mapped_full, mapped_swa = mapping.mapping[0]
     assert mapped_full.tolist() == [102, 103, 106, 107]
     assert mapped_swa.tolist() == [202, 203, 206, 207]
+
+
+class _SourceSafeLinker(_FakeLinker):
+    def __init__(self):
+        super().__init__()
+        self.source_prefix = 0
+
+    def num_source_safe_offloads(self):
+        return self.source_prefix
+
+    def pop_completed_offload(self):
+        self.source_prefix = max(0, self.source_prefix - 1)
+        return super().pop_completed_offload()
+
+
+class TestOffloadSourceOwnership(CustomTestCase):
+    def make_wrapper(self, *, linker=None):
+        linker = _SourceSafeLinker() if linker is None else linker
+        nodes = {
+            node_id: SimpleNamespace(
+                id=node_id,
+                key=list(range(4)),
+                external_cache_stored=False,
+                write_through_pending_id=None,
+            )
+            for node_id in (7, 8, 9)
+        }
+        params = {}
+        unlocks = []
+
+        def acquire(node_id):
+            params[node_id] = object()
+            return SimpleNamespace(to_dec_params=lambda: params[node_id])
+
+        def release(node_id, lock_params):
+            self.assertIn(node_id, nodes, "A held source lock must still pin its node")
+            self.assertIs(lock_params, params.pop(node_id))
+            unlocks.append(node_id)
+
+        cache = _cache_for_wrapper(
+            tree_core=SimpleNamespace(
+                enable_external_cache_linker=False,
+                mark_write_through_pending=lambda node_id: setattr(
+                    nodes[node_id], "write_through_pending_id", node_id
+                ),
+            ),
+            _components_tuple=(
+                SimpleNamespace(
+                    build_external_linker_transfer=lambda *args: PoolTransfer(
+                        name=PoolName.KV, keys=["page"]
+                    )
+                ),
+            ),
+            inc_lock_ref=acquire,
+            dec_lock_ref=release,
+            resolve_node_handle=nodes.__getitem__,
+        )
+        wrapper = UnifiedCacheLinkerWrapper(
+            cache, linker, resolve_pending_node=nodes.get
+        )
+        return wrapper, linker, nodes, unlocks
+
+    def test_source_release_does_not_retire_durability_or_split_identity(self):
+        wrapper, linker, nodes, unlocks = self.make_wrapper()
+        wrapper.offload_nodes([7])
+        linker.source_prefix = 1
+        self.assertEqual(wrapper.num_source_safe_offloads(), 1)
+        wrapper.release_source_safe_offloads(1)
+        self.assertEqual(wrapper.num_source_safe_offloads(), 0)
+        self.assertEqual(wrapper.source_lock_count, 0)
+        self.assertEqual(len(wrapper.pending_offloads), 1)
+        self.assertEqual(wrapper.num_completed_offloads(), 0)
+        for node_id in (8, 9):
+            nodes[node_id].write_through_pending_id = 7
+        wrapper.replace_pending_offload_node(7, 7, [8, 7])
+        wrapper.replace_pending_offload_node(7, 8, [9, 8])
+        nodes[8].key = [1]
+        nodes[9].write_through_pending_id = 100
+        nodes[9].external_cache_stored = False
+        del nodes[7]
+        self.assertEqual(wrapper.pending_offloads[0].token_count, 4)
+        linker.completed_offloads.append(True)
+        wrapper.commit_completed_offloads(wrapper.take_completed_offloads(1))
+        self.assertTrue(nodes[8].external_cache_stored)
+        self.assertIsNone(nodes[8].write_through_pending_id)
+        self.assertFalse(nodes[9].external_cache_stored)
+        self.assertEqual(nodes[9].write_through_pending_id, 100)
+        self.assertNotIn(7, nodes)
+        self.assertEqual(unlocks, [7])
+        self.assertFalse(wrapper.pending_offloads)
+
+    def test_captured_source_prefix_survives_durable_pop_before_release(self):
+        wrapper, linker, _, unlocks = self.make_wrapper()
+        wrapper.offload_nodes([7, 8])
+        linker.source_prefix = 2
+        count = wrapper.num_source_safe_offloads()
+        linker.completed_offloads.append(False)
+        results = wrapper.take_completed_offloads(1)
+        wrapper.release_source_safe_offloads(count)
+        wrapper.commit_completed_offloads(results)
+        self.assertEqual(unlocks, [7, 8])
+        self.assertEqual(wrapper.source_lock_count, 0)
+        self.assertEqual(len(wrapper.pending_offloads), 1)
+        self.assertEqual(wrapper.num_source_safe_offloads(), 0)
+        linker.completed_offloads.append(True)
+        wrapper.commit_completed_offloads(wrapper.take_completed_offloads(1))
+        self.assertEqual(unlocks, [7, 8])
+
+    def test_reset_and_close_release_only_still_owned_sources(self):
+        for action in ("reset", "close"):
+            with self.subTest(action=action):
+                wrapper, linker, nodes, unlocks = self.make_wrapper()
+                wrapper.offload_nodes([7, 8])
+                linker.source_prefix = 1
+                wrapper.release_source_safe_offloads(1)
+                del nodes[7]
+                getattr(wrapper, action)()
+                self.assertEqual(unlocks, [7, 8])
+                self.assertFalse(wrapper.pending_offloads)
+                self.assertIsNone(nodes[8].write_through_pending_id)
+                self.assertFalse(nodes[8].external_cache_stored)
+                stats = wrapper.get_offload_stats()
+                self.assertEqual(stats["source_lock_count"], 0)
+                self.assertEqual(stats["durable_pending_count"], 0)
+                self.assertEqual(stats["source_released_offloads"], 2)
+
+    def test_unsafe_close_retains_remaining_source_and_publication_ownership(self):
+        from unittest.mock import Mock
+
+        from sglang.srt.mem_cache.storage.flat_memory.io_result import FlatUnsafeIOError
+
+        wrapper, linker, nodes, unlocks = self.make_wrapper()
+        wrapper.offload_nodes([7, 8])
+        linker.source_prefix = 1
+        wrapper.release_source_safe_offloads(1)
+        del nodes[7]
+        linker.close = Mock(side_effect=FlatUnsafeIOError("staging still owned"))
+        with self.assertRaises(FlatUnsafeIOError):
+            wrapper.close()
+        self.assertEqual(unlocks, [7])
+        self.assertEqual(wrapper.source_lock_count, 1)
+        self.assertEqual(len(wrapper.pending_offloads), 2)
+        self.assertEqual(nodes[8].write_through_pending_id, 8)
+        linker.close.side_effect = None
+        wrapper.close()
+        self.assertEqual(unlocks, [7, 8])
+
+    def test_default_backend_remains_locked_until_durable_completion(self):
+        wrapper, linker, _, unlocks = self.make_wrapper(linker=_FakeLinker())
+        wrapper.offload_nodes([7])
+        self.assertEqual(wrapper.num_source_safe_offloads(), 0)
+        self.assertEqual(wrapper.source_lock_count, 1)
+        self.assertFalse(unlocks)
+        linker.completed_offloads.append(True)
+        wrapper.commit_completed_offloads(wrapper.take_completed_offloads(1))
+        self.assertEqual(unlocks, [7])
+        self.assertEqual(wrapper.source_lock_count, 0)
 
 
 if __name__ == "__main__":

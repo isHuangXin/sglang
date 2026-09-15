@@ -9,3 +9,7 @@ class FlatRestoreAdmission(msgspec.Struct, frozen=True):
     full_reservation: int = 0
     swa_reservation: int = 0
     reason: str = ""
+    full_required_tokens: float | None = None
+    full_available_tokens: float | None = None
+    swa_required_tokens: float | None = None
+    swa_available_tokens: float | None = None

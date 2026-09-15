@@ -4,6 +4,7 @@ import unittest
 from array import array
 from concurrent.futures import Future
 from types import SimpleNamespace as NS
+from unittest.mock import patch
 
 import torch
 
@@ -39,6 +40,9 @@ class _Storage:
         self.queries = {}
         self.loads = {}
         self.transfers = {}
+        self.offload_enabled = False
+        self.backups = []
+        self.source_safe = set()
 
     def submit_lookup(self, rid, transfers):
         future = Future()
@@ -91,10 +95,36 @@ class _Storage:
         self.transfers.pop(rid, None)
 
     def offload(self, transfers):
-        return False
+        if not self.offload_enabled:
+            return False
+        self.backups.append(Future())
+        return True
+
+    def complete_backup(self, index=0, *, success=True, unsafe=False):
+        self.backups[index].set_result(
+            NS(success=success, capacity_rejected=False, unsafe=unsafe)
+        )
+
+    def num_source_safe_offloads(self):
+        count = 0
+        for future in self.backups:
+            if future not in self.source_safe:
+                break
+            count += 1
+        return count
 
     def num_completed_offloads(self):
-        return 0
+        count = 0
+        for future in self.backups:
+            if not future.done():
+                break
+            count += 1
+        return count
+
+    def pop_completed_offload_result(self):
+        future = self.backups.pop(0)
+        self.source_safe.discard(future)
+        return future.result()
 
 
 class TestFlatMemoryAdmission(CustomTestCase):
@@ -148,11 +178,11 @@ class TestFlatMemoryAdmission(CustomTestCase):
         self.cache.linker = self.runtime
         self.cache.storage_metrics_collector = None
 
-    def _req(self, rid="request", length=12, output=1):
+    def _req(self, rid="request", length=12, output=1, start=10):
         req = Req(
             rid=rid,
             origin_input_text="",
-            origin_input_ids=array("q", range(10, 10 + length)),
+            origin_input_ids=array("q", range(start, start + length)),
             sampling_params=SamplingParams(temperature=0, max_new_tokens=output),
         )
         req.init_next_round_input(self.cache)
@@ -264,6 +294,34 @@ class TestFlatMemoryAdmission(CustomTestCase):
             ),
         )
 
+    def test_private_restore_eviction_revalidates_gpu_only_ready_request(self):
+        """Real Full/SWA allocation must invalidate a peer's unleased GPU-only readiness."""
+        cached, restored = self._restored()
+        self.runtime.release_request(cached.rid)
+        covered = self._req("covered")
+        covered_state = self.runtime.prefetches[covered.rid]
+        self.assertIsNone(covered_state.future)
+        self.assertEqual(covered_state.phase, "ready")
+        self.assertEqual(self._match_len(covered), restored.loaded_tokens)
+        competitor = self._req("competitor", length=60, start=100)
+        self.runtime.poll()
+        adder = self._adder()
+        self.runtime.prepare_admission(
+            [covered, competitor], adder, has_chunked_req=False
+        )
+        self.assertEqual(self.runtime.prefetches[competitor.rid].phase, "read")
+        self.assertLess(self._match_len(covered), restored.loaded_tokens)
+        self.assertFalse(self.runtime.is_ready(covered.rid))
+        self.assertEqual(covered_state.phase, "query")
+        self.assertEqual(covered_state.query_start, 0)
+        self.assertIsNone(covered_state.prepared)
+        self.assertEqual(list(self.storage.loads), [competitor.rid])
+        self.runtime.release_request(covered.rid)
+        self.runtime.release_request(competitor.rid)
+        self.storage.complete(competitor.rid)
+        self.runtime.poll()
+        self.assertIsNone(self.runtime._lease_rid)
+
     def test_restore_reservation_accounts_for_admitted_chunk_future_input(self):
         """A concurrent restore must reserve the admitted chunk's remaining input."""
         req = self._req(length=32, output=6)
@@ -311,6 +369,153 @@ class TestFlatMemoryAdmission(CustomTestCase):
             (adder.rem_total_tokens, adder.cur_rem_tokens, adder.rem_swa_tokens),
         )
         self.runtime.release_request(running.rid)
+
+    def _blocked_by_backup(self):
+        cached, restored = self._restored()
+        node_id = self.cache.resolve_node_handle(restored.hold_node).id
+        self.runtime.release_request(cached.rid)
+        self.storage.offload_enabled = True
+        self.runtime.tree_linker._offload_node(node_id)
+        req = self._req("waiting", length=60, start=100)
+        state = self.runtime.prefetches[req.rid]
+        self.runtime.poll()
+        adder = self._adder()
+        self.runtime.prepare_admission([req], adder, has_chunked_req=False)
+        self.assertEqual(state.phase, "allocate")
+        self.assertEqual(
+            req.flat_prefetch_stats["flat_restore_reason"], "full_decode_headroom"
+        )
+        return req, state, adder
+
+    def test_pending_backup_retirement_enables_restore_without_recompute(self):
+        """An idle compute pass must wait for backup-owned capacity before recomputing."""
+        req, state, adder = self._blocked_by_backup()
+        self.runtime.finish_admission(adder, can_progress=False)
+        self.assertFalse(state.bypass)
+        self.assertIsNone(state.hold_params)
+        self.assertIsNone(state.prepared)
+        self.assertNotIn(req.rid, self.storage.loads)
+        self.assertEqual(len(self.runtime.pending_offloads), 1)
+
+        self.storage.complete_backup()
+        self.runtime.poll()
+        adder = self._adder()
+        self.runtime.prepare_admission([req], adder, has_chunked_req=False)
+        self.assertEqual(state.phase, "read")
+        self.storage.complete(req.rid)
+        self.runtime.poll()
+        adder = self._adder()
+        self.runtime.prepare_admission([req], adder, has_chunked_req=False)
+        req.init_next_round_input(self.cache)
+        self.runtime.before_admission(req, adder)
+        adder.add_one_req(req, has_chunked_req=False, truncation_align_size=None)
+        self.assertIn(req, adder.can_run_list)
+        self.runtime.after_admission(req, adder)
+        self.runtime.finish_admission(adder, can_progress=True)
+        self.assertEqual(req.storage_read_tokens, 59)
+        self.assertEqual(req.storage_hit_length, 59)
+        self.assertEqual(self.runtime.lease_fallbacks, 0)
+        self.cache.dec_lock_ref(
+            req.last_node,
+            DecLockRefParams(
+                swa_uuid_for_lock=req.swa_uuid_for_lock,
+                skip_lock_node_ids=req.skip_lock_node_ids,
+            ),
+        )
+
+    def test_source_release_enables_real_allocation_before_durable_completion(self):
+        """A safely copied backup must stop pinning pages while its disk write waits."""
+        req, state, adder = self._blocked_by_backup()
+        self.runtime.finish_admission(adder, can_progress=False)
+        pending = self.runtime.pending_offloads[0]
+        node_id = pending.lock_node_id
+        self.cache.resolve_node_handle(node_id).external_cache_stored = False
+        self.storage.source_safe.add(self.storage.backups[0])
+        self.runtime.poll()
+        self.assertFalse(pending.source_lock_held)
+        self.assertFalse(self.storage.backups[0].done())
+        self.assertEqual(len(self.runtime.pending_offloads), 1)
+
+        adder = self._adder()
+        self.runtime.prepare_admission([req], adder, has_chunked_req=False)
+        self.assertEqual(state.phase, "read")
+        self.assertIsNone(self.cache.tree_core.try_node_by_id(node_id))
+        self.assertFalse(self.storage.backups[0].done())
+        self.storage.complete_backup()
+        self.runtime.poll()
+        self.assertFalse(self.runtime.pending_offloads)
+        self.runtime.release_request(req.rid)
+        self.storage.complete(req.rid)
+        self.runtime.poll()
+        self.assertEqual(self.allocator.full_available_size(), 64)
+
+    def test_allocation_wait_timeout_survives_query_refresh(self):
+        """Refreshing a lookup cannot renew a resource wait or keep backup pages hostage."""
+        req, state, adder = self._blocked_by_backup()
+        self.runtime.finish_admission(adder, can_progress=False)
+        deadline = state.allocation_wait_deadline
+        self.assertGreater(deadline, 0)
+        result = self.runtime._rematch(state)
+        self.runtime._refresh_query(state, result)
+        self.assertEqual(state.phase, "query")
+        self.assertEqual(state.allocation_wait_deadline, deadline)
+        with patch(
+            "sglang.srt.mem_cache.flat_memory_cache.time.monotonic",
+            return_value=deadline + 1,
+        ):
+            self.runtime.poll()
+        self.assertTrue(state.bypass)
+        self.assertEqual(state.revoke_reason, "allocation_wait_timeout")
+        self.assertEqual(
+            req.flat_prefetch_stats["flat_restore_plan_reason"], "full_decode_headroom"
+        )
+        self.assertEqual(len(self.runtime.pending_offloads), 1)
+        self.assertFalse(self.storage.backups[0].done())
+        self.assertNotIn(req.rid, self.storage.loads)
+        self.runtime.release_request(req.rid)
+        self.storage.complete_backup()
+        self.runtime.poll()
+
+    def test_backup_completion_does_not_credit_another_owners_pages(self):
+        """Retiring one backup must not allocate pages still pinned by another owner."""
+        req, state, adder = self._blocked_by_backup()
+        node_id = self.runtime.pending_offloads[0].lock_node_id
+        other_owner = self.cache.inc_lock_ref(node_id).to_dec_params()
+        self.runtime.finish_admission(adder, can_progress=False)
+        self.assertFalse(state.bypass)
+        self.storage.complete_backup()
+        self.runtime.poll()
+        adder = self._adder()
+        self.runtime.prepare_admission([req], adder, has_chunked_req=False)
+        self.runtime.finish_admission(adder, can_progress=False)
+        self.assertTrue(state.bypass)
+        self.assertEqual(state.revoke_reason, "no_admission_progress")
+        self.assertNotIn(req.rid, self.storage.loads)
+        self.cache.dec_lock_ref(node_id, other_owner)
+        self.runtime.release_request(req.rid)
+
+    def test_cancelled_allocate_wait_preserves_backup_until_safe_failure(self):
+        """Cancelling a waiter cannot release the source lock of its independent backup."""
+        req, state, adder = self._blocked_by_backup()
+        self.runtime.finish_admission(adder, can_progress=False)
+        before = self.allocator.full_available_size() + self.cache.full_evictable_size()
+        self.runtime.release_request(req.rid)
+        self.assertNotIn(req.rid, self.runtime.prefetches)
+        self.assertEqual(len(self.runtime.pending_offloads), 1)
+        self.assertEqual(
+            self.allocator.full_available_size() + self.cache.full_evictable_size(),
+            before,
+        )
+        self.assertEqual(
+            req.flat_prefetch_stats["flat_restore_allocation_wait_outcome"], "cancelled"
+        )
+        self.storage.complete_backup(success=False)
+        self.runtime.poll()
+        self.assertFalse(self.runtime.pending_offloads)
+        self.assertEqual(self.runtime.io_errors, 1)
+        self.assertEqual(
+            self.allocator.full_available_size() + self.cache.full_evictable_size(), 64
+        )
 
     def test_oversized_restore_does_not_reserve_or_allocate(self):
         req = self._req(length=60, output=8)

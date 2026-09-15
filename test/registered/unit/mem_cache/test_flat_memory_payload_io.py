@@ -8,12 +8,15 @@ import weakref
 from collections import deque
 from concurrent.futures import Future
 from contextlib import contextmanager
-from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import torch
 
-from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
+from sglang.srt.mem_cache.hicache_storage import PoolHitPolicy, PoolName, PoolTransfer
+from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
+    DevicePoolEntry,
+    DevicePoolGroup,
+)
 from sglang.srt.mem_cache.storage.flat_memory import flat_memory_direct_linker
 from sglang.srt.mem_cache.storage.flat_memory.flat_memory_direct_linker import (
     FlatMemoryDirectLinker,
@@ -99,34 +102,40 @@ def _request(rows):
     ]
 
 
-def _make_transfer(*, pages=1, capacity=8 * ALIGNMENT, batch_pages=128):
-    buffer = torch.arange(pages * 17, dtype=torch.uint8, device="cpu").reshape(
-        pages, 17
+def _make_transfer(
+    *,
+    pages=1,
+    capacity=8 * ALIGNMENT,
+    batch_pages=128,
+    staging_bytes=3 * ALIGNMENT,
+    row_bytes=17,
+    max_io_bytes=ALIGNMENT,
+):
+    buffer = torch.arange(pages * row_bytes, dtype=torch.uint8, device="cpu").reshape(
+        pages, row_bytes
     )
-    entry = SimpleNamespace(
+    entry = DevicePoolEntry(
         name=PoolName.KV,
         indices_from_pool=PoolName.KV,
+        device_pool=None,
         components=[[buffer]],
         layer_mapping={0: 0},
         page_size=1,
-        _row_span=1,
-        prepare_locations=lambda indices: indices.tolist(),
+        rows_are_pages=True,
     )
     layout = PayloadLayout(
-        pool_group=SimpleNamespace(
-            entries=[entry], entry_map={PoolName.KV: entry}, page_size=1
-        ),
+        pool_group=DevicePoolGroup([entry], num_layers=1, page_size=1),
         model_namespace="cpu-payload-io",
         tp_rank=0,
         tp_size=1,
-        max_io_bytes=ALIGNMENT,
+        max_io_bytes=max_io_bytes,
     )
     manager = _CPUManager(capacity)
     transfer = GPUTransfer(
         layout=layout,
         manager=manager,
         device=torch.device("cpu"),
-        staging_bytes=3 * ALIGNMENT,
+        staging_bytes=staging_bytes,
         batch_pages=batch_pages,
     )
     return transfer, manager, buffer, _request(list(range(pages)))
@@ -176,6 +185,315 @@ def _make_linker(transfer):
 
 
 class TestFlatPayloadIO(CustomTestCase):
+    def test_whole_snapshot_survives_source_reuse_during_first_native_batch(self):
+        """All source bytes must be independent before any source-safe receipt."""
+        transfer, manager, buffer, request = _make_transfer(
+            pages=3, batch_pages=1, staging_bytes=8 * ALIGNMENT
+        )
+        expected = buffer.clone()
+        consumed = threading.Event()
+        pointers = []
+        native_put = manager.put_gpu_file_detailed.side_effect
+
+        def blocked_put(keys, addresses, sizes):
+            self.assertTrue(consumed.is_set(), "Native write still owns source pages")
+            self.assertEqual(transfer.budget.current_bytes, 4 * ALIGNMENT - 1)
+            pointers.extend(addresses)
+            buffer.fill_(231)
+            return native_put(keys, addresses, sizes)
+
+        manager.put_gpu_file_detailed.side_effect = blocked_put
+        with patch.object(torch, "empty", wraps=torch.empty) as allocate:
+            transfer.write(request, on_source_consumed=consumed.set)
+        self.assertEqual(allocate.call_count, 1, "Native batches must share one owner")
+        self.assertEqual(
+            pointers, list(range(pointers[0], pointers[0] + 3 * ALIGNMENT, ALIGNMENT))
+        )
+        self.assertEqual(manager.check_gpu_write.call_count, 3)
+        self.assertTrue(
+            all(
+                len(call.args[0]) == 1
+                for call in manager.check_gpu_write.call_args_list
+            )
+        )
+        buffer.zero_()
+        transfer.read(request)
+        torch.testing.assert_close(buffer, expected)
+        self.assertEqual(transfer.budget.current_bytes, 0)
+
+    def test_streaming_receipt_waits_for_last_pack_not_first_native_batch(self):
+        transfer, manager, buffer, request = _make_transfer(
+            pages=4, batch_pages=1, staging_bytes=6 * ALIGNMENT
+        )
+        expected = buffer.clone()
+        consumed = threading.Event()
+        native_put = manager.put_gpu_file_detailed.side_effect
+        calls = 0
+
+        def observed_put(keys, pointers, sizes):
+            nonlocal calls
+            calls += 1
+            self.assertEqual(consumed.is_set(), calls == 4)
+            self.assertLessEqual(transfer.budget.current_bytes, 3 * ALIGNMENT)
+            if calls == 4:
+                buffer.fill_(231)
+            return native_put(keys, pointers, sizes)
+
+        manager.put_gpu_file_detailed.side_effect = observed_put
+        transfer.write(request, on_source_consumed=consumed.set)
+        buffer.zero_()
+        transfer.read(request)
+        torch.testing.assert_close(buffer, expected)
+        self.assertEqual(calls, 4)
+
+    def test_staging_reservation_is_nonblocking_and_includes_alignment(self):
+        budget = StagingBudget(4 * ALIGNMENT)
+        self.assertTrue(budget.try_acquire(2 * ALIGNMENT - 1))
+        self.assertFalse(budget.try_acquire(2 * ALIGNMENT + 2))
+        self.assertEqual(budget.current_bytes, 2 * ALIGNMENT - 1)
+        budget.release(2 * ALIGNMENT - 1)
+        self.assertTrue(budget.try_acquire(4 * ALIGNMENT))
+        budget.release(4 * ALIGNMENT)
+
+    def test_snapshot_unavailable_budget_falls_back_without_waiting(self):
+        transfer, manager, _, request = _make_transfer(
+            pages=3, batch_pages=1, staging_bytes=8 * ALIGNMENT
+        )
+        held = 5 * ALIGNMENT
+        transfer.budget.acquire(held)
+        consumed = Mock()
+        try:
+            with patch.object(
+                transfer.budget, "try_acquire", wraps=transfer.budget.try_acquire
+            ) as reserve:
+                transfer.write(request, on_source_consumed=consumed)
+            reserve.assert_called_once_with(4 * ALIGNMENT - 1)
+            consumed.assert_called_once_with()
+            self.assertEqual(transfer.budget.current_bytes, held)
+            self.assertEqual(transfer.budget.wait_count, 0)
+            self.assertEqual(transfer.snapshot_writes, 0)
+            self.assertEqual(transfer.streaming_writes, 1)
+            self.assertEqual(transfer.snapshot_budget_fallbacks, 1)
+            self.assertEqual(manager.put_gpu_file_detailed.call_count, 3)
+        finally:
+            transfer.budget.release(held)
+
+    def test_owner_quotas_use_actual_fragments_and_exact_alignment_slack(self):
+        for budget, row_bytes, max_io, enabled in (
+            (6 * ALIGNMENT - 3, ALIGNMENT + 1, 2 * ALIGNMENT, False),
+            (6 * ALIGNMENT - 2, ALIGNMENT + 1, 2 * ALIGNMENT, True),
+            (8 * ALIGNMENT, 17, 4 * ALIGNMENT, True),
+        ):
+            with self.subTest(budget=budget, row_bytes=row_bytes):
+                transfer, _, _, request = _make_transfer(
+                    staging_bytes=budget, row_bytes=row_bytes, max_io_bytes=max_io
+                )
+                self.assertEqual(transfer.snapshot_enabled, enabled)
+                transfer.write(request)
+                transfer.read(request)
+                self.assertLessEqual(transfer.budget.peak_bytes, budget)
+                self.assertEqual(transfer.snapshot_writes, int(enabled))
+                self.assertEqual(transfer.streaming_writes, int(not enabled))
+        for budget, snapshot in ((8 * ALIGNMENT - 4, False), (8 * ALIGNMENT - 2, True)):
+            with self.subTest(snapshot_budget=budget):
+                transfer, _, _, request = _make_transfer(pages=3, staging_bytes=budget)
+                transfer.write(request)
+                self.assertTrue(transfer.snapshot_enabled)
+                self.assertEqual(transfer.snapshot_writes, int(snapshot))
+                self.assertLessEqual(transfer.budget.peak_bytes, budget // 2)
+
+    def test_all_streaming_write_and_read_batches_obey_direction_quotas(self):
+        transfer, manager, buffer, request = _make_transfer(
+            pages=7, staging_bytes=8 * ALIGNMENT + 1
+        )
+        expected = buffer.clone()
+        with patch.object(torch, "empty", wraps=torch.empty) as allocate:
+            transfer.write(request)
+            write_sizes = [call.args[0] for call in allocate.call_args_list]
+            allocate.reset_mock()
+            buffer.zero_()
+            transfer.read(request)
+            read_sizes = [call.args[0] for call in allocate.call_args_list]
+        self.assertEqual(manager.put_gpu_file_detailed.call_count, 3)
+        self.assertEqual(len(read_sizes), 3)
+        self.assertTrue(all(size <= transfer.write_quota_bytes for size in write_sizes))
+        self.assertTrue(all(size <= transfer.read_quota_bytes for size in read_sizes))
+        torch.testing.assert_close(buffer, expected)
+
+    def test_snapshot_leaves_headroom_for_a_read_while_native_write_is_blocked(self):
+        transfer, manager, buffer, _ = _make_transfer(
+            pages=4, staging_bytes=8 * ALIGNMENT
+        )
+        transfer.write(_request([0]))
+        expected = buffer[0].clone()
+        entered, resume = threading.Event(), threading.Event()
+        completed = Future()
+        native_put = manager.put_gpu_file_detailed.side_effect
+
+        def blocked_put(*args):
+            entered.set()
+            if not resume.wait(timeout=3):
+                raise AssertionError("Write was not resumed")
+            return native_put(*args)
+
+        def write():
+            try:
+                transfer.write(_request([1, 2, 3]))
+                completed.set_result(None)
+            except BaseException as error:
+                completed.set_exception(error)
+
+        manager.put_gpu_file_detailed.side_effect = blocked_put
+        thread = threading.Thread(target=write, daemon=True)
+        thread.start()
+        try:
+            self.assertTrue(entered.wait(timeout=2))
+            self.assertEqual(transfer.budget.current_bytes, 4 * ALIGNMENT - 1)
+            buffer[0].zero_()
+            transfer.read(_request([0]))
+            torch.testing.assert_close(buffer[0], expected)
+            self.assertEqual(transfer.budget.wait_count, 0)
+            self.assertLessEqual(
+                transfer.budget.peak_bytes, transfer.budget.total_bytes
+            )
+            self.assertFalse(completed.done())
+        finally:
+            resume.set()
+            thread.join(timeout=3)
+        completed.result(timeout=1)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(transfer.budget.current_bytes, 0)
+
+    def test_v4_source_receipt_includes_swa_compressed_indexer_and_state_pools(self):
+        sources = (
+            (PoolName.SWA, PoolName.SWA),
+            (PoolName.DEEPSEEK_V4_C4, PoolName.KV),
+            (PoolName.DEEPSEEK_V4_C4_INDEXER, PoolName.KV),
+            (PoolName.DEEPSEEK_V4_C128, PoolName.KV),
+            (PoolName.DEEPSEEK_V4_C4_STATE, PoolName.SWA),
+            (PoolName.DEEPSEEK_V4_C4_INDEXER_STATE, PoolName.SWA),
+        )
+        for snapshot in (False, True):
+            with self.subTest(snapshot=snapshot):
+                entries = [
+                    DevicePoolEntry(
+                        name=name,
+                        indices_from_pool=source,
+                        device_pool=None,
+                        components=[
+                            [torch.full((1, 17 + index), index + 1, dtype=torch.uint8)]
+                        ],
+                        layer_mapping={0: 0},
+                        page_size=1,
+                        rows_are_pages=True,
+                    )
+                    for index, (name, source) in enumerate(sources)
+                ]
+                group = DevicePoolGroup(entries, num_layers=1, page_size=1)
+                layout = PayloadLayout(
+                    pool_group=group,
+                    model_namespace="v4-physical-source-ownership",
+                    tp_rank=0,
+                    tp_size=1,
+                    max_io_bytes=ALIGNMENT,
+                )
+                manager = _CPUManager(8 * ALIGNMENT)
+                transfer = GPUTransfer(
+                    layout=layout,
+                    manager=manager,
+                    device="cpu",
+                    batch_pages=1,
+                    staging_bytes=(14 if snapshot else 6) * ALIGNMENT,
+                )
+                requests = group.resolve_transfers(
+                    [
+                        PoolTransfer(
+                            name=name,
+                            device_indices=torch.tensor([0]),
+                            keys=["page"],
+                            hit_policy=policy,
+                        )
+                        for name, policy in (
+                            (PoolName.KV, PoolHitPolicy.ALL_PAGES),
+                            (PoolName.SWA, PoolHitPolicy.TRAILING_PAGES),
+                        )
+                    ]
+                )
+                expected = [entry.components[0][0].clone() for entry in entries]
+                consumed = threading.Event()
+                native_put = manager.put_gpu_file_detailed.side_effect
+                writes = 0
+
+                def write(keys, pointers, sizes):
+                    nonlocal writes
+                    writes += 1
+                    self.assertEqual(
+                        consumed.is_set(), snapshot or writes == len(entries)
+                    )
+                    if consumed.is_set():
+                        for entry in entries:
+                            entry.components[0][0].fill_(255)
+                    return native_put(keys, pointers, sizes)
+
+                manager.put_gpu_file_detailed.side_effect = write
+                transfer.write(requests, on_source_consumed=consumed.set)
+                transfer.read(requests)
+                for entry, original in zip(entries, expected):
+                    torch.testing.assert_close(entry.components[0][0], original)
+                self.assertEqual(transfer.snapshot_writes, int(snapshot))
+                if snapshot:
+                    self.assertEqual(transfer.budget.peak_bytes, 7 * ALIGNMENT - 1)
+
+    def test_snapshot_unsafe_before_pack_holds_source_after_pack_retains_owner(self):
+        for fail_pack in (True, False):
+            with self.subTest(fail_pack=fail_pack):
+                transfer, manager, _, request = _make_transfer(
+                    pages=3, staging_bytes=8 * ALIGNMENT
+                )
+                consumed = Mock()
+                failure = FlatUnsafeIOError("completion is unknown")
+                target = transfer if fail_pack else manager
+                method = "_pack_batch" if fail_pack else "put_gpu_file_detailed"
+                with patch.object(target, method, side_effect=failure):
+                    with self.assertRaises(FlatUnsafeIOError):
+                        transfer.write(request, on_source_consumed=consumed)
+                self.assertEqual(consumed.call_count, int(not fail_pack))
+                self.assertEqual(len(transfer._retained_staging), 1)
+                self.assertEqual(transfer.budget.current_bytes, 4 * ALIGNMENT - 1)
+                with self.assertRaises(FlatUnsafeIOError):
+                    transfer.budget.try_acquire(1)
+
+    def test_snapshot_keeps_per_batch_capacity_and_partial_write_semantics(self):
+        transfer, manager, _, request = _make_transfer(
+            pages=3, capacity=ALIGNMENT, staging_bytes=8 * ALIGNMENT, batch_pages=1
+        )
+        consumed = Mock()
+        with self.assertRaises(FlatCapacityError):
+            transfer.write(request, on_source_consumed=consumed)
+        consumed.assert_called_once_with()
+        self.assertEqual(manager.check_gpu_write.call_count, 2)
+        self.assertEqual(manager.put_gpu_file_detailed.call_count, 1)
+        self.assertEqual(len(manager.objects), 1)
+        self.assertEqual(transfer.padded_write_bytes, ALIGNMENT)
+        self.assertEqual(transfer.budget.current_bytes, 0)
+        transfer.raise_if_unsafe()
+
+    def test_snapshot_duplicate_only_never_reserves_or_allocates(self):
+        transfer, manager, _, request = _make_transfer(
+            pages=3, capacity=3 * ALIGNMENT, staging_bytes=8 * ALIGNMENT, batch_pages=1
+        )
+        transfer.write(request)
+        consumed = Mock()
+        with (
+            patch.object(torch, "empty") as allocate,
+            patch.object(transfer.budget, "try_acquire") as reserve,
+        ):
+            transfer.write(request, on_source_consumed=consumed)
+        allocate.assert_not_called()
+        reserve.assert_not_called()
+        consumed.assert_called_once_with()
+        self.assertEqual(manager.put_gpu_file_detailed.call_count, 3)
+
     def test_capacity_preflight_rejects_before_staging_or_packing(self):
         transfer, manager, _, request = _make_transfer(capacity=0)
         with (
@@ -426,10 +744,10 @@ class TestFlatPayloadIO(CustomTestCase):
         transfer, manager, _, request = _make_transfer()
         sync_error = _NativeIOError("stream completion cannot be established")
         owners = []
-        allocate = torch.empty
+        original_allocate = torch.empty
 
         def track_owner(*args, **kwargs):
-            owner = allocate(*args, **kwargs)
+            owner = original_allocate(*args, **kwargs)
             owners.append(weakref.ref(owner))
             return owner
 
@@ -522,6 +840,87 @@ class TestFlatPayloadIO(CustomTestCase):
 
 
 class TestFlatLinkerWriteIO(CustomTestCase):
+    def test_write_worker_source_safe_receipt_precedes_durable_completion(self):
+        transfer, manager, buffer, _ = _make_transfer(
+            pages=3, staging_bytes=8 * ALIGNMENT
+        )
+        expected = buffer.clone()
+        manager.close = Mock()
+        linker = FlatMemoryDirectLinker(
+            pool_group=transfer.layout.pool_group,
+            config={
+                "gds_max_io_bytes": ALIGNMENT,
+                "gpu_stage_bytes": 8 * ALIGNMENT,
+                "gpu_batch_pages": 1,
+                "drain_timeout": 0.02,
+            },
+            model_namespace="source-worker",
+            tp_rank=0,
+            tp_size=1,
+            device="cpu",
+            manager=manager,
+        )
+        entered, resume = threading.Event(), threading.Event()
+        native_put = manager.put_gpu_file_detailed.side_effect
+
+        def blocked_put(*args):
+            entered.set()
+            if not resume.wait(timeout=3):
+                raise AssertionError("Write was not resumed")
+            return native_put(*args)
+
+        manager.put_gpu_file_detailed.side_effect = blocked_put
+        try:
+            self.assertTrue(
+                linker.offload(
+                    [
+                        PoolTransfer(
+                            name=PoolName.KV,
+                            device_indices=torch.tensor([0, 1, 2]),
+                            keys=["a", "b", "c"],
+                        )
+                    ]
+                )
+            )
+            self.assertTrue(entered.wait(timeout=2))
+            self.assertEqual(linker.num_source_safe_offloads(), 1)
+            self.assertEqual(linker.num_completed_offloads(), 0)
+            self.assertTrue(linker.has_unfinished_io())
+            self.assertFalse(linker.drain(timeout=0))
+            with self.assertRaises(TimeoutError):
+                linker.close()
+            self.assertFalse(linker._closed)
+            self.assertEqual(len(linker._offload_coverage), 1)
+            buffer.fill_(231)
+        finally:
+            resume.set()
+            linker.drain_timeout = 2
+            linker.close()
+        self.assertEqual(len(manager.objects), 3)
+        for row, stored in zip(expected, manager.objects.values()):
+            self.assertEqual(stored[: row.numel()], bytes(row.tolist()))
+        self.assertEqual(linker.transfer.budget.current_bytes, 0)
+
+    def test_unsafe_write_before_and_after_pack_keep_distinct_source_receipts(self):
+        for fail_pack in (True, False):
+            with self.subTest(fail_pack=fail_pack):
+                transfer, manager, _, request = _make_transfer(
+                    pages=3, staging_bytes=8 * ALIGNMENT
+                )
+                linker = _make_linker(transfer)
+                source = Future()
+                target = transfer if fail_pack else manager
+                method = "_pack_batch" if fail_pack else "put_gpu_file_detailed"
+                failure = FlatUnsafeIOError("unknown completion")
+                with patch.object(target, method, side_effect=failure):
+                    result = linker._write(request, None, source)
+                self.assertTrue(result.unsafe)
+                self.assertFalse(result.success)
+                self.assertEqual(source.done(), not fail_pack)
+                self.assertIs(linker._unsafe_error, failure)
+                self.assertEqual(len(transfer._retained_staging), 1)
+                self.assertEqual(transfer.budget.current_bytes, 4 * ALIGNMENT - 1)
+
     def test_capacity_warning_is_rate_limited_without_error_or_success_samples(self):
         transfer, _, _, request = _make_transfer(capacity=0)
         linker = _make_linker(transfer)
@@ -545,7 +944,9 @@ class TestFlatLinkerWriteIO(CustomTestCase):
         for result in results[:2]:
             future = Future()
             future.set_result(result)
-            linker._offloads.append(future)
+            linker._offloads.append(
+                flat_memory_direct_linker._Offload(future, Future())
+            )
         self.assertIs(linker.pop_completed_offload_result(), results[0])
         self.assertIs(linker.pop_completed_offload(), False)
 
@@ -574,7 +975,9 @@ class TestFlatLinkerWriteIO(CustomTestCase):
                 self.assertEqual(logged, [failure])
                 future = Future()
                 future.set_result(result)
-                linker._offloads.append(future)
+                linker._offloads.append(
+                    flat_memory_direct_linker._Offload(future, Future())
+                )
                 if result.unsafe:
                     self.assertIs(linker._unsafe_error, failure)
                     with self.assertRaisesRegex(FlatUnsafeIOError, str(failure)):
@@ -594,7 +997,10 @@ class TestFlatLinkerWriteIO(CustomTestCase):
         self.assertEqual(linker._backup_samples, [(2, buffer.numel(), 2.0)])
         first, second = Future(), Future()
         second.set_result(result)
-        linker._offloads.extend((first, second))
+        linker._offloads.extend(
+            flat_memory_direct_linker._Offload(future, Future())
+            for future in (first, second)
+        )
         self.assertEqual(linker.num_completed_offloads(), 0)
         with self.assertRaisesRegex(RuntimeError, "No Flat offload has completed"):
             linker.pop_completed_offload_result()

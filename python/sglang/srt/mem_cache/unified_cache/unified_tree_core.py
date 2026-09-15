@@ -500,6 +500,10 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         """
         return self._node_arena[node_id]
 
+    def try_node_by_id(self, node_id: NodeId) -> UnifiedTreeNode | None:
+        # FLAT_MEMORY: Durable acknowledgments may outlive source-unlocked nodes.
+        return self._node_arena.get(node_id)
+
     def is_backuped(self, node_id: NodeId) -> bool:
         """Whether the node's KV is already backed up to host."""
         return self._node_arena[node_id].backuped

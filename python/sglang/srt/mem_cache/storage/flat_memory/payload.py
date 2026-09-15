@@ -5,7 +5,8 @@ from __future__ import annotations
 import hashlib
 import json
 import threading
-from collections.abc import Iterable, Iterator
+import time
+from collections.abc import Callable, Iterable, Iterator
 from contextlib import nullcontext
 from typing import Any
 
@@ -173,6 +174,13 @@ class PayloadLayout:
             f"f{spec.part}:n{spec.length}:{page_key}"
         )
 
+    def padded_bytes(self, transfers: list[PoolTransfer]) -> int:
+        return sum(
+            len(transfer.keys or [])
+            * sum(spec.padded_length for spec in self.specs[transfer.name])
+            for transfer in transfers
+        )
+
     def fragments(self, transfers: list[PoolTransfer]) -> Iterator[PayloadFragment]:
         for transfer in transfers:
             entry = self.pool_group.entry_map[transfer.name]
@@ -209,6 +217,8 @@ class StagingBudget:
         self.total_bytes = total_bytes
         self.current_bytes = 0
         self.peak_bytes = 0
+        self.wait_seconds = 0.0
+        self.wait_count = 0
         self._condition = threading.Condition()
         self._error: FlatUnsafeIOError | None = None
 
@@ -216,14 +226,28 @@ class StagingBudget:
         if size > self.total_bytes:
             raise ValueError("One Flat staging allocation exceeds the total budget")
         with self._condition:
-            self._condition.wait_for(
-                lambda: self._error is not None
-                or self.current_bytes + size <= self.total_bytes
-            )
+            if self._error is None and self.current_bytes + size > self.total_bytes:
+                started = time.perf_counter()
+                self.wait_count += 1
+                self._condition.wait_for(
+                    lambda: self._error is not None
+                    or self.current_bytes + size <= self.total_bytes
+                )
+                self.wait_seconds += time.perf_counter() - started
             if self._error is not None:
                 raise self._error
             self.current_bytes += size
             self.peak_bytes = max(self.peak_bytes, self.current_bytes)
+
+    def try_acquire(self, size: int) -> bool:
+        with self._condition:
+            if self._error is not None:
+                raise self._error
+            if self.current_bytes + size > self.total_bytes:
+                return False
+            self.current_bytes += size
+            self.peak_bytes = max(self.peak_bytes, self.current_bytes)
+            return True
 
     def poison(self, error: FlatUnsafeIOError) -> None:
         with self._condition:
@@ -270,6 +294,27 @@ class GPUTransfer:
             raise ValueError(
                 "Flat staging budget cannot fit gds_max_io_bytes plus alignment"
             )
+        # FLAT_MEMORY: One write worker owns at most W, leaving actual read headroom.
+        write_quota = staging_bytes // 2
+        read_quota = staging_bytes - write_quota
+        largest_fragment = max(
+            (spec.padded_length for specs in layout.specs.values() for spec in specs),
+            default=0,
+        )
+        self.snapshot_enabled = largest_fragment + ALIGNMENT - 1 <= min(
+            write_quota, read_quota
+        )
+        self.write_quota_bytes = write_quota if self.snapshot_enabled else staging_bytes
+        self.read_quota_bytes = read_quota if self.snapshot_enabled else staging_bytes
+        self.write_batch_bytes = (
+            (self.write_quota_bytes - ALIGNMENT + 1) // ALIGNMENT * ALIGNMENT
+        )
+        self.read_batch_bytes = (
+            (self.read_quota_bytes - ALIGNMENT + 1) // ALIGNMENT * ALIGNMENT
+        )
+        self.snapshot_writes = 0
+        self.streaming_writes = 0
+        self.snapshot_budget_fallbacks = 0
         self.logical_read_bytes = 0
         self.logical_write_bytes = 0
         self.padded_read_bytes = 0
@@ -278,11 +323,11 @@ class GPUTransfer:
         self._unsafe_error: FlatUnsafeIOError | None = None
         self._retained_staging: list[torch.Tensor] = []
 
-    def _batches(self, fragments: Iterable[PayloadFragment]):
+    def _batches(self, fragments: Iterable[PayloadFragment], *, batch_bytes: int):
         batch, total = [], 0
         for fragment in fragments:
             if batch and (
-                total + fragment.padded_length > self.batch_bytes
+                total + fragment.padded_length > batch_bytes
                 or len(batch) >= self.batch_pages
             ):
                 yield batch, total
@@ -308,11 +353,29 @@ class GPUTransfer:
             return torch.cuda.stream(torch.cuda.Stream(device=self.device))
         return nullcontext()
 
-    def write(self, transfers: list[PoolTransfer]) -> None:
-        self._transfer(transfers=transfers, write=True)
+    def write(
+        self,
+        transfers: list[PoolTransfer],
+        *,
+        on_source_consumed: Callable[[], None] | None = None,
+    ) -> None:
+        self.raise_if_unsafe()
+        with self._context(), self._stream_context():
+            self._write_transfers(transfers, on_source_consumed=on_source_consumed)
 
     def read(self, transfers: list[PoolTransfer]) -> None:
-        self._transfer(transfers=transfers, write=False)
+        self.raise_if_unsafe()
+        with self._context(), self._stream_context():
+            for batch, total in self._batches(
+                self.layout.fragments(transfers), batch_bytes=self.read_batch_bytes
+            ):
+                self._with_stage(
+                    total,
+                    lambda stage: self._transfer_batch(
+                        batch=batch, stage=stage, write=False
+                    ),
+                )
+                self._record_batch(batch, write=False)
 
     def raise_if_unsafe(self) -> None:
         if self._unsafe_error is not None:
@@ -340,51 +403,143 @@ class GPUTransfer:
             raise RuntimeError("Flat GPU write did not complete every payload fragment")
         return results
 
-    def _transfer(self, *, transfers: list[PoolTransfer], write: bool) -> None:
-        self.raise_if_unsafe()
-        with self._context(), self._stream_context():
-            for batch, total in self._batches(self.layout.fragments(transfers)):
-                if write:
-                    admission = self.manager.check_gpu_write(
-                        [fragment.key for fragment in batch],
-                        [fragment.padded_length for fragment in batch],
+    def _write_transfers(self, transfers, *, on_source_consumed) -> None:
+        whole_bytes = self.layout.padded_bytes(transfers)
+        remaining = whole_bytes
+        batches = iter(
+            self._batches(
+                self.layout.fragments(transfers), batch_bytes=self.write_batch_bytes
+            )
+        )
+        attempted_snapshot = False
+        for batch, total in batches:
+            remaining -= total
+            if self._duplicate_batch(batch):
+                self._record_batch(batch, write=True)
+                continue
+            if not attempted_snapshot:
+                attempted_snapshot = True
+                allocated = whole_bytes + ALIGNMENT - 1
+                fits = self.snapshot_enabled and allocated <= self.write_quota_bytes
+                if fits and self.budget.try_acquire(allocated):
+                    with self._metrics_lock:
+                        self.snapshot_writes += 1
+                    self._with_stage(
+                        whole_bytes,
+                        lambda stage: self._write_snapshot(
+                            first=(batch, total),
+                            batches=batches,
+                            stage=stage,
+                            on_source_consumed=on_source_consumed,
+                        ),
+                        reserved=True,
                     )
-                    results = self._write_results(
-                        admission, count=len(batch), complete=False
-                    )
-                    if all(results):
-                        self._record_batch(batch, write=True)
-                        continue
-                allocated = total + ALIGNMENT - 1
-                self.budget.acquire(allocated)
-                owner = stage = None
-                unsafe = False
-                try:
-                    owner = torch.empty(
-                        allocated, dtype=torch.uint8, device=self.device
-                    )
-                    offset = (-owner.data_ptr()) % ALIGNMENT
-                    stage = owner.narrow(0, offset, total)
-                    self._transfer_batch(batch=batch, stage=stage, write=write)
-                except FlatUnsafeIOError as error:
-                    unsafe = True
-                    self._retain_stage(owner, error)
-                    raise
-                finally:
-                    if not unsafe:
-                        try:
-                            self._sync()
-                        except Exception as error:
-                            failure = FlatUnsafeIOError(
-                                f"Flat GPU staging did not quiesce: {error}"
-                            )
-                            self._retain_stage(owner, failure)
-                            raise failure from error
-                        owner = stage = None
-                        self.budget.release(allocated)
-                self._record_batch(batch, write=write)
+                    return
+                with self._metrics_lock:
+                    self.streaming_writes += 1
+                    self.snapshot_budget_fallbacks += int(fits)
+            self._with_stage(
+                total,
+                lambda stage: self._transfer_batch(
+                    batch=batch,
+                    stage=stage,
+                    write=True,
+                    on_source_consumed=(on_source_consumed if remaining == 0 else None),
+                ),
+            )
+            self._record_batch(batch, write=True)
+            if remaining == 0:
+                return
+        # FLAT_MEMORY: Only duplicate batches (possibly a trailing suffix) remain.
+        if on_source_consumed is not None:
+            on_source_consumed()
 
-    def _transfer_batch(self, *, batch, stage: torch.Tensor, write: bool) -> None:
+    def _duplicate_batch(self, batch) -> bool:
+        admission = self.manager.check_gpu_write(
+            [fragment.key for fragment in batch],
+            [fragment.padded_length for fragment in batch],
+        )
+        return all(self._write_results(admission, count=len(batch), complete=False))
+
+    def _write_snapshot(self, *, first, batches, stage, on_source_consumed) -> None:
+        owned_batches = [first, *batches]
+        offset = 0
+        for batch, total in owned_batches:
+            self._pack_batch(batch, stage.narrow(0, offset, total))
+            offset += total
+        self._sync()
+        if on_source_consumed is not None:
+            on_source_consumed()
+        offset = 0
+        for index, (batch, total) in enumerate(owned_batches):
+            # FLAT_MEMORY: Admission remains per native batch, never one storage extent.
+            if index == 0 or not self._duplicate_batch(batch):
+                self._write_staged_batch(batch, stage.narrow(0, offset, total))
+            self._record_batch(batch, write=True)
+            offset += total
+
+    def _with_stage(self, total: int, transfer, *, reserved: bool = False) -> None:
+        allocated = total + ALIGNMENT - 1
+        if not reserved:
+            self.budget.acquire(allocated)
+        owner = stage = None
+        unsafe = False
+        try:
+            owner = torch.empty(allocated, dtype=torch.uint8, device=self.device)
+            offset = (-owner.data_ptr()) % ALIGNMENT
+            stage = owner.narrow(0, offset, total)
+            transfer(stage)
+        except FlatUnsafeIOError as error:
+            unsafe = True
+            self._retain_stage(owner, error)
+            raise
+        finally:
+            if not unsafe:
+                try:
+                    self._sync()
+                except Exception as error:
+                    failure = FlatUnsafeIOError(
+                        f"Flat GPU staging did not quiesce: {error}"
+                    )
+                    self._retain_stage(owner, failure)
+                    raise failure from error
+                owner = stage = None
+                self.budget.release(allocated)
+
+    @staticmethod
+    def _pack_batch(batch, stage) -> None:
+        offset = 0
+        for fragment in batch:
+            view = stage.narrow(0, offset, fragment.padded_length)
+            view.zero_()
+            view[: fragment.source.numel()].copy_(fragment.source)
+            offset += fragment.padded_length
+
+    def _write_staged_batch(self, batch, stage) -> None:
+        pointers, offset = [], 0
+        for fragment in batch:
+            pointer = stage.data_ptr() + offset
+            if pointer % ALIGNMENT:
+                raise RuntimeError("Flat GPU staging pointer is not 4096-byte aligned")
+            pointers.append(pointer)
+            offset += fragment.padded_length
+        result = self.manager.put_gpu_file_detailed(
+            [fragment.key for fragment in batch],
+            pointers,
+            [fragment.padded_length for fragment in batch],
+        )
+        self._write_results(result, count=len(batch), complete=True)
+
+    def _transfer_batch(
+        self, *, batch, stage: torch.Tensor, write: bool, on_source_consumed=None
+    ) -> None:
+        if write:
+            self._pack_batch(batch, stage)
+            self._sync()
+            if on_source_consumed is not None:
+                on_source_consumed()
+            self._write_staged_batch(batch, stage)
+            return
         views, pointers, sizes, keys = [], [], [], []
         offset = 0
         for fragment in batch:
@@ -395,31 +550,20 @@ class GPUTransfer:
             keys.append(fragment.key)
             if view.data_ptr() % ALIGNMENT:
                 raise RuntimeError("Flat GPU staging pointer is not 4096-byte aligned")
-            if write:
-                view.zero_()
-                view[: fragment.source.numel()].copy_(fragment.source)
             offset += fragment.padded_length
         # FLAT_MEMORY: Native streams must wait for this allocation's prior users.
         self._sync()
-        if write:
-            result = self.manager.put_gpu_file_detailed(keys, pointers, sizes)
-            results = self._write_results(result, count=len(batch), complete=True)
-        else:
-            addresses = self.manager.lookup_addresses(keys)
-            if len(addresses) != len(keys) or not all(addresses):
-                raise RuntimeError("Flat GPU restore lost a required payload fragment")
-            if any(address % ALIGNMENT for address in addresses):
-                raise RuntimeError("Flat GPU storage offset is not 4096-byte aligned")
-            results = self.manager.read_gpu(addresses, pointers, sizes)
+        addresses = self.manager.lookup_addresses(keys)
+        if len(addresses) != len(keys) or not all(addresses):
+            raise RuntimeError("Flat GPU restore lost a required payload fragment")
+        if any(address % ALIGNMENT for address in addresses):
+            raise RuntimeError("Flat GPU storage offset is not 4096-byte aligned")
+        results = self.manager.read_gpu(addresses, pointers, sizes)
         if len(results) != len(batch) or not all(results):
-            operation = "write" if write else "read"
-            raise RuntimeError(
-                f"Flat GPU {operation} did not complete every payload fragment"
-            )
-        if not write:
-            for fragment, view in zip(batch, views):
-                fragment.source.copy_(view[: fragment.source.numel()])
-            self._sync()
+            raise RuntimeError("Flat GPU read did not complete every payload fragment")
+        for fragment, view in zip(batch, views):
+            fragment.source.copy_(view[: fragment.source.numel()])
+        self._sync()
 
     def _record_batch(self, batch: list[PayloadFragment], *, write: bool) -> None:
         logical = sum(fragment.source.numel() for fragment in batch)
@@ -523,4 +667,12 @@ class GPUTransfer:
                 "gpu_staging_bytes": self.budget.current_bytes,
                 "gpu_staging_peak_bytes": self.budget.peak_bytes,
                 "gpu_staging_budget_bytes": self.budget.total_bytes,
+                "gpu_staging_wait_seconds": self.budget.wait_seconds,
+                "gpu_staging_wait_count": self.budget.wait_count,
+                "snapshot_enabled": self.snapshot_enabled,
+                "write_owner_quota_bytes": self.write_quota_bytes,
+                "read_owner_quota_bytes": self.read_quota_bytes,
+                "snapshot_writes": self.snapshot_writes,
+                "streaming_writes": self.streaming_writes,
+                "snapshot_budget_fallbacks": self.snapshot_budget_fallbacks,
             }

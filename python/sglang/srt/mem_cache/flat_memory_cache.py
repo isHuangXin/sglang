@@ -58,7 +58,10 @@ class _Prefetch(msgspec.Struct, kw_only=True):
     queried_endpoint: int = 0
     query_generation: int = -1
     refresh_attempts: int = 0
+    storage_probe_attempts: int = 0
+    anchor_refresh_attempts: int = 0
     refresh_deadline: float = 0.0
+    device_cover_reactivations: int = 0
     read_anchor_tokens: int = 0
     read_endpoint: int = 0
     lease_started: float = 0.0
@@ -69,6 +72,11 @@ class _Prefetch(msgspec.Struct, kw_only=True):
     revoke_reason: str = ""
     admission_attempted: bool = False
     admitted: bool = False
+    allocation_wait_started: float = 0.0
+    allocation_wait_deadline: float = 0.0
+    allocation_wait_eligible: bool = False
+    allocation_plan_attempts: int = 0
+    plan_rejection_recorded: bool = False
 
 
 class FlatMemoryCache:
@@ -82,7 +90,11 @@ class FlatMemoryCache:
         self.cache = cache
         self.ready_fcfs = ready_fcfs
         self.cache_linker = cache_linker
-        self.tree_linker = UnifiedCacheLinkerWrapper(cache, cache_linker)
+        self.tree_linker = UnifiedCacheLinkerWrapper(
+            cache,
+            cache_linker,
+            resolve_pending_node=cache.tree_core.try_node_by_id,
+        )
         self.prefetches: dict[str, _Prefetch] = {}
         self.arrivals: dict[str, int] = {}
         self._next_arrival = 0
@@ -223,15 +235,37 @@ class FlatMemoryCache:
         states = list(self.prefetches.values())
         if not states:
             return
-        query_ready = self._reduce(
+        now = time.monotonic()
+        query_flags = self._reduce(
             [
-                int(s.phase == "query" and s.future is not None and s.future.done())
+                value
                 for s in states
+                for value in (
+                    int(
+                        s.phase == "query" and s.future is not None and s.future.done()
+                    ),
+                    int(
+                        not s.allocation_wait_deadline
+                        or s.phase not in ("query", "allocate")
+                        or now < s.allocation_wait_deadline
+                    ),
+                    int(
+                        not s.refresh_deadline
+                        or s.phase != "query"
+                        or now < s.refresh_deadline
+                    ),
+                )
             ],
             torch.distributed.ReduceOp.MIN,
         )
-        for state, ready in zip(states, query_ready):
-            if ready:
+        for state, ready, unexpired, refresh_unexpired in zip(
+            states, query_flags[::3], query_flags[1::3], query_flags[2::3]
+        ):
+            if not unexpired:
+                self._fallback(state, "allocation_wait_timeout")
+            elif not refresh_unexpired:
+                self._fallback(state, "query_refresh_timeout")
+            elif ready:
                 self._finish_query(state)
         self._expire_lease()
         self._poll_reads(states)
@@ -243,12 +277,17 @@ class FlatMemoryCache:
         if state.cancelled:
             state.phase = "ready"
             return
+        failed = False
         try:
             restorable = state.future.result()
         except Exception:
+            failed = True
             self.io_errors += 1
             logger.exception("Flat storage lookup failed for request %s", state.req.rid)
             restorable = []
+        if self._reduce([int(failed)], torch.distributed.ReduceOp.MAX)[0]:
+            self._fallback(state, "query_failed", count=False)
+            return
         pages = self.tree_linker._sync_restorable_prefix(
             restorable, num_pages=len(state.tail_hashes), device_hit_pages=0
         )
@@ -292,7 +331,11 @@ class FlatMemoryCache:
             )
             if candidate is not None:
                 self._admission_candidate = candidate.req.rid
-                self._select_restore(candidate, adder)
+                if self._select_restore(candidate, adder):
+                    # FLAT_MEMORY: Private allocation may evict another unleased ready hit.
+                    for state in self._admission_states:
+                        if self._is_unleased(state) and state.phase == "ready":
+                            self._revalidate_unleased(state)
         self.carry_reservation(adder)
         return self.order_ready_requests(requests)
 
@@ -305,6 +348,14 @@ class FlatMemoryCache:
         if minima != maxima:
             raise RuntimeError("Flat restore admission queue differs across TP ranks")
 
+    @staticmethod
+    def _is_unleased(state: _Prefetch) -> bool:
+        return (
+            state.phase in ("ready", "allocate")
+            and not state.bypass
+            and not state.lease_started
+        )
+
     def _refresh_stale_queries(self, states: list[_Prefetch]) -> None:
         if not states:
             return
@@ -312,11 +363,10 @@ class FlatMemoryCache:
         stale = self._reduce(
             [
                 int(
-                    s.phase in ("ready", "allocate")
-                    and not s.bypass
-                    and not s.lease_started
+                    self._is_unleased(s)
                     and s.future is not None
-                    and s.refresh_attempts < 2
+                    and s.storage_probe_attempts < 2
+                    and s.queried_endpoint == s.query_start
                     and s.queried_endpoint
                     < len(s.key) // self.cache.page_size * self.cache.page_size
                     and s.query_generation < generation
@@ -326,36 +376,63 @@ class FlatMemoryCache:
             torch.distributed.ReduceOp.MAX,
         )
         for state, refresh in zip(states, stale):
-            check_gap = (
-                state.phase == "ready"
-                and not state.bypass
-                and not state.lease_started
-                and state.query_start > 0
-            )
-            if not refresh and not check_gap:
+            if not self._is_unleased(state):
                 continue
-            result = self._rematch(state)
-            gap = len(result.device_indices) < state.query_start
-            if not refresh and not gap:
-                continue
+            self._revalidate_unleased(state)
+            if refresh and self._is_unleased(state) and state.phase == "ready":
+                self._refresh_query(state, state.result, reason="storage_generation")
+
+    def _revalidate_unleased(self, state: _Prefetch) -> None:
+        result = self._rematch(state)
+        state.result = result
+        device_tokens = len(result.device_indices)
+        if device_tokens >= state.queried_endpoint:
+            state.phase = "ready"
+            if state.queried_endpoint > state.query_start:
+                self._diagnose(state, reason="device_covers_restore")
+            return
+        if (
+            state.allocation_wait_deadline
+            and self._reduce(
+                [int(time.monotonic() >= state.allocation_wait_deadline)],
+                torch.distributed.ReduceOp.MAX,
+            )[0]
+        ):
+            self._fallback(state, "allocation_wait_timeout")
+            return
+        was_ready = state.phase == "ready"
+        if device_tokens < state.query_start:
             tail_tokens = (
-                (len(state.key) - len(result.device_indices))
+                (len(state.key) - device_tokens)
                 // self.cache.page_size
                 * self.cache.page_size
             )
             if state.future is None and tail_tokens < self.prefetch_threshold:
-                continue
-            if self._can_refresh(state):
-                self._refresh_query(state, result)
-            elif gap:
+                return
+            if not self._refresh_query(state, result):
                 self._fallback(state, "anchor_gap_refresh_exhausted")
+        else:
+            # FLAT_MEMORY: Receipt coordinates stay fixed; selection slices its hashes.
+            state.phase = "allocate"
+            self._diagnose(state, reason="receipt_reuse")
+        if was_ready and not state.bypass:
+            state.device_cover_reactivations += 1
+            self._diagnose(
+                state, device_cover_reactivations=state.device_cover_reactivations
+            )
 
-    def _can_refresh(self, state: _Prefetch) -> bool:
+    def _can_refresh(self, state: _Prefetch, *, reason: str) -> bool:
         now = time.monotonic()
         if not state.refresh_deadline:
             state.refresh_deadline = now + self.lease_timeout
+        attempts = (
+            state.storage_probe_attempts
+            if reason == "storage_generation"
+            else state.anchor_refresh_attempts
+        )
+        # FLAT_MEMORY: Each purpose gets two submissions, not a per-generation budget.
         exhausted = self._reduce(
-            [int(state.refresh_attempts >= 2 or now >= state.refresh_deadline)],
+            [int(attempts >= 2 or now >= state.refresh_deadline)],
             torch.distributed.ReduceOp.MAX,
         )[0]
         return not exhausted
@@ -370,43 +447,58 @@ class FlatMemoryCache:
             raise RuntimeError("Flat restore device anchor differs across TP ranks")
         return result
 
-    def _refresh_query(self, state: _Prefetch, result: MatchResult) -> None:
-        state.refresh_attempts += 1
-        state.query_start = len(result.device_indices)
+    def _refresh_query(
+        self, state: _Prefetch, result: MatchResult, *, reason: str = "anchor_gap"
+    ) -> bool:
+        # FLAT_MEMORY: Direct linkers return the old future while its query is unfinished.
+        finished = self._reduce(
+            [int(state.future is None or state.future.done())],
+            torch.distributed.ReduceOp.MIN,
+        )[0]
+        if not finished:
+            return False
+        query_start = len(result.device_indices)
         namespace = request_storage_namespace(state.key)
-        state.tail_hashes = [
+        tail_hashes = [
             namespace + value
-            for value in self.tree_linker._tail_hashes(
-                state.key, result, state.query_start
-            )
+            for value in self.tree_linker._tail_hashes(state.key, result, query_start)
         ]
-        state.queried_endpoint = state.query_start
-        if not state.tail_hashes:
+        if not tail_hashes:
             state.phase = "ready"
+            state.query_start = state.queried_endpoint = query_start
+            state.tail_hashes = []
             self.cache_linker.release_lookup(state.req.rid)
             state.future = None
-            return
-        transfers = self._lookup_transfers(state.tail_hashes)
+            return True
+        transfers = self._lookup_transfers(tail_hashes)
         if not transfers:
-            state.phase, state.bypass = "ready", True
-            self.cache_linker.release_lookup(state.req.rid)
-            return
-        state.future = self.cache_linker.refresh_lookup(state.req.rid, transfers)
+            self._fallback(state, "unsupported_lookup", count=False)
+            return True
+        if not self._can_refresh(state, reason=reason):
+            return False
+        future = self.cache_linker.refresh_lookup(state.req.rid, transfers)
+        state.future = future
+        state.query_start = state.queried_endpoint = query_start
+        state.tail_hashes = tail_hashes
+        state.refresh_attempts += 1
+        if reason == "storage_generation":
+            state.storage_probe_attempts += 1
+        else:
+            state.anchor_refresh_attempts += 1
         state.phase = "query"
-        self._diagnose(state, refresh_attempts=state.refresh_attempts)
+        self._diagnose(
+            state,
+            refresh_attempts=state.refresh_attempts,
+            storage_probe_attempts=state.storage_probe_attempts,
+            anchor_refresh_attempts=state.anchor_refresh_attempts,
+            refresh_reason=reason,
+        )
+        return True
 
-    def _select_restore(self, state: _Prefetch, adder) -> None:
-        result = self._rematch(state)
+    def _select_restore(self, state: _Prefetch, adder) -> bool:
+        # FLAT_MEMORY: The shared revalidation pass already refreshed this match.
+        result = state.result
         device_tokens = len(result.device_indices)
-        if device_tokens >= state.queried_endpoint:
-            self._fallback(state, "device_covers_restore", count=False)
-            return
-        if device_tokens < state.query_start:
-            if self._can_refresh(state):
-                self._refresh_query(state, result)
-            else:
-                self._fallback(state, "anchor_gap_refresh_exhausted")
-            return
         page = self.cache.page_size
         keys = state.tail_hashes[
             (device_tokens - state.query_start)
@@ -419,7 +511,7 @@ class FlatMemoryCache:
         )[0]
         if not supported:
             self._fallback(state, "unsupported_restore_footprint")
-            return
+            return False
         state.result = result
         state.hold_node = result.last_device_node
         state.hold_params = self.cache.inc_lock_ref(state.hold_node).to_dec_params()
@@ -429,14 +521,27 @@ class FlatMemoryCache:
             full_tokens=footprint.get(PoolName.KV, 0),
             swa_tokens=footprint.get(PoolName.SWA, 0),
         )
-        can_restore, never_fits = self._sync_plan(plan)
+        state.allocation_plan_attempts += 1
+        self._diagnose(state, allocation_plan_attempts=state.allocation_plan_attempts)
+        can_restore, never_fits, wait_eligible = self._sync_plan(plan)
+        state.allocation_wait_eligible = wait_eligible
         if not can_restore:
+            self._record_plan_rejection(state, plan)
             self._release_hold(state)
             self.restore_deferrals += 1
             self._diagnose(state, reason=plan.reason or "restore_headroom")
             if never_fits:
                 self._fallback(state, "restore_never_fits")
-            return
+            elif wait_eligible and not state.allocation_wait_deadline:
+                state.allocation_wait_started = time.monotonic()
+                state.allocation_wait_deadline = (
+                    state.allocation_wait_started + self.lease_timeout
+                )
+                self._diagnose(
+                    state, allocation_wait_budget_ms=self.lease_timeout * 1000
+                )
+            return False
+        self._finish_allocation_wait(state, "budget_available")
         state.full_reservation, state.swa_reservation = self._sync_reservation(plan)
         state.read_anchor_tokens = device_tokens
         state.read_endpoint = state.queried_endpoint
@@ -451,15 +556,71 @@ class FlatMemoryCache:
             prepare_ms=(state.lease_started - state.started) * 1000,
         )
         self._prepare(state, keys=keys)
+        return True
 
-    def _sync_plan(self, plan) -> tuple[bool, bool]:
-        can_restore = self._reduce(
-            [int(plan.can_restore)], torch.distributed.ReduceOp.MIN
-        )[0]
+    def _sync_plan(self, plan) -> tuple[bool, bool, bool]:
+        # FLAT_MEMORY: Durability-only backups cannot release additional GPU pages.
+        # Source ownership is a retry opportunity, never speculative capacity credit.
+        wait_eligible = plan.can_restore or (
+            not plan.never_fits
+            and plan.reason in ("full_decode_headroom", "swa_decode_headroom")
+            and self.tree_linker.source_lock_count > 0
+        )
+        can_restore, wait_eligible = self._reduce(
+            [int(plan.can_restore), int(wait_eligible)], torch.distributed.ReduceOp.MIN
+        )
         never_fits = self._reduce(
             [int(plan.never_fits)], torch.distributed.ReduceOp.MAX
         )[0]
-        return bool(can_restore), bool(never_fits)
+        return (
+            bool(can_restore),
+            bool(never_fits),
+            bool(wait_eligible and not never_fits),
+        )
+
+    def _record_plan_rejection(self, state: _Prefetch, plan) -> None:
+        if state.plan_rejection_recorded:
+            return
+        # FLAT_MEMORY: Gather once after a common veto, while the anchor is pinned.
+        # Keep one real rank's comparison instead of combining unrelated extrema.
+        snapshots = self.gather(
+            {
+                "can_restore": plan.can_restore,
+                "reason": plan.reason,
+                "full_required_tokens": plan.full_required_tokens,
+                "full_available_tokens": plan.full_available_tokens,
+                "swa_required_tokens": plan.swa_required_tokens,
+                "swa_available_tokens": plan.swa_available_tokens,
+                "pending_backups": len(self.pending_offloads),
+                "source_locked_backups": self.tree_linker.source_lock_count,
+            }
+        )
+        rank, snapshot = next(
+            (rank, value)
+            for rank, value in enumerate(snapshots)
+            if not value["can_restore"]
+        )
+        self._diagnose(
+            state,
+            plan_reject_rank=rank,
+            plan_reason=snapshot["reason"],
+            **{
+                f"plan_{key}": value
+                for key, value in snapshot.items()
+                if key not in ("can_restore", "reason")
+            },
+        )
+        state.plan_rejection_recorded = True
+
+    def _finish_allocation_wait(self, state: _Prefetch, outcome: str) -> None:
+        if state.allocation_wait_started:
+            self._diagnose(
+                state,
+                allocation_wait_ms=(time.monotonic() - state.allocation_wait_started)
+                * 1000,
+                allocation_wait_outcome=outcome,
+            )
+            state.allocation_wait_started = 0.0
 
     def _sync_reservation(self, plan) -> tuple[int, int]:
         full, swa = self._reduce(
@@ -476,7 +637,7 @@ class FlatMemoryCache:
             full_tokens=0,
             swa_tokens=0,
         )
-        can_restore, never_fits = self._sync_plan(plan)
+        can_restore, never_fits, _ = self._sync_plan(plan)
         if never_fits:
             self._fallback(state, "ready_never_fits")
         elif can_restore:
@@ -666,8 +827,18 @@ class FlatMemoryCache:
                     self._forget(state, keep_arrival=True)
         state = self.prefetches.get(self._lease_rid or self._admission_candidate)
         # FLAT_MEMORY: A rank-local gate may skip admission without rejecting the KV.
-        can_progress, admission_attempted = self._reduce(
-            [int(can_progress), int(state is not None and state.admission_attempted)],
+        can_wait = bool(
+            state is not None
+            and state.phase == "allocate"
+            and state.allocation_wait_eligible
+            and time.monotonic() < state.allocation_wait_deadline
+        )
+        can_progress, admission_attempted, can_wait = self._reduce(
+            [
+                int(can_progress),
+                int(state is not None and state.admission_attempted),
+                int(can_wait),
+            ],
             torch.distributed.ReduceOp.MIN,
         )
         if (
@@ -675,11 +846,16 @@ class FlatMemoryCache:
             and not state.bypass
             and not can_progress
             and (
-                state.phase == "allocate"
+                (state.phase == "allocate" and not can_wait)
                 or (state.phase == "ready" and admission_attempted)
             )
         ):
-            self._fallback(state, "no_admission_progress")
+            reason = (
+                "allocation_wait_timeout"
+                if state.phase == "allocate" and state.allocation_wait_eligible
+                else "no_admission_progress"
+            )
+            self._fallback(state, reason)
         self._admission_states = []
         self._admission_candidate = None
         self.carry_reservation(adder)
@@ -751,6 +927,7 @@ class FlatMemoryCache:
             # Tokens abandoned at ready are separate from actual admission loss.
             if state.hold_params is not None and state.ready_started:
                 self.ready_dropped_tokens += state.loaded_tokens
+        self._finish_allocation_wait(state, reason)
         self._release_hold(state)
         if self._lease_rid == state.req.rid:
             self._lease_rid = None
@@ -776,6 +953,7 @@ class FlatMemoryCache:
             self.arrivals.pop(rid, None)
             return
         state.cancelled = True
+        self._finish_allocation_wait(state, "cancelled")
         if state.phase != "read":
             self._forget(state)
 
@@ -811,12 +989,18 @@ class FlatMemoryCache:
         self.tree_linker.replace_pending_offload_node(ack_id, old_node_id, new_node_ids)
 
     def _poll_offloads(self) -> None:
-        count = self._reduce(
-            [self.tree_linker.num_completed_offloads()], torch.distributed.ReduceOp.MIN
-        )[0]
-        if count:
+        source_count, durable_count = self._reduce(
+            [
+                self.tree_linker.num_source_safe_offloads(),
+                self.tree_linker.num_completed_offloads(),
+            ],
+            torch.distributed.ReduceOp.MIN,
+        )
+        successes = []
+        if durable_count:
             results = [
-                self.cache_linker.pop_completed_offload_result() for _ in range(count)
+                self.cache_linker.pop_completed_offload_result()
+                for _ in range(durable_count)
             ]
             # FLAT_MEMORY: Pressure on one rank must not mask another rank's I/O error.
             flags = self._reduce(
@@ -835,22 +1019,21 @@ class FlatMemoryCache:
             if any(flags[3::4]):
                 raise FlatUnsafeIOError(
                     "Flat offload did not quiesce on every TP rank; "
-                    "source GPU pages remain owned"
+                    "outstanding source or staging ownership is retained"
                 )
             successes = [not failed for failed in flags[0::4]]
             self.capacity_pressure_offloads += sum(flags[1::4])
             self.io_errors += sum(flags[2::4])
+        # FLAT_MEMORY: Check common unsafe outcomes before either ownership transition.
+        self.tree_linker.release_source_safe_offloads(source_count)
+        if durable_count:
             collector = self.cache.storage_metrics_collector
             if collector is not None:
                 for success, pending in zip(successes, self.pending_offloads):
                     if success:
-                        tokens = sum(
-                            len(self.cache.resolve_node_handle(node_id).key)
-                            for node_id in pending.publish_node_ids
-                        )
-                        collector.log_backuped_tokens(tokens)
-                        collector.log_storage_write_tokens(tokens)
-            self.tree_linker.commit_completed_offloads([bool(x) for x in successes])
+                        collector.log_backuped_tokens(pending.token_count)
+                        collector.log_storage_write_tokens(pending.token_count)
+            self.tree_linker.commit_completed_offloads(successes)
 
     def _log_metrics(self) -> None:
         collector = self.cache.storage_metrics_collector
@@ -903,6 +1086,7 @@ class FlatMemoryCache:
         result = self.cache_linker.get_flat_memory_stats()
         result.update(
             pending_backups=len(self.pending_offloads),
+            backup_lifecycle=self.tree_linker.get_offload_stats(),
             pending_prefetches=len(self.prefetches),
             flat_io_errors=self.io_errors,
             flat_capacity_pressure_offloads=self.capacity_pressure_offloads,

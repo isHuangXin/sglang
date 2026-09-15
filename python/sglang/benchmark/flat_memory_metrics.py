@@ -29,10 +29,16 @@ _WINDOW_COUNTERS = (
     "durable_write_bytes",
     "io_errors",
 )
+_DRAM_WINDOW_COUNTERS = (
+    "dram_read_completed_bytes",
+    "dram_write_completed_bytes",
+)
 _IO_RESULT_FIELDS = (
     "flat_io_window_seconds",
     "flat_dram_read_bw_gbps",
     "flat_dram_write_bw_gbps",
+    "flat_dram_read_peak_bw_gbps",
+    "flat_dram_write_peak_bw_gbps",
     "flat_ssd_read_bw_gbps",
     "flat_ssd_write_bw_gbps",
     "flat_ssd_read_peak_bw_gbps",
@@ -216,29 +222,44 @@ def _flat_rank_map(snapshot, expected_tp_size=None):
     return mapped
 
 
+def _flat_window_schema_version(window: object) -> int:
+    if not isinstance(window, dict):
+        raise ValueError("Missing or invalid Flat I/O window")
+    # FLAT_MEMORY: Unversioned native windows contain SSD completion buckets only.
+    version = window.get("schema_version", 1)
+    if type(version) is not int or version not in (1, 2):
+        raise ValueError(f"Unsupported Flat I/O window schema version: {version!r}")
+    return version
+
+
 def _validate_flat_window(snapshot, window_id, active, expected_tp_size=None):
     ranks = _flat_rank_map(snapshot, expected_tp_size)
-    boundaries = set()
+    boundaries, versions = set(), set()
     for rank in ranks.values():
-        window = rank["io_window"]
+        window = rank.get("io_window")
+        version = _flat_window_schema_version(window)
+        versions.add(version)
         if (
-            window["enabled"] is not True
-            or window["window_id"] != window_id
-            or window["active"] is not active
-            or window["aborted"] is not False
-            or window["overflowed"] is not False
-            or _flat_counter(window["bucket_ns"]) != 100_000_000
+            window.get("enabled") is not True
+            or window.get("window_id") != window_id
+            or window.get("active") is not active
+            or window.get("aborted") is not False
+            or window.get("overflowed") is not False
+            or _flat_counter(window.get("bucket_ns")) != 100_000_000
         ):
             raise ValueError("Disabled, mismatched, aborted or overflowed Flat window")
-        start, end = _flat_counter(window["start_ns"]), _flat_counter(window["end_ns"])
+        start, end = _flat_counter(window.get("start_ns")), _flat_counter(
+            window.get("end_ns")
+        )
         if not start or (active and end != 0) or (not active and end <= start):
             raise ValueError("Invalid Flat window boundaries")
         boundaries.add((start, end))
-        for name in _WINDOW_COUNTERS:
-            value = _flat_counter(window[name])
+        counters = _WINDOW_COUNTERS + (_DRAM_WINDOW_COUNTERS if version == 2 else ())
+        for name in counters:
+            value = _flat_counter(window.get(name))
             if (active or name == "io_errors") and value:
                 raise ValueError("Nonempty begin window or Flat I/O errors")
-        if not isinstance(window["buckets"], list) or (active and window["buckets"]):
+        if not isinstance(window.get("buckets"), list) or (active and window["buckets"]):
             raise ValueError("Invalid Flat I/O buckets")
         for name in ("pending_backups", "pending_prefetches"):
             if _flat_counter(rank[name]):
@@ -246,6 +267,8 @@ def _validate_flat_window(snapshot, window_id, active, expected_tp_size=None):
         _flat_counter(rank["flat_io_errors"])
     if len(boundaries) != 1:
         raise ValueError("TP ranks do not share Flat window boundaries")
+    if len(versions) != 1:
+        raise ValueError("TP ranks do not share a Flat I/O window schema version")
     return ranks, next(iter(boundaries))
 
 
@@ -261,17 +284,57 @@ def _flat_replicated_delta(first, last, name):
     return deltas.pop()
 
 
+def _flat_bucket_peaks(
+    ranks: dict, *, duration_ns: int, schema_version: int
+) -> dict[str, float]:
+    fields = {
+        "read_bytes": "read_completed_bytes",
+        "write_bytes": "durable_write_bytes",
+    }
+    if schema_version == 2:
+        fields.update(
+            dram_read_bytes="dram_read_completed_bytes",
+            dram_write_bytes="dram_write_completed_bytes",
+        )
+    buckets = {}
+    for rank in ranks.values():
+        window = rank["io_window"]
+        totals = dict.fromkeys(fields, 0)
+        seen = set()
+        for bucket in window["buckets"]:
+            if not isinstance(bucket, dict):
+                raise ValueError("Invalid Flat I/O bucket")
+            index = _flat_counter(bucket.get("index"))
+            if index in seen or index * 100_000_000 >= duration_ns:
+                raise ValueError("Duplicate or out-of-window Flat bucket index")
+            seen.add(index)
+            merged = buckets.setdefault(index, dict.fromkeys(fields, 0))
+            for name in fields:
+                value = _flat_counter(bucket.get(name))
+                totals[name] += value
+                merged[name] += value
+        if any(totals[name] != window[total] for name, total in fields.items()):
+            raise ValueError("Flat bucket totals do not match completed/durable bytes")
+    # FLAT_MEMORY: Merge rank buckets before peaks; partial buckets still divide by 100ms.
+    return {
+        name: max((bucket[name] for bucket in buckets.values()), default=0) / 0.1 / 1e9
+        for name in fields
+    }
+
+
 def summarize_flat_io(before, after, window_id, expected_tp_size=None):
     first, (start, _) = _validate_flat_window(before, window_id, True, expected_tp_size)
     last, (end_start, end) = _validate_flat_window(after, window_id, False, len(first))
     if start != end_start:
         raise ValueError("Flat begin/end window start mismatch")
+    schema_version = _flat_window_schema_version(first[0]["io_window"])
+    if schema_version != _flat_window_schema_version(last[0]["io_window"]):
+        raise ValueError("Flat begin/end I/O window schema version mismatch")
     seconds = (end - start) / 1e9
     totals = dict.fromkeys(_WINDOW_COUNTERS, 0)
     deltas = dict.fromkeys(
         ("dram_read_total_bytes", "dram_write_total_bytes", "ssd_write_count"), 0
     )
-    buckets = {}
     for tp_rank, rank in last.items():
         prior = first[tp_rank]
         if any(rank[name] != prior[name] for name in ("pid", "gpu_id", "gds_mode")):
@@ -283,42 +346,21 @@ def summarize_flat_io(before, after, window_id, expected_tp_size=None):
                 prior["bandwidth"][name]
             )
             deltas[name] += _flat_counter(delta)
-        window = rank["io_window"]
         for name in totals:
-            totals[name] += window[name]
-        seen = set()
-        read_bytes = write_bytes = 0
-        for bucket in window["buckets"]:
-            index = _flat_counter(bucket["index"])
-            if index in seen or index * 100_000_000 >= end - start:
-                raise ValueError("Duplicate or out-of-window Flat bucket index")
-            seen.add(index)
-            read, write = _flat_counter(bucket["read_bytes"]), _flat_counter(
-                bucket["write_bytes"]
-            )
-            read_bytes += read
-            write_bytes += write
-            merged = buckets.setdefault(index, [0, 0])
-            merged[0] += read
-            merged[1] += write
-        if (
-            read_bytes != window["read_completed_bytes"]
-            or write_bytes != window["durable_write_bytes"]
-        ):
-            raise ValueError("Flat bucket totals do not match completed/durable bytes")
+            totals[name] += rank["io_window"][name]
+    peaks = _flat_bucket_peaks(
+        last, duration_ns=end - start, schema_version=schema_version
+    )
     return {
         "flat_io_window_seconds": seconds,
         "flat_dram_read_bw_gbps": deltas["dram_read_total_bytes"] / seconds / 1e9,
         "flat_dram_write_bw_gbps": deltas["dram_write_total_bytes"] / seconds / 1e9,
+        "flat_dram_read_peak_bw_gbps": peaks.get("dram_read_bytes"),
+        "flat_dram_write_peak_bw_gbps": peaks.get("dram_write_bytes"),
         "flat_ssd_read_bw_gbps": totals["read_completed_bytes"] / seconds / 1e9,
         "flat_ssd_write_bw_gbps": totals["durable_write_bytes"] / seconds / 1e9,
-        # FLAT_MEMORY: Merge rank buckets before peaks; partial buckets still divide by 100ms.
-        "flat_ssd_read_peak_bw_gbps": max((b[0] for b in buckets.values()), default=0)
-        / 0.1
-        / 1e9,
-        "flat_ssd_write_peak_bw_gbps": max((b[1] for b in buckets.values()), default=0)
-        / 0.1
-        / 1e9,
+        "flat_ssd_read_peak_bw_gbps": peaks["read_bytes"],
+        "flat_ssd_write_peak_bw_gbps": peaks["write_bytes"],
         "flat_ssd_read_io_count": totals["read_completed_ops"],
         "flat_ssd_write_io_count": totals["write_completed_ops"],
         "flat_ssd_durable_write_batches": totals["durable_write_batches"],

@@ -55,6 +55,7 @@ from sglang.benchmark.flat_memory_metrics import (
     summarize_flat_cache,
     summarize_flat_io,
 )
+from sglang.benchmark.flat_memory_report import format_flat_memory_report
 from sglang.benchmark.utils import (
     get_tokenizer,
     parse_custom_headers,
@@ -1872,6 +1873,8 @@ async def benchmark(
             )
             legacy_metrics["flat_memory"] = fetch_flat_memory_metrics(host, port)
     if flat_mode:
+        # FLAT_MEMORY: Human-readable tiers accompany the complete native snapshots.
+        print(format_flat_memory_report(cache_usage | flat_cache | flat_io.result))
         print("Flat cache and completed/durable I/O (unavailable values are null):")
         print(json.dumps(flat_cache | flat_io.result, default=str))
     elif any(legacy_metrics.values()):

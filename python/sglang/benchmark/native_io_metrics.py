@@ -8,6 +8,11 @@ import warnings
 
 import requests
 
+_HOST_IDENTITY = (
+    "pid", "generation", "tp_rank", "tp_size",
+    "host_capacity_bytes", "device_capacity_bytes", "bytes_per_token",
+)
+
 
 def _auth_headers(headers):
     if headers is not None:
@@ -55,6 +60,51 @@ def sanitize_server_info(info: dict | None) -> dict | None:
         if name in info
         and (info[name] is None or type(info[name]) in (str, bool, int, float))
     }
+
+
+def _validate_host_rank(rank, tp_size):
+    if not isinstance(rank, dict):
+        raise ValueError("Invalid HiCache rank snapshot")
+    for name in (*_HOST_IDENTITY, "pending"):
+        value = rank.get(name)
+        minimum = (
+            0 if name in ("generation", "tp_rank", "pending", "bytes_per_token") else 1
+        )
+        if type(value) is not int or value < minimum:
+            raise ValueError(f"Invalid HiCache rank field: {name}")
+    if (
+        rank["tp_rank"] not in range(tp_size)
+        or rank["tp_size"] != tp_size
+        or rank.get("enabled") is not True
+        or rank.get("io_backend") != "direct"
+        or type(rank.get("idle")) is not bool
+    ):
+        raise ValueError(
+            f"Incomplete or disabled HiCache telemetry: {rank.get('error')}"
+        )
+    for direction in ("read", "write"):
+        counters = rank.get(direction)
+        if not isinstance(counters, dict):
+            raise ValueError(f"Missing HiCache {direction} counters")
+        if any(
+            type(counters.get(key)) is not int or counters[key] < 0
+            for key in ("bytes", "batches")
+        ):
+            raise ValueError("Invalid completed Host copy counters")
+        elapsed = counters.get("elapsed_ms")
+        if (
+            type(elapsed) not in (int, float)
+            or not math.isfinite(elapsed)
+            or elapsed < 0
+        ):
+            raise ValueError("Invalid completed Host copy duration")
+        if (counters["batches"] == 0) != (counters["bytes"] == 0) or (
+            counters["batches"] == 0
+        ) != (elapsed == 0):
+            raise ValueError("Inconsistent completed Host copy counters")
+    pending = rank.get("storage_pending", 0)
+    if type(pending) is not int or pending < 0:
+        raise ValueError("Invalid storage pipeline pending count")
 
 
 def fetch_hicache_io_snapshot(
@@ -107,52 +157,10 @@ def fetch_hicache_io_snapshot(
             raise ValueError("Missing HiCache telemetry from one or more TP ranks")
         seen = set()
         for rank in ranks:
-            if not isinstance(rank, dict):
-                raise ValueError("Invalid HiCache rank snapshot")
-            for name in (
-                "tp_rank",
-                "tp_size",
-                "pid",
-                "generation",
-                "pending",
-                "host_capacity_bytes",
-                "device_capacity_bytes",
-                "bytes_per_token",
-            ):
-                value = rank.get(name)
-                minimum = 0 if name in ("tp_rank", "generation", "pending") else 1
-                if type(value) is not int or value < minimum:
-                    raise ValueError(f"Invalid HiCache rank field: {name}")
-            if (
-                rank["tp_rank"] not in range(tp_size)
-                or rank["tp_rank"] in seen
-                or rank["tp_size"] != tp_size
-                or rank.get("enabled") is not True
-                or rank.get("io_backend") != "direct"
-                or type(rank.get("idle")) is not bool
-            ):
-                raise ValueError("Incomplete or disabled HiCache TP telemetry")
+            _validate_host_rank(rank, tp_size)
+            if rank["tp_rank"] in seen:
+                raise ValueError("Duplicate HiCache TP rank")
             seen.add(rank["tp_rank"])
-            for direction in ("read", "write"):
-                counters = rank.get(direction)
-                if not isinstance(counters, dict):
-                    raise ValueError(f"Missing HiCache {direction} counters")
-                for name in ("bytes", "batches"):
-                    if type(counters.get(name)) is not int or counters[name] < 0:
-                        raise ValueError(f"Invalid HiCache {direction} {name}")
-                elapsed = counters.get("elapsed_ms")
-                if (
-                    type(elapsed) not in (int, float)
-                    or not math.isfinite(elapsed)
-                    or elapsed < 0
-                ):
-                    raise ValueError(f"Invalid HiCache {direction} timing")
-                if (counters["batches"] == 0) != (counters["bytes"] == 0) or (
-                    counters["batches"] == 0
-                ) != (elapsed == 0):
-                    raise ValueError(
-                        f"Inconsistent completed HiCache {direction} counters"
-                    )
         if info.get("hicache_storage_backend") == "mooncake" and any(
             "storage_pending" not in rank for rank in ranks
         ):

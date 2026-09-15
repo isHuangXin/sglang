@@ -69,7 +69,23 @@ class HostIOMetrics:
         self._totals = self._empty_totals()
 
 
+def _unique_buffer_nbytes(buffers, seen):
+    total = 0
+    for buffer in buffers:
+        # Count the registered view, not unrelated regions in its backing storage.
+        key = (buffer.device, buffer.data_ptr(), buffer.nbytes)
+        if key not in seen:
+            total += int(buffer.nbytes)
+            seen.add(key)
+    return total
+
+
 def host_pool_capacities(*, host_pool, device_pool):
+    from sglang.srt.mem_cache.memory_pool_host import (
+        DeepSeekV4PagedHostPool,
+        DeepSeekV4StateHostPool,
+        LogicalHostPool,
+    )
     from sglang.srt.mem_cache.pool_host import HostPoolGroup
 
     if isinstance(host_pool, HostPoolGroup):
@@ -82,7 +98,24 @@ def host_pool_capacities(*, host_pool, device_pool):
     device_bytes = 0
     seen_host = set()
     seen_device = set()
+    seen_device_buffers = set()
     for host, device in pairs:
+        if isinstance(host, LogicalHostPool):
+            continue
+        if isinstance(host, (DeepSeekV4PagedHostPool, DeepSeekV4StateHostPool)):
+            # V4 size_per_token describes a per-layer page, not a token.
+            if id(host) not in seen_host:
+                host_bytes += sum(
+                    int(buffer.nbytes) for buffer in host.get_hybrid_pool_buffer()
+                )
+                seen_host.add(id(host))
+            buffers = (
+                host.device_buffers
+                if isinstance(host, DeepSeekV4PagedHostPool)
+                else host.device_page_views
+            )
+            device_bytes += _unique_buffer_nbytes(buffers, seen_device_buffers)
+            continue
         if id(host) not in seen_host:
             host_bytes += int(host.size) * int(host.size_per_token)
             seen_host.add(id(host))
@@ -93,6 +126,6 @@ def host_pool_capacities(*, host_pool, device_pool):
         "host_capacity_bytes": host_bytes,
         "device_capacity_bytes": device_bytes,
         "bytes_per_token": int(anchor.size_per_token),
-        "capacity_scope": "sum of unique physical pool slot capacities",
+        "capacity_scope": "sum of unique registered HiCache pool capacities",
         "bytes_per_token_scope": "primary index anchor; I/O uses actual transferred bytes",
     }

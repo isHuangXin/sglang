@@ -25,7 +25,9 @@ def _validate_host_rank(rank, tp_size):
         raise ValueError("Invalid HiCache rank snapshot")
     for name in (*_HOST_IDENTITY, "pending"):
         value = rank.get(name)
-        minimum = 0 if name in ("generation", "tp_rank", "pending") else 1
+        minimum = (
+            0 if name in ("generation", "tp_rank", "pending", "bytes_per_token") else 1
+        )
         if type(value) is not int or value < minimum:
             raise ValueError(f"Invalid HiCache rank field: {name}")
     if (

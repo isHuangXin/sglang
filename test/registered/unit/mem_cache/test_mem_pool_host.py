@@ -3,18 +3,21 @@
 import threading
 import unittest
 import unittest.mock
+from types import SimpleNamespace
 
 import torch
-
+from sglang.benchmark.native_io_metrics import _validate_host_rank
 from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sglang.srt.mem_cache.memory_pool_host import (
     DeepSeekV4PagedHostPool,
+    DeepSeekV4StateHostPool,
     LogicalHostPool,
 )
 from sglang.srt.mem_cache.pool_host import HostPoolGroup, PoolEntry, base
 from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
 from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
+from sglang.srt.observability.hicache_io_metrics import host_pool_capacities
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -110,6 +113,30 @@ class TestHostKVCache(CustomTestCase):
         self.assertEqual(self.host_pool.free(torch.empty(0, dtype=torch.int64)), 0)
         self.assertEqual(self.host_pool.num_release_slots, 0)
         self.assertEqual(self.host_pool.release_slots, [])
+
+    def test_slot_capacities_deduplicate_shared_pools(self):
+        """Repeated ordinary pools retain their unique token-slot capacities."""
+        group = HostPoolGroup(
+            [
+                PoolEntry(
+                    name=name,
+                    host_pool=self.host_pool,
+                    device_pool=self.device_pool,
+                    layer_mapper=lambda layer: layer,
+                )
+                for name in (PoolName.KV, PoolName.SWA)
+            ]
+        )
+        capacities = host_pool_capacities(host_pool=group, device_pool=None)
+        self.assertEqual(
+            capacities["host_capacity_bytes"],
+            self.host_pool.size * self.host_pool.size_per_token,
+        )
+        self.assertEqual(
+            capacities["device_capacity_bytes"],
+            self.device_pool.size * self.host_pool.size_per_token,
+        )
+        self.assertEqual(capacities["bytes_per_token"], self.host_pool.size_per_token)
 
 
 class TestLazyHostPoolRelease(CustomTestCase):
@@ -211,10 +238,11 @@ class TestHostMemoryBudget(CustomTestCase):
         # Deliberate single-accessor stub: isolates the budget math from the
         # topology derivation, which the ranks_per_host case below covers.
         fake_mem = unittest.mock.Mock(available=self._AVAILABLE)
-        with unittest.mock.patch.object(
-            base, "ranks_per_host", return_value=ranks
-        ), unittest.mock.patch.object(
-            base.psutil, "virtual_memory", return_value=fake_mem
+        with (
+            unittest.mock.patch.object(base, "ranks_per_host", return_value=ranks),
+            unittest.mock.patch.object(
+                base.psutil, "virtual_memory", return_value=fake_mem
+            ),
         ):
             return base.host_memory_budget_bytes()
 
@@ -233,9 +261,15 @@ class TestHostMemoryBudget(CustomTestCase):
         # The launcher slices ranks uniformly across nodes, so the co-located
         # rank count is world_size // nnodes — no hostname collective.
         fake_group = unittest.mock.Mock(world_size=16)
-        with get_context().override_server_args(nnodes=2), unittest.mock.patch.object(
-            torch.distributed, "is_initialized", return_value=True
-        ), unittest.mock.patch.object(base, "get_world_group", return_value=fake_group):
+        with (
+            get_context().override_server_args(nnodes=2),
+            unittest.mock.patch.object(
+                torch.distributed, "is_initialized", return_value=True
+            ),
+            unittest.mock.patch.object(
+                base, "get_world_group", return_value=fake_group
+            ),
+        ):
             self.assertEqual(base.ranks_per_host(), 8)
 
 
@@ -286,6 +320,152 @@ class TestHostPoolGroup(CustomTestCase):
         self.assertIsNone(group.resolve_host_transfers(transfers))
         self.assertIsNone(transfers[0].host_indices)
         self.assertEqual(group.available_size(PoolName.SWA), 2)
+
+
+class TestV4HostPoolCapacities(CustomTestCase):
+    @staticmethod
+    def _set_host_buffer(pool, *, pages, layers, page_bytes, layout):
+        pool.size = pages * 256
+        pool.size_per_token = page_bytes
+        pool.can_use_write_back_jit = False
+        if layout == "layer_first":
+            pool.kv_buffer = [
+                torch.empty((pages, page_bytes), dtype=torch.uint8)
+                for _ in range(layers)
+            ]
+        else:
+            pool.kv_buffer = torch.empty(
+                (pages, layers, 1, page_bytes), dtype=torch.uint8
+            )
+
+    @classmethod
+    def _paged(cls, buffers, *, layout="page_first_direct"):
+        pool = DeepSeekV4PagedHostPool.__new__(DeepSeekV4PagedHostPool)
+        pool.device_buffers = buffers
+        cls._set_host_buffer(
+            pool, pages=3, layers=len(buffers), page_bytes=20, layout=layout
+        )
+        return pool
+
+    @classmethod
+    def _state(cls, *, slots, width, dtype, pages, layout):
+        pool = DeepSeekV4StateHostPool.__new__(DeepSeekV4StateHostPool)
+        pool.state_pools = [
+            SimpleNamespace(
+                ring_size=2,
+                kv_score_buffer=SimpleNamespace(
+                    kv_score=torch.empty((slots, width), dtype=dtype)
+                ),
+            )
+            for _ in range(2)
+        ]
+        pool.device_page_views = []
+        pool._init_device_page_views()
+        cls._set_host_buffer(
+            pool, pages=pages, layers=2, page_bytes=pool.state_page_bytes, layout=layout
+        )
+        return pool
+
+    @staticmethod
+    def _group(*entries):
+        anchor = PoolEntry(
+            name=PoolName.KV,
+            host_pool=LogicalHostPool(size=1024, page_size=256),
+            device_pool=SimpleNamespace(size=1024),
+            layer_mapper=lambda layer: layer,
+            is_primary_index_anchor=True,
+        )
+        return HostPoolGroup(
+            [anchor]
+            + [
+                PoolEntry(
+                    name=name,
+                    host_pool=host,
+                    device_pool=device,
+                    layer_mapper=lambda layer: layer,
+                )
+                for name, host, device in entries
+            ]
+        )
+
+    @staticmethod
+    def _rank(capacities):
+        return {
+            **capacities,
+            "pid": 1,
+            "generation": 0,
+            "tp_rank": 0,
+            "tp_size": 1,
+            "pending": 0,
+            "enabled": True,
+            "io_backend": "direct",
+            "idle": True,
+            **{
+                direction: {"bytes": 0, "batches": 0, "elapsed_ms": 0.0}
+                for direction in ("read", "write")
+            },
+        }
+
+    def test_mixed_pools_include_both_states_without_device_pool(self):
+        """V4 status includes state pages without dereferencing absent device pools."""
+        for layout in ("layer_first", "page_first_direct"):
+            with self.subTest(layout=layout):
+                paged = self._paged(
+                    [torch.empty((7, 20), dtype=torch.uint8) for _ in range(2)],
+                    layout=layout,
+                )
+                state = self._state(
+                    slots=7, width=3, dtype=torch.uint8, pages=4, layout=layout
+                )
+                indexer = self._state(
+                    slots=9, width=4, dtype=torch.float16, pages=2, layout=layout
+                )
+                group = self._group(
+                    (PoolName.SWA, paged, SimpleNamespace(size=1536)),
+                    (PoolName.DEEPSEEK_V4_C4_STATE, state, None),
+                    (PoolName.DEEPSEEK_V4_C4_INDEXER_STATE, indexer, None),
+                )
+                capacities = host_pool_capacities(host_pool=group, device_pool=None)
+                # Host: 120 + 48 + 64. Device: 280 + 36 + 128 (complete rings).
+                self.assertEqual(capacities["host_capacity_bytes"], 232)
+                self.assertEqual(capacities["device_capacity_bytes"], 444)
+                self.assertEqual(capacities["bytes_per_token"], 0)
+                _validate_host_rank(self._rank(capacities), tp_size=1)
+
+    def test_unified_views_exclude_unregistered_storage_and_duplicate_aliases(self):
+        """Shared storage counts only registered ranges, including each alias once."""
+        storage = torch.empty((11, 20), dtype=torch.uint8)
+        compressed = storage[2:9]
+        paged = self._paged([compressed, storage[9:]])
+        alias = self._paged([compressed.view_as(compressed)])
+        group = self._group(
+            (PoolName.SWA, paged, None),
+            (PoolName.INDEXER, alias, None),
+            (PoolName.DEEPSEEK_V4_C4_STATE, paged, None),
+        )
+        capacities = host_pool_capacities(host_pool=group, device_pool=None)
+        self.assertEqual(capacities["host_capacity_bytes"], 180)
+        self.assertEqual(capacities["device_capacity_bytes"], 180)
+
+    def test_benchmark_accepts_zero_anchor_but_rejects_invalid_capacities(self):
+        """A payload-free anchor is valid; missing capacity and malformed values are not."""
+        rank = self._rank(
+            {
+                "host_capacity_bytes": 232,
+                "device_capacity_bytes": 444,
+                "bytes_per_token": 0,
+            }
+        )
+        _validate_host_rank(rank, tp_size=1)
+        for field, value in (
+            ("bytes_per_token", -1),
+            ("bytes_per_token", True),
+            ("bytes_per_token", 1.5),
+            ("host_capacity_bytes", 0),
+            ("device_capacity_bytes", 0),
+        ):
+            with self.subTest(field=field, value=value), self.assertRaises(ValueError):
+                _validate_host_rank({**rank, field: value}, tp_size=1)
 
 
 if __name__ == "__main__":

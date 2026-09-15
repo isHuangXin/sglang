@@ -3576,9 +3576,8 @@ class Scheduler(
 
         if self.flat_memory_cache is not None:
             self.flat_memory_cache.poll()
-            self.flat_memory_cache.release_ready_holds()
-            if running_batch.is_empty():
-                running_batch.batch_is_full = False
+            # FLAT_MEMORY: Retry ready lease admission as running requests progress.
+            running_batch.batch_is_full = False
         elif self.enable_hierarchical_cache or get_memory().enable_flexkv:
             self.tree_cache.check_hicache_events()
             if self.enable_hicache_storage:
@@ -3668,9 +3667,21 @@ class Scheduler(
             prefill_tile_block_m=prefill_tile_block_m,
         )
 
+        if self.flat_memory_cache is not None:
+            self.flat_memory_cache.carry_reservation(adder)
+
         if self.chunked_req is not None:
             self.chunked_req.init_next_round_input()
             self.chunked_req = adder.add_chunked_req(self.chunked_req)
+
+        if self.flat_memory_cache is not None:
+            self.waiting_queue = self.flat_memory_cache.prepare_admission(
+                self.waiting_queue,
+                adder,
+                has_chunked_req=(
+                    self.chunked_req is not None or bool(adder.can_run_list)
+                ),
+            )
 
         if self.enable_lora:
             running_loras = {
@@ -3757,11 +3768,15 @@ class Scheduler(
                 if held_tokens > 0:
                     req.host_hit_length = held_tokens
                     req.swa_host_hit_length = held_swa_tokens
+            if self.flat_memory_cache is not None:
+                self.flat_memory_cache.before_admission(req, adder)
             res = adder.add_one_req(
                 req,
                 has_chunked_req=(self.chunked_req is not None),
                 truncation_align_size=self.truncation_align_size,
             )
+            if self.flat_memory_cache is not None:
+                self.flat_memory_cache.after_admission(req, adder)
 
             if self.enable_lora:
                 running_loras.add(req.lora_id)
@@ -3797,6 +3812,16 @@ class Scheduler(
 
         if mamba_allocator is not None:
             mamba_allocator.alloc_group_end()
+
+        if self.flat_memory_cache is not None:
+            self.flat_memory_cache.finish_admission(
+                adder,
+                can_progress=(
+                    not running_batch.is_empty()
+                    or bool(adder.can_run_list)
+                    or self.chunked_req is not None
+                ),
+            )
 
         # Update waiting queue
         can_run_list: List[Req] = adder.can_run_list

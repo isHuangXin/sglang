@@ -7,7 +7,7 @@ import os
 import threading
 import time
 from collections import deque
-from concurrent.futures import Future, ThreadPoolExecutor, wait
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import replace
 from typing import Any
 
@@ -16,7 +16,17 @@ import torch
 
 from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
 from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import DevicePoolGroup
-from sglang.srt.mem_cache.storage.flat_memory.payload import GPUTransfer, PayloadLayout
+from sglang.srt.mem_cache.storage.flat_memory.io_result import (
+    FlatCapacityError,
+    FlatUnsafeIOError,
+    FlatWriteResult,
+)
+from sglang.srt.mem_cache.storage.flat_memory.payload import (
+    GPUTransfer,
+    LookupProbeResult,
+    PageRecord,
+    PayloadLayout,
+)
 from sglang.srt.mem_cache.storage.flat_memory.ssd_executor import SSDReadExecutor
 from sglang.srt.mem_cache.unified_cache.unified_cache_linker import UnifiedCacheLinker
 
@@ -31,6 +41,16 @@ class FlatLoadResult(msgspec.Struct, frozen=True):
     dram_pages: int = 0
     ssd_pages: int = 0
     mixed_pages: int = 0
+    unsafe: bool = False
+
+
+class _LookupQuery(msgspec.Struct, eq=False):
+    transfers: list[PoolTransfer]
+    keys: list[str]
+    future: Future[list[int]]
+    deadline: float
+    dependencies: frozenset[Future] = frozenset()
+    eligible: bool = True
 
 
 class LayerLoadCounter:
@@ -164,12 +184,18 @@ class FlatMemoryDirectLinker(UnifiedCacheLinker):
         )
         self._pending_loads: dict[str, list[PoolTransfer]] = {}
         self._loads: dict[str, Future] = {}
-        self._lookups: dict[str, Future] = {}
-        self._query_jobs: set[Future] = set()
+        self._lookups: dict[str, Future[list[int]]] = {}
+        self._queries: dict[str, _LookupQuery] = {}
+        self._lookup_generations: dict[str, int] = {}
+        self._physical_query_jobs: dict[str, Future[LookupProbeResult]] = {}
+        self._storage_generation = 0
+        self._offload_coverage: dict[Future, frozenset[PageRecord]] = {}
         self._load_batches: deque[tuple[int, dict[str, Future]]] = deque()
         self._offloads: deque[Future] = deque()
         self._prefetch_samples = []
         self._backup_samples = []
+        self._last_capacity_warning = float("-inf")
+        self._unsafe_error: FlatUnsafeIOError | None = None
         self._lock = threading.RLock()
 
     @property
@@ -199,40 +225,129 @@ class FlatMemoryDirectLinker(UnifiedCacheLinker):
         kv = next(transfer for transfer in transfers if transfer.name == PoolName.KV)
         return self.transfer.lookup(keys=list(kv.keys or []), transfers=expanded)
 
-    def submit_lookup(self, rid: str, transfers: list[PoolTransfer]) -> Future:
+    @property
+    def storage_generation(self) -> int:
+        with self._lock:
+            return self._storage_generation
+
+    def get_lookup_generation(self, rid: str) -> int:
+        with self._lock:
+            return self._lookup_generations.get(rid, -1)
+
+    def submit_lookup(
+        self, rid: str, transfers: list[PoolTransfer]
+    ) -> Future[list[int]]:
         self._check_open()
-        snapshot = self._snapshot(transfers)
         with self._lock:
             if rid in self._lookups:
                 return self._lookups[rid]
-            offloads = tuple(self._offloads)
-            future = self._lookup_executor.submit(
-                self._lookup_after_backup, rid, snapshot, offloads
+            snapshot = self._snapshot(transfers)
+            expanded = self.pool_group.resolve_transfers(snapshot)
+            kv = next((item for item in snapshot if item.name == PoolName.KV), None)
+            future = Future()
+            query = _LookupQuery(
+                expanded,
+                list(kv.keys or []) if kv is not None else [],
+                future,
+                time.monotonic() + self.backup_wait_seconds,
             )
             self._lookups[rid] = future
-            self._query_jobs.add(future)
-            future.add_done_callback(self._query_finished)
+            self._queries[rid] = query
+            self._submit_query_probe(rid, query)
             return future
 
-    def _query_finished(self, future: Future) -> None:
+    def refresh_lookup(
+        self, rid: str, transfers: list[PoolTransfer]
+    ) -> Future[list[int]]:
+        self._check_open()
         with self._lock:
-            self._query_jobs.discard(future)
+            old = self._lookups.get(rid)
+            if old is not None and not old.done():
+                return old
+            self.release_lookup(rid)
+            return self.submit_lookup(rid, transfers)
 
-    def _lookup_after_backup(self, rid: str, transfers, offloads) -> list[int]:
-        result = self.lookup(rid, transfers)
-        kv = next((item for item in transfers if item.name == PoolName.KV), None)
-        complete = kv is not None and result and result[-1] == len(kv.keys or [])
-        pending = [future for future in offloads if not future.done()]
-        if not complete and pending and self.backup_wait_seconds:
-            wait(pending, timeout=self.backup_wait_seconds)
-            result = self.lookup(rid, transfers)
-        return result
+    def _submit_query_probe(self, rid: str, query: _LookupQuery) -> None:
+        if rid in self._physical_query_jobs:
+            return
+        offloads = dict(self._offload_coverage)
+        coverage = frozenset(
+            record for records in offloads.values() for record in records
+        )
+        generation = self._storage_generation
+        final_probe = time.monotonic() >= query.deadline
+        query.eligible = False
+        future = self._lookup_executor.submit(self._probe, query, coverage)
+        self._physical_query_jobs[rid] = future
+        future.add_done_callback(
+            lambda done: self._query_finished(
+                rid, query, done, offloads, generation, final_probe
+            )
+        )
+
+    def _probe(
+        self, query: _LookupQuery, coverage: frozenset[PageRecord]
+    ) -> LookupProbeResult:
+        if not query.transfers:
+            return LookupProbeResult(())
+        return self.transfer.lookup_probe(
+            keys=query.keys, transfers=query.transfers, pending_coverage=coverage
+        )
+
+    def _query_finished(
+        self, rid, query, future, offloads, generation, final_probe
+    ) -> None:
+        with self._lock:
+            self._physical_query_jobs.pop(rid)
+            # FLAT_MEMORY: A cancelled request ID may already name a new logical query.
+            if self._queries.get(rid) is not query:
+                return
+            if query.future.done():
+                self._queries.pop(rid)
+                return
+            try:
+                result = future.result()
+            except BaseException as error:
+                self._queries.pop(rid)
+                if query.future.set_running_or_notify_cancel():
+                    query.future.set_exception(error)
+                return
+            # FLAT_MEMORY: A write completing during the probe must leave a stale receipt.
+            self._lookup_generations[rid] = generation
+            query.dependencies = frozenset(
+                job
+                for job, records in offloads.items()
+                if not result.missing_records.isdisjoint(records)
+            )
+            if (
+                final_probe
+                or time.monotonic() >= query.deadline
+                or not query.dependencies
+            ):
+                self._queries.pop(rid)
+                # FLAT_MEMORY: Future.cancel() can race without acquiring the linker lock.
+                if query.future.set_running_or_notify_cancel():
+                    query.future.set_result(list(result.boundaries))
+            else:
+                query.eligible = any(job.done() for job in query.dependencies)
+
+    def poll_queries(self) -> None:
+        self._check_open()
+        with self._lock:
+            now = time.monotonic()
+            for rid, query in list(self._queries.items()):
+                if query.future.done():
+                    self._queries.pop(rid)
+                elif query.eligible or now >= query.deadline:
+                    self._submit_query_probe(rid, query)
 
     def release_lookup(self, rid: str) -> None:
         with self._lock:
+            self._queries.pop(rid, None)
+            self._lookup_generations.pop(rid, None)
             future = self._lookups.pop(rid, None)
-        if future is not None:
-            future.cancel()
+            if future is not None:
+                future.cancel()
 
     def load(self, rid: str, transfers: list[PoolTransfer]) -> bool:
         self._check_open()
@@ -331,7 +446,11 @@ class FlatMemoryDirectLinker(UnifiedCacheLinker):
         try:
             value = done.result()
         except BaseException as error:
-            value = FlatLoadResult(rid, f"{type(error).__name__}: {error}")
+            value = FlatLoadResult(
+                rid,
+                f"{type(error).__name__}: {error}",
+                unsafe=isinstance(error, FlatUnsafeIOError),
+            )
         self._finish_read(value, result, counter_index, batch)
 
     def _read(
@@ -339,19 +458,25 @@ class FlatMemoryDirectLinker(UnifiedCacheLinker):
     ) -> FlatLoadResult:
         started = time.perf_counter()
         failure = None
+        unsafe = False
         try:
-            if ready_event is not None:
-                ready_event.synchronize()
+            self._wait_ready(ready_event)
             self.transfer.read(transfers)
         except Exception as error:
             failure = f"{type(error).__name__}: {error}"
+            unsafe = isinstance(error, FlatUnsafeIOError)
+            logger.exception(
+                "Flat GPU restore failed (TP%d, %s)", self.tp_rank, self.device
+            )
         elapsed = time.perf_counter() - started
         if failure is None:
             with self._lock:
                 self._prefetch_samples.append(
                     (dram + ssd, self._payload_bytes(transfers), elapsed)
                 )
-        return FlatLoadResult(rid, failure, medium, elapsed, dram, ssd, mixed)
+        return FlatLoadResult(
+            rid, failure, medium, elapsed, dram, ssd, mixed, unsafe=unsafe
+        )
 
     def _payload_bytes(self, transfers) -> int:
         return sum(
@@ -362,6 +487,8 @@ class FlatMemoryDirectLinker(UnifiedCacheLinker):
 
     def _finish_read(self, value, result, counter_index, batch) -> None:
         with self._lock:
+            if value.unsafe:
+                self._unsafe_error = FlatUnsafeIOError(value.error)
             result.set_result(value)
             if all(future.done() for future in batch.values()):
                 errors = [
@@ -379,6 +506,8 @@ class FlatMemoryDirectLinker(UnifiedCacheLinker):
         if future is None or not future.done():
             return False
         result = future.result()
+        if result.unsafe:
+            raise FlatUnsafeIOError(result.error)
         if result.error:
             raise RuntimeError(result.error)
         return True
@@ -443,18 +572,28 @@ class FlatMemoryDirectLinker(UnifiedCacheLinker):
         )
         if not expanded:
             return False
+        coverage = self.layout.coverage(expanded)
         ready_event = self._ready_event()
         with self._lock:
-            self._offloads.append(
-                self._write_executor.submit(self._write, expanded, ready_event)
-            )
+            future = self._write_executor.submit(self._write, expanded, ready_event)
+            self._offloads.append(future)
+            self._offload_coverage[future] = coverage
+            future.add_done_callback(self._offload_finished)
         return True
 
-    def _write(self, transfers, ready_event) -> bool:
+    def _offload_finished(self, future: Future) -> None:
+        with self._lock:
+            self._offload_coverage.pop(future)
+            # FLAT_MEMORY: A failed later batch may follow earlier published pages.
+            self._storage_generation += 1
+            for query in self._queries.values():
+                if future in query.dependencies:
+                    query.eligible = True
+
+    def _write(self, transfers, ready_event) -> FlatWriteResult:
         started = time.perf_counter()
         try:
-            if ready_event is not None:
-                ready_event.synchronize()
+            self._wait_ready(ready_event)
             self.transfer.write(transfers)
             pages = len({key for transfer in transfers for key in transfer.keys or []})
             with self._lock:
@@ -465,10 +604,41 @@ class FlatMemoryDirectLinker(UnifiedCacheLinker):
                         time.perf_counter() - started,
                     )
                 )
-            return True
-        except Exception:
-            logger.exception("Flat GPU offload failed")
-            return False
+            return FlatWriteResult(success=True)
+        except FlatCapacityError as error:
+            now = time.monotonic()
+            if now - self._last_capacity_warning >= 5.0:
+                self._last_capacity_warning = now
+                logger.warning(
+                    "Flat GPU backup rejected by capacity (TP%d, %s): %s",
+                    self.tp_rank,
+                    self.device,
+                    error,
+                )
+            return FlatWriteResult(
+                success=False, capacity_rejected=True, error=str(error)
+            )
+        except Exception as error:
+            if isinstance(error, FlatUnsafeIOError):
+                self._unsafe_error = error
+            logger.exception(
+                "Flat GPU offload failed (TP%d, %s)", self.tp_rank, self.device
+            )
+            return FlatWriteResult(
+                success=False,
+                error=f"{type(error).__name__}: {error}",
+                unsafe=isinstance(error, FlatUnsafeIOError),
+            )
+
+    @staticmethod
+    def _wait_ready(ready_event) -> None:
+        if ready_event is not None:
+            try:
+                ready_event.synchronize()
+            except Exception as error:
+                raise FlatUnsafeIOError(
+                    f"Flat GPU producer did not quiesce: {error}"
+                ) from error
 
     def num_completed_offloads(self) -> int:
         with self._lock:
@@ -480,32 +650,67 @@ class FlatMemoryDirectLinker(UnifiedCacheLinker):
             return count
 
     def pop_completed_offload(self) -> bool:
+        result = self.pop_completed_offload_result()
+        if result.unsafe:
+            raise FlatUnsafeIOError(result.error)
+        return result.success
+
+    def pop_completed_offload_result(self) -> FlatWriteResult:
         with self._lock:
             if not self._offloads or not self._offloads[0].done():
                 raise RuntimeError("No Flat offload has completed")
-            return self._offloads.popleft().result()
+            result = self._offloads.popleft().result()
+            return (
+                FlatWriteResult(success=result) if isinstance(result, bool) else result
+            )
 
     def has_unfinished_io(self) -> bool:
         # FLAT_MEMORY: Ready or failed futures need retirement, not an idle delay.
         with self._lock:
-            return any(
-                not future.done()
-                for jobs in (self._query_jobs, self._loads.values(), self._offloads)
-                for future in jobs
+            return (
+                any(not query.future.done() for query in self._queries.values())
+                or bool(self._physical_query_jobs or self._offload_coverage)
+                or any(
+                    not future.done()
+                    for jobs in (self._loads.values(), self._offloads)
+                    for future in jobs
+                )
             )
 
     def drain(self, timeout: float | None = None) -> bool:
-        self.start_preparing_loads()
-        with self._lock:
-            futures = (
-                list(self._loads.values())
-                + list(self._offloads)
-                + list(self._query_jobs)
-            )
-        _, incomplete = wait(
-            futures, timeout=self.drain_timeout if timeout is None else timeout
+        deadline = time.monotonic() + (
+            self.drain_timeout if timeout is None else timeout
         )
-        return not incomplete
+        if self._unsafe_error is not None:
+            raise self._unsafe_error
+        self.transfer.raise_if_unsafe()
+        self.start_preparing_loads()
+        while True:
+            self.poll_queries()
+            if self._unsafe_error is not None:
+                raise self._unsafe_error
+            self.transfer.raise_if_unsafe()
+            if not self.has_unfinished_io():
+                return True
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            with self._lock:
+                futures = [
+                    future
+                    for jobs in (
+                        self._loads.values(),
+                        self._offloads,
+                        self._physical_query_jobs.values(),
+                    )
+                    for future in jobs
+                    if not future.done()
+                ]
+            # FLAT_MEMORY: Service deferred retries/deadlines, not just physical futures.
+            if futures:
+                wait(futures, timeout=min(remaining, 0.01), return_when=FIRST_COMPLETED)
+            else:
+                time.sleep(min(remaining, 0.01))
 
     def reset(self) -> None:
         if not self.drain():
@@ -513,6 +718,8 @@ class FlatMemoryDirectLinker(UnifiedCacheLinker):
         with self._lock:
             self._loads.clear()
             self._lookups.clear()
+            self._queries.clear()
+            self._lookup_generations.clear()
             self._offloads.clear()
             self._load_batches.clear()
             self.layer_done_counter.reset()
@@ -581,6 +788,8 @@ class FlatMemoryDirectLinker(UnifiedCacheLinker):
     def get_flat_memory_stats(self) -> dict:
         self._check_open()
         return {
+            # FLAT_MEMORY: I/O windows identify the bound device, not the TP rank.
+            "gpu_id": self.device.index,
             "storage": self.manager.get_stats(),
             "bandwidth": self.manager.get_bandwidth_report(),
             "capacity": self.manager.get_capacity_stats(),

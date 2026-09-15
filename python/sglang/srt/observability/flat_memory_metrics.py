@@ -31,7 +31,7 @@ _INT32_MAX = (1 << 31) - 1
 
 class FlatRequestMetrics(Protocol):
     flat_storage_backend: bool
-    flat_prefetch_stats: dict[str, int | float | None]
+    flat_prefetch_stats: dict[str, int | float | str | None]
     flat_cached_tokens: dict[str, int | None]
     storage_hit_length: int
     cached_tokens_device: int
@@ -90,6 +90,11 @@ def flat_cached_tokens_details(
         details.update(req.flat_cached_tokens)
         details.update(
             {name: req.flat_prefetch_stats[name] for name in FLAT_PREFETCH_FIELDS}
+        )
+        details.update(
+            (name, value)
+            for name, value in req.flat_prefetch_stats.items()
+            if name.startswith("flat_restore_")
         )
     for field, key in zip(
         FLAT_TRANSFER_FIELDS,

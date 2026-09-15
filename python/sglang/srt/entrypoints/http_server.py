@@ -848,7 +848,7 @@ async def server_info():
 # FLAT_MEMORY: A window owns completed I/O across all TP ranks, not an HTTP timer.
 @app.post("/flat_memory/io_window")
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
-async def flat_memory_io_window(obj: FlatMemoryIOWindowReq):
+async def flat_memory_io_window(obj: Annotated[FlatMemoryIOWindowReq, Body()]):
     try:
         validate_flat_window_request(obj.action, obj.window_id)
     except ValueError as exc:

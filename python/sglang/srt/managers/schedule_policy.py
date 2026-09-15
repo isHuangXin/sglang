@@ -60,6 +60,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     zero_match_result,
 )
+from sglang.srt.mem_cache.flat_memory_admission import FlatRestoreAdmission
 from sglang.srt.mem_cache.multi_ended_allocator import (
     UnifiedMambaSWATokenToKVPoolAllocator,
     UnifiedMambaTokenToKVPoolAllocator,
@@ -512,6 +513,8 @@ class PrefillAdder:
             self.rem_chunk_tokens -= num_mixed_decode_tokens
         self.rem_total_token_offset = num_mixed_decode_tokens
         self.cur_rem_token_offset = num_mixed_decode_tokens
+        self._flat_full_reservation = 0
+        self._flat_swa_reservation = 0
 
         self.req_states = None
         self.can_run_list = []
@@ -806,6 +809,162 @@ class PrefillAdder:
 
     def ceil_paged_tokens(self, tokens: int) -> int:
         return -(-tokens // self.page_size) * self.page_size
+
+    def _candidate_token_budget(self, req: Req, *, prefix_len: int):
+        max_new = min(
+            max(req.sampling_params.max_new_tokens - len(req.output_ids), 0),
+            CLIP_MAX_NEW_TOKENS,
+        )
+        extend = len(req.full_untruncated_fill_ids) - prefix_len
+        total = extend + max_new + self.page_size + self._mamba_gap_budget_for_req(req)
+        if self._flat_full_reservation or self._flat_swa_reservation:
+            remaining = max(req.sampling_params.max_new_tokens - len(req.output_ids), 0)
+            total = max(
+                total,
+                self.ceil_paged_tokens(extend)
+                + self.ceil_paged_tokens(remaining)
+                + 2 * self.page_size,
+            )
+        real_input = self.ceil_paged_tokens(extend - req.host_hit_length)
+        return max_new, total, real_input
+
+    def _flat_candidate_swa_budget(self, req: Req, real_input: int) -> int:
+        alloc = (
+            real_input
+            if self.rem_chunk_tokens is None
+            else min(real_input, max(0, self.rem_chunk_tokens))
+        )
+        future_input = max(0, real_input - alloc)
+        remaining = max(req.sampling_params.max_new_tokens - len(req.output_ids), 0)
+        charged_decode = (
+            0
+            if future_input
+            else min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS)
+        )
+        window = self.tree_cache.sliding_window_size
+        reserved = self._swa_reserved_tokens(alloc, charged_decode)
+        current = max(alloc - window, 0) + reserved
+        growth = future_input + remaining
+        guard = (
+            self.ceil_paged_tokens(min(growth, window)) + self.page_size
+            if growth
+            else 0
+        )
+        return current + max(0, guard - max(0, reserved - min(alloc, window)))
+
+    def _flat_running_headroom(self):
+        # FLAT_MEMORY: A private read spans multiple decode steps, not just the next one.
+        running = self.running_batch.reqs if self.running_batch is not None else []
+        full_extra, swa_extra = 0, 0
+        seen = set()
+        for req in [*running, *self.can_run_list]:
+            if id(req) in seen:
+                continue
+            seen.add(id(req))
+            admitted = any(req is candidate for candidate in self.can_run_list)
+            remaining = max(req.sampling_params.max_new_tokens - len(req.output_ids), 0)
+            future_input = (
+                max(0, len(req.full_untruncated_fill_ids) - req.extend_range.end)
+                if admitted
+                else 0
+            )
+            growth = future_input + remaining
+            if not growth:
+                continue
+            if admitted:
+                charged_decode = (
+                    0
+                    if future_input
+                    else min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS)
+                )
+            else:
+                charged_decode = max(
+                    self._get_running_request_total_token_offset(req), 0
+                )
+            full_extra += max(
+                0, self.ceil_paged_tokens(growth) + self.page_size - charged_decode
+            )
+            if self.is_hybrid_swa:
+                window = self.tree_cache.sliding_window_size
+                guard = self.ceil_paged_tokens(min(growth, window)) + self.page_size
+                if admitted:
+                    extend = self.ceil_paged_tokens(req.extend_range.length)
+                    # Only the not-yet-consumed decode/page headroom can fund this guard.
+                    reserved = self._swa_reserved_tokens(extend, charged_decode)
+                    guard -= max(0, reserved - min(extend, window))
+                swa_extra += max(0, guard)
+        return full_extra, swa_extra
+
+    def set_flat_restore_reservation(
+        self, *, full_tokens: int, swa_tokens: int
+    ) -> None:
+        if full_tokens < 0 or swa_tokens < 0:
+            raise ValueError("Flat restore reservations must be nonnegative")
+        extra_full, extra_swa = (
+            self._flat_running_headroom() if full_tokens or swa_tokens else (0, 0)
+        )
+        full, swa = full_tokens + extra_full, swa_tokens + extra_swa
+        self.rem_total_token_offset += full - self._flat_full_reservation
+        self.cur_rem_token_offset += full - self._flat_full_reservation
+        self.rem_swa_token_offset += swa - self._flat_swa_reservation
+        self._flat_full_reservation, self._flat_swa_reservation = full, swa
+
+    def plan_flat_restore(
+        self,
+        req: Req,
+        *,
+        restored_prefix_len: int,
+        full_tokens: int,
+        swa_tokens: int,
+    ) -> FlatRestoreAdmission:
+        if (
+            not 0
+            <= full_tokens
+            <= restored_prefix_len
+            <= len(req.full_untruncated_fill_ids)
+        ):
+            raise ValueError("Invalid Flat restore prefix footprint")
+        if swa_tokens < 0 or (swa_tokens and not self.is_hybrid_swa):
+            raise ValueError("Invalid Flat restore SWA footprint")
+        if self.is_hybrid_ssm_cache or self.is_all_swa:
+            raise ValueError("Flat admission requires full or full/SWA pools")
+        if self.rem_input_tokens <= 0 or (
+            self.rem_chunk_tokens is not None and self.rem_chunk_tokens <= 0
+        ):
+            return FlatRestoreAdmission(False, reason="prefill_pass_budget")
+        if (
+            self.prefill_max_requests is not None
+            and len(self.can_run_list) >= self.prefill_max_requests
+        ):
+            return FlatRestoreAdmission(False, reason="prefill_request_limit")
+        max_new, full_reservation, real_input = self._candidate_token_budget(
+            req, prefix_len=restored_prefix_len
+        )
+        full_capacity = self.token_to_kv_pool_allocator.size_full
+        if restored_prefix_len + full_reservation >= full_capacity:
+            return FlatRestoreAdmission(
+                False, never_fits=True, reason="full_pool_capacity"
+            )
+        extra_full, extra_swa = self._flat_running_headroom()
+        if full_tokens + full_reservation + extra_full >= self.rem_total_tokens:
+            return FlatRestoreAdmission(False, reason="full_decode_headroom")
+        swa_reservation = 0
+        if self.is_hybrid_swa:
+            swa_reservation = self._swa_budget_for_req(
+                real_input, max_new, swa_host_hit_length=0
+            )
+            if swa_tokens + swa_reservation >= self.token_to_kv_pool_allocator.size_swa:
+                # Normal admission retains ownership of its existing safe chunk fallback.
+                return FlatRestoreAdmission(
+                    False, never_fits=True, reason="swa_restore_and_chunk_capacity"
+                )
+            if swa_tokens + swa_reservation + extra_swa >= self.rem_swa_tokens:
+                return FlatRestoreAdmission(False, reason="swa_decode_headroom")
+        return FlatRestoreAdmission(
+            True,
+            full_reservation=full_reservation,
+            swa_reservation=swa_reservation,
+        )
 
     def budget_state(self):
         no_token = self.rem_total_tokens <= 0 or self.cur_rem_tokens <= 0
@@ -1192,28 +1351,23 @@ class PrefillAdder:
         # Reserve page_size for page-alignment overhead: the paged allocator may
         # consume one extra page per request (see alloc_extend), which
         # _update_prefill_budget also deducts.
-        max_new = min(
-            max(req.sampling_params.max_new_tokens - len(req.output_ids), 0),
-            CLIP_MAX_NEW_TOKENS,
-        )
-        cand_extend_input_len = len(req.full_untruncated_fill_ids) - len(
-            req.prefix_indices
-        )
-        total_tokens = cand_extend_input_len + max_new + self.page_size
-        # Shared Mamba pool: fold the new mamba state's shared-gap cost into
-        # `total_tokens` so both `rem_total_tokens` gates reflect the joint budget.
-        total_tokens += self._mamba_gap_budget_for_req(req)
-
-        # adjusting the input_tokens based on host_hit_length and page_size
-        real_input_tokens = cand_extend_input_len - req.host_hit_length
-        real_input_tokens = self.ceil_paged_tokens(real_input_tokens)
         prefix_len = len(req.prefix_indices)
+        # Shared Mamba gap costs remain part of both total-token admission gates.
+        _, total_tokens, real_input_tokens = self._candidate_token_budget(
+            req, prefix_len=prefix_len
+        )
 
         if total_tokens >= self.rem_total_tokens:
             return AddReqResult.NO_TOKEN
 
         chunk_tokens_limit = self.rem_chunk_tokens
         if self.is_hybrid_swa:
+            if (
+                self._flat_full_reservation or self._flat_swa_reservation
+            ) and self._flat_candidate_swa_budget(
+                req, real_input_tokens
+            ) >= self.rem_swa_tokens:
+                return AddReqResult.NO_TOKEN
             # host-hit prefix is loaded back, not re-prefilled, so the SWA peak is
             # driven only by the freshly-prefilled tail (the loaded window is
             # charged separately via swa_host_hit_length).
@@ -1253,6 +1407,12 @@ class PrefillAdder:
 
             if self.is_hybrid_swa:
                 # self.rem_swa_tokens may decrease after the lock acquisition
+                if (
+                    self._flat_full_reservation or self._flat_swa_reservation
+                ) and self._flat_candidate_swa_budget(
+                    req, real_input_tokens
+                ) >= self.rem_swa_tokens:
+                    return AddReqResult.NO_TOKEN
                 swa_needed = self._swa_budget_for_req(
                     real_input_tokens,
                     self._swa_new_tokens(req),

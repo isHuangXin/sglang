@@ -276,6 +276,18 @@ class UnifiedCacheLinkerWrapper:
             return self.cache.tree_core.empty_match_result.device_indices, req.last_node
         return self.commit_prepared_load(prepared)
 
+    def plan_load_tokens(self, keys: list[str]) -> dict[PoolName, int] | None:
+        # FLAT_MEMORY: LOOKUP and LOAD share component key/window selection.
+        tokens = {}
+        for component in self.cache._components_tuple:
+            transfer = component.build_external_linker_transfer(
+                LinkerTransferPhase.LOOKUP, None, keys
+            )
+            if transfer is None:
+                return None
+            tokens[transfer.name] = len(transfer.keys or []) * self.cache.page_size
+        return tokens
+
     def prepare_load(
         self,
         req: Req,

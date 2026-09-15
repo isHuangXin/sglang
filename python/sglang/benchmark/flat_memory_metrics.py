@@ -41,6 +41,7 @@ _IO_RESULT_FIELDS = (
     "flat_ssd_write_io_count",
     "flat_ssd_durable_write_batches",
     "flat_ssd_new_kv_blocks",
+    "flat_capacity_pressure_offloads",
 )
 
 
@@ -248,6 +249,18 @@ def _validate_flat_window(snapshot, window_id, active, expected_tp_size=None):
     return ranks, next(iter(boundaries))
 
 
+def _flat_replicated_delta(first, last, name):
+    if any(name not in rank for ranks in (first, last) for rank in ranks.values()):
+        return None
+    deltas = {
+        _flat_counter(_flat_counter(rank[name]) - _flat_counter(first[tp_rank][name]))
+        for tp_rank, rank in last.items()
+    }
+    if len(deltas) != 1:
+        raise ValueError(f"Flat TP ranks disagree on {name}")
+    return deltas.pop()
+
+
 def summarize_flat_io(before, after, window_id, expected_tp_size=None):
     first, (start, _) = _validate_flat_window(before, window_id, True, expected_tp_size)
     last, (end_start, end) = _validate_flat_window(after, window_id, False, len(first))
@@ -310,6 +323,10 @@ def summarize_flat_io(before, after, window_id, expected_tp_size=None):
         "flat_ssd_write_io_count": totals["write_completed_ops"],
         "flat_ssd_durable_write_batches": totals["durable_write_batches"],
         "flat_ssd_new_kv_blocks": deltas["ssd_write_count"],
+        # FLAT_MEMORY: TP-common outcomes are replicated, not additive per-rank I/O.
+        "flat_capacity_pressure_offloads": _flat_replicated_delta(
+            first, last, "flat_capacity_pressure_offloads"
+        ),
     }
 
 

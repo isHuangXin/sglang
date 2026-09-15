@@ -87,6 +87,7 @@ def _cache_for_wrapper(**kwargs):
     defaults = {
         "tree_core": SimpleNamespace(enable_external_cache_linker=False),
         "write_through_threshold": 256,
+        "is_swa_enabled": False,
         "pp_size": 1,
         "pp_group": None,
     }
@@ -364,6 +365,7 @@ def test_close_quiesces_backend_before_releasing_pending_loads():
 def test_check_hicache_events_commits_common_rank_results():
     committed = []
     cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+    cache.flat_memory = None
     cache.linker = SimpleNamespace(
         num_completed_loads=lambda: 1,
         drain_loads=lambda count: committed.append(("load", count)),
@@ -394,6 +396,7 @@ def test_component_commit_keeps_only_adopted_pages():
     mapping = _MappingRecorder()
     cache = _cache_for_wrapper(
         page_size=2,
+        is_swa_enabled=True,
         token_to_kv_pool_allocator=SimpleNamespace(
             set_full_to_swa_mapping=mapping.set_full_to_swa_mapping
         ),

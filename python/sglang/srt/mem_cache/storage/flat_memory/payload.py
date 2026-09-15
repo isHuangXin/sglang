@@ -14,9 +14,19 @@ import torch
 
 from sglang.srt.mem_cache.hicache_storage import PoolHitPolicy, PoolName, PoolTransfer
 from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import DevicePoolGroup
+from sglang.srt.mem_cache.storage.flat_memory.io_result import (
+    FlatCapacityError,
+    FlatUnsafeIOError,
+)
 
 ALIGNMENT = 4096
 FORMAT_VERSION = 1
+PageRecord = tuple[PoolName, str]
+
+
+class LookupProbeResult(msgspec.Struct, frozen=True):
+    boundaries: tuple[int, ...]
+    missing_records: frozenset[PageRecord] = frozenset()
 
 
 def align_up(size: int) -> int:
@@ -140,6 +150,17 @@ class PayloadLayout:
         ).hexdigest()
         self.namespace = f"flat-v{FORMAT_VERSION}:{digest}"
 
+    def page_record(self, *, name: PoolName, page_key: str) -> PageRecord:
+        return name, f"{self.namespace}:{page_key}"
+
+    def coverage(self, transfers: list[PoolTransfer]) -> frozenset[PageRecord]:
+        # FLAT_MEMORY: Callers provide resolved physical pools, not logical aliases.
+        return frozenset(
+            self.page_record(name=transfer.name, page_key=key)
+            for transfer in transfers
+            for key in transfer.keys or []
+        )
+
     def keys_for_page(self, *, name: PoolName, page_key: str) -> list[str]:
         return [
             self._key(name=name, page_key=page_key, spec=spec)
@@ -189,16 +210,25 @@ class StagingBudget:
         self.current_bytes = 0
         self.peak_bytes = 0
         self._condition = threading.Condition()
+        self._error: FlatUnsafeIOError | None = None
 
     def acquire(self, size: int) -> None:
         if size > self.total_bytes:
             raise ValueError("One Flat staging allocation exceeds the total budget")
         with self._condition:
             self._condition.wait_for(
-                lambda: self.current_bytes + size <= self.total_bytes
+                lambda: self._error is not None
+                or self.current_bytes + size <= self.total_bytes
             )
+            if self._error is not None:
+                raise self._error
             self.current_bytes += size
             self.peak_bytes = max(self.peak_bytes, self.current_bytes)
+
+    def poison(self, error: FlatUnsafeIOError) -> None:
+        with self._condition:
+            self._error = error
+            self._condition.notify_all()
 
     def release(self, size: int) -> None:
         with self._condition:
@@ -245,6 +275,8 @@ class GPUTransfer:
         self.padded_read_bytes = 0
         self.padded_write_bytes = 0
         self._metrics_lock = threading.Lock()
+        self._unsafe_error: FlatUnsafeIOError | None = None
+        self._retained_staging: list[torch.Tensor] = []
 
     def _batches(self, fragments: Iterable[PayloadFragment]):
         batch, total = [], 0
@@ -282,13 +314,51 @@ class GPUTransfer:
     def read(self, transfers: list[PoolTransfer]) -> None:
         self._transfer(transfers=transfers, write=False)
 
+    def raise_if_unsafe(self) -> None:
+        if self._unsafe_error is not None:
+            raise self._unsafe_error
+
+    def _retain_stage(self, owner, error: FlatUnsafeIOError) -> None:
+        # FLAT_MEMORY: Unproven completion must not return buffers to the allocator.
+        with self._metrics_lock:
+            self._unsafe_error = error
+            if owner is not None:
+                self._retained_staging.append(owner)
+        self.budget.poison(error)
+
+    @staticmethod
+    def _write_results(result: dict, *, count: int, complete: bool) -> list[bool]:
+        results = result["results"]
+        if len(results) != count:
+            raise RuntimeError("Flat GPU write returned the wrong number of results")
+        status = result["status"]
+        if status == "capacity":
+            raise FlatCapacityError(result["error"])
+        if status != "ok":
+            raise RuntimeError(f"Flat GPU write {status}: {result['error']}")
+        if complete and not all(results):
+            raise RuntimeError("Flat GPU write did not complete every payload fragment")
+        return results
+
     def _transfer(self, *, transfers: list[PoolTransfer], write: bool) -> None:
+        self.raise_if_unsafe()
         with self._context(), self._stream_context():
             for batch, total in self._batches(self.layout.fragments(transfers)):
+                if write:
+                    admission = self.manager.check_gpu_write(
+                        [fragment.key for fragment in batch],
+                        [fragment.padded_length for fragment in batch],
+                    )
+                    results = self._write_results(
+                        admission, count=len(batch), complete=False
+                    )
+                    if all(results):
+                        self._record_batch(batch, write=True)
+                        continue
                 allocated = total + ALIGNMENT - 1
                 self.budget.acquire(allocated)
                 owner = stage = None
-                failure = None
+                unsafe = False
                 try:
                     owner = torch.empty(
                         allocated, dtype=torch.uint8, device=self.device
@@ -296,17 +366,23 @@ class GPUTransfer:
                     offset = (-owner.data_ptr()) % ALIGNMENT
                     stage = owner.narrow(0, offset, total)
                     self._transfer_batch(batch=batch, stage=stage, write=write)
-                except Exception as error:
-                    failure = f"{type(error).__name__}: {error}"
+                except FlatUnsafeIOError as error:
+                    unsafe = True
+                    self._retain_stage(owner, error)
+                    raise
                 finally:
-                    # Copies on an exceptional path still own their source allocation.
-                    try:
-                        self._sync()
-                    finally:
+                    if not unsafe:
+                        try:
+                            self._sync()
+                        except Exception as error:
+                            failure = FlatUnsafeIOError(
+                                f"Flat GPU staging did not quiesce: {error}"
+                            )
+                            self._retain_stage(owner, failure)
+                            raise failure from error
                         owner = stage = None
                         self.budget.release(allocated)
-                if failure is not None:
-                    raise RuntimeError(failure)
+                self._record_batch(batch, write=write)
 
     def _transfer_batch(self, *, batch, stage: torch.Tensor, write: bool) -> None:
         views, pointers, sizes, keys = [], [], [], []
@@ -323,9 +399,11 @@ class GPUTransfer:
                 view.zero_()
                 view[: fragment.source.numel()].copy_(fragment.source)
             offset += fragment.padded_length
+        # FLAT_MEMORY: Native streams must wait for this allocation's prior users.
+        self._sync()
         if write:
-            self._sync()
-            results = self.manager.put_gpu_file(keys, pointers, sizes)
+            result = self.manager.put_gpu_file_detailed(keys, pointers, sizes)
+            results = self._write_results(result, count=len(batch), complete=True)
         else:
             addresses = self.manager.lookup_addresses(keys)
             if len(addresses) != len(keys) or not all(addresses):
@@ -342,8 +420,10 @@ class GPUTransfer:
             for fragment, view in zip(batch, views):
                 fragment.source.copy_(view[: fragment.source.numel()])
             self._sync()
+
+    def _record_batch(self, batch: list[PayloadFragment], *, write: bool) -> None:
         logical = sum(fragment.source.numel() for fragment in batch)
-        padded = sum(sizes)
+        padded = sum(fragment.padded_length for fragment in batch)
         with self._metrics_lock:
             if write:
                 self.logical_write_bytes += logical
@@ -353,18 +433,59 @@ class GPUTransfer:
                 self.padded_read_bytes += padded
 
     def lookup(self, *, keys: list[str], transfers: list[PoolTransfer]) -> list[int]:
+        return list(self.lookup_probe(keys=keys, transfers=transfers).boundaries)
+
+    def lookup_probe(
+        self,
+        *,
+        keys: list[str],
+        transfers: list[PoolTransfer],
+        pending_coverage: frozenset[PageRecord] = frozenset(),
+    ) -> LookupProbeResult:
         candidates = set(range(1, len(keys) + 1))
+        possible = set(candidates)
+        pools = []
         for transfer in transfers:
             states = self.page_addresses(name=transfer.name, keys=keys)
             exists = [bool(addresses) and all(addresses) for addresses in states]
+            records = [
+                self.layout.page_record(name=transfer.name, page_key=key)
+                for key in keys
+            ]
+            trailing_pages = max(1, len(transfer.keys or []))
             candidates &= restorable_boundaries(
-                exists,
-                policy=transfer.hit_policy,
-                trailing_pages=max(1, len(transfer.keys or [])),
+                exists, policy=transfer.hit_policy, trailing_pages=trailing_pages
             )
-            if not candidates:
+            # FLAT_MEMORY: Pending writes only explain a retry; never publish them as hits.
+            possible &= restorable_boundaries(
+                [
+                    found or record in pending_coverage
+                    for found, record in zip(exists, records)
+                ],
+                policy=transfer.hit_policy,
+                trailing_pages=trailing_pages,
+            )
+            pools.append((transfer.hit_policy, trailing_pages, exists, records))
+            if not possible:
                 break
-        return sorted(candidates)
+
+        best = max(candidates, default=0)
+        better = sorted(stop for stop in possible if stop > best)
+        missing = set()
+        if better:
+            for policy, trailing_pages, exists, records in pools:
+                if policy == PoolHitPolicy.ALL_PAGES:
+                    required = range(better[-1])
+                else:
+                    required = {
+                        index
+                        for stop in better
+                        for index in range(max(0, stop - trailing_pages), stop)
+                    }
+                missing.update(
+                    records[index] for index in required if not exists[index]
+                )
+        return LookupProbeResult(tuple(sorted(candidates)), frozenset(missing))
 
     def page_addresses(self, *, name: PoolName, keys: list[str]) -> list[list[int]]:
         states = []

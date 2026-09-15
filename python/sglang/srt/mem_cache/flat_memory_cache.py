@@ -6,6 +6,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import time
 from concurrent.futures import Future
 from typing import TYPE_CHECKING, Any
@@ -14,7 +15,9 @@ import msgspec
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.mem_cache.base_prefix_cache import MatchResult
+from sglang.srt.mem_cache.base_prefix_cache import MatchPrefixParams, MatchResult
+from sglang.srt.mem_cache.hicache_storage import PoolName
+from sglang.srt.mem_cache.storage.flat_memory.io_result import FlatUnsafeIOError
 from sglang.srt.mem_cache.unified_cache.components import LinkerTransferPhase
 from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
     ExternalCacheHitMarker,
@@ -50,6 +53,22 @@ class _Prefetch(msgspec.Struct, kw_only=True):
     loaded_tokens: int = 0
     started: float = 0.0
     swa_evicted_before: int = 0
+    original_device_tokens: int = 0
+    query_start: int = 0
+    queried_endpoint: int = 0
+    query_generation: int = -1
+    refresh_attempts: int = 0
+    refresh_deadline: float = 0.0
+    read_anchor_tokens: int = 0
+    read_endpoint: int = 0
+    lease_started: float = 0.0
+    ready_started: float = 0.0
+    full_reservation: int = 0
+    swa_reservation: int = 0
+    bypass: bool = False
+    revoke_reason: str = ""
+    admission_attempted: bool = False
+    admitted: bool = False
 
 
 class FlatMemoryCache:
@@ -68,6 +87,14 @@ class FlatMemoryCache:
         self.arrivals: dict[str, int] = {}
         self._next_arrival = 0
         self.io_errors = 0
+        self.capacity_pressure_offloads = 0
+        self.lease_fallbacks = 0
+        self.restore_deferrals = 0
+        self.ready_dropped_tokens = 0
+        self.admission_dropped_tokens = 0
+        self._lease_rid: str | None = None
+        self._admission_candidate: str | None = None
+        self._admission_states: list[_Prefetch] = []
         self._last_metrics_log = 0.0
         threshold_override = envs.SGLANG_PREFETCH_THRESHOLD.get()
         self.prefetch_threshold = int(
@@ -75,12 +102,18 @@ class FlatMemoryCache:
             if threshold_override is None
             else threshold_override
         )
+        # FLAT_MEMORY: The legacy budget permits one oversized prefix; leases serialize it.
         self.max_prefetch_tokens = int(config.get("prefetch_max_tokens", 65536))
         self.drain_timeout = float(config.get("drain_timeout", 30.0))
+        self.lease_timeout = float(
+            config.get("restore_lease_timeout", self.drain_timeout)
+        )
         if self.prefetch_threshold < 0 or self.max_prefetch_tokens < cache.page_size:
             raise ValueError("Invalid Flat prefetch threshold or token budget")
-        if self.drain_timeout <= 0:
-            raise ValueError("Flat drain_timeout must be positive")
+        if not math.isfinite(self.drain_timeout) or self.drain_timeout <= 0:
+            raise ValueError("Flat drain_timeout must be finite and positive")
+        if not math.isfinite(self.lease_timeout) or self.lease_timeout <= 0:
+            raise ValueError("Flat restore_lease_timeout must be finite and positive")
 
     @property
     def manager(self):
@@ -104,10 +137,18 @@ class FlatMemoryCache:
             )
 
     def order_ready_requests(self, requests: list) -> list:
-        # FLAT_MEMORY: I/O completion order must not replace request arrival order.
-        if not self.ready_fcfs:
-            return requests
-        return sorted(requests, key=lambda req: self.arrivals[req.rid])
+        # FLAT_MEMORY: A ready lease gets the first real admission attempt.
+        ordered = (
+            sorted(requests, key=lambda req: self.arrivals[req.rid])
+            if self.ready_fcfs
+            else requests
+        )
+        lease = self.prefetches.get(self._lease_rid)
+        if lease is not None and lease.phase == "ready":
+            return [req for req in ordered if req.rid == self._lease_rid] + [
+                req for req in ordered if req.rid != self._lease_rid
+            ]
+        return ordered
 
     def has_hit(self, rid: str) -> bool:
         # Completed Flat reads are already device hits; admission never queues DMA.
@@ -134,21 +175,26 @@ class FlatMemoryCache:
             tail_hashes=tail_hashes,
             started=time.monotonic(),
             swa_evicted_before=req.kv.swa_evicted_seqlen if req.kv is not None else 0,
+            original_device_tokens=device_hit_len,
+            query_start=device_hit_len,
+            queried_endpoint=device_hit_len,
         )
         self.prefetches[req.rid] = state
-        if len(tail_hashes) * self.cache.page_size < self.prefetch_threshold:
+        self._diagnose(state, original_device_tokens=device_hit_len)
+        if (
+            not tail_hashes
+            or len(tail_hashes) * self.cache.page_size < self.prefetch_threshold
+        ):
             state.phase = "ready"
             return result
         transfers = self._lookup_transfers(tail_hashes)
         if not transfers:
-            state.phase = "ready"
+            state.phase, state.bypass = "ready", True
             return result
-        state.hold_node = result.last_device_node
-        state.hold_params = self.cache.inc_lock_ref(state.hold_node).to_dec_params()
+        # FLAT_MEMORY: Metadata probes never retain an evictable device anchor.
         try:
             state.future = self.cache_linker.submit_lookup(req.rid, transfers)
         except BaseException:
-            self._release_hold(state)
             self.prefetches.pop(req.rid)
             raise
         return result
@@ -171,6 +217,7 @@ class FlatMemoryCache:
 
     def poll(self) -> None:
         self._poll_offloads()
+        self.cache_linker.poll_queries()
         self._log_metrics()
         # FLAT_MEMORY: Every rank visits the same request list, never worker order.
         states = list(self.prefetches.values())
@@ -186,12 +233,7 @@ class FlatMemoryCache:
         for state, ready in zip(states, query_ready):
             if ready:
                 self._finish_query(state)
-        occupied = sum(s.loaded_tokens for s in states if s.prepared is not None)
-        for state in states:
-            if state.phase == "allocate":
-                self._prepare(state, occupied=occupied)
-                if state.prepared is not None:
-                    occupied += state.loaded_tokens
+        self._expire_lease()
         self._poll_reads(states)
         for state in states:
             if state.cancelled and state.phase == "ready":
@@ -210,28 +252,244 @@ class FlatMemoryCache:
         pages = self.tree_linker._sync_restorable_prefix(
             restorable, num_pages=len(state.tail_hashes), device_hit_pages=0
         )
-        if pages == 0:
-            state.phase = "ready"
-            self._release_hold(state)
-            return
-        state.loaded_tokens = pages * self.cache.page_size
-        state.tail_hashes = state.tail_hashes[:pages]
-        state.phase = "allocate"
+        state.query_generation = self.cache_linker.get_lookup_generation(state.req.rid)
+        state.queried_endpoint = state.query_start + pages * self.cache.page_size
+        state.phase = "allocate" if pages else "ready"
+        self._diagnose(
+            state,
+            queried_endpoint=state.queried_endpoint,
+            query_ms=(time.monotonic() - state.started) * 1000,
+        )
 
-    def _prepare(self, state: _Prefetch, *, occupied: int) -> None:
-        if state.cancelled:
+    def carry_reservation(self, adder) -> None:
+        lease = self.prefetches.get(self._lease_rid)
+        active = lease is not None and not lease.admitted
+        adder.set_flat_restore_reservation(
+            full_tokens=lease.full_reservation if active else 0,
+            swa_tokens=lease.swa_reservation if active else 0,
+        )
+
+    def prepare_admission(
+        self, requests: list, adder, *, has_chunked_req: bool
+    ) -> list:
+        # FLAT_MEMORY: This stage is shared by all ranks, before the local add loop.
+        requests = self.order_ready_requests(requests)
+        self._agree_requests(requests)
+        self._admission_states = [
+            self.prefetches[req.rid] for req in requests if req.rid in self.prefetches
+        ]
+        self._admission_candidate = None
+        for state in self._admission_states:
+            state.admission_attempted = False
+        self._refresh_stale_queries(self._admission_states)
+        lease = self.prefetches.get(self._lease_rid)
+        if lease is not None:
+            if lease.phase == "ready":
+                self._revalidate_lease(lease, adder)
+        elif not has_chunked_req:
+            candidate = next(
+                (s for s in self._admission_states if s.phase == "allocate"), None
+            )
+            if candidate is not None:
+                self._admission_candidate = candidate.req.rid
+                self._select_restore(candidate, adder)
+        self.carry_reservation(adder)
+        return self.order_ready_requests(requests)
+
+    def _agree_requests(self, requests: list) -> None:
+        identity = json.dumps([req.rid for req in requests], separators=(",", ":"))
+        digest = int.from_bytes(hashlib.sha256(identity.encode()).digest()[:4], "big")
+        signature = [len(requests), digest & 0x7FFFFFFF]
+        minima = self._reduce(signature, torch.distributed.ReduceOp.MIN)
+        maxima = self._reduce(signature, torch.distributed.ReduceOp.MAX)
+        if minima != maxima:
+            raise RuntimeError("Flat restore admission queue differs across TP ranks")
+
+    def _refresh_stale_queries(self, states: list[_Prefetch]) -> None:
+        if not states:
+            return
+        generation = self.cache_linker.storage_generation
+        stale = self._reduce(
+            [
+                int(
+                    s.phase in ("ready", "allocate")
+                    and not s.bypass
+                    and not s.lease_started
+                    and s.future is not None
+                    and s.refresh_attempts < 2
+                    and s.queried_endpoint
+                    < len(s.key) // self.cache.page_size * self.cache.page_size
+                    and s.query_generation < generation
+                )
+                for s in states
+            ],
+            torch.distributed.ReduceOp.MAX,
+        )
+        for state, refresh in zip(states, stale):
+            check_gap = (
+                state.phase == "ready"
+                and not state.bypass
+                and not state.lease_started
+                and state.query_start > 0
+            )
+            if not refresh and not check_gap:
+                continue
+            result = self._rematch(state)
+            gap = len(result.device_indices) < state.query_start
+            if not refresh and not gap:
+                continue
+            tail_tokens = (
+                (len(state.key) - len(result.device_indices))
+                // self.cache.page_size
+                * self.cache.page_size
+            )
+            if state.future is None and tail_tokens < self.prefetch_threshold:
+                continue
+            if self._can_refresh(state):
+                self._refresh_query(state, result)
+            elif gap:
+                self._fallback(state, "anchor_gap_refresh_exhausted")
+
+    def _can_refresh(self, state: _Prefetch) -> bool:
+        now = time.monotonic()
+        if not state.refresh_deadline:
+            state.refresh_deadline = now + self.lease_timeout
+        exhausted = self._reduce(
+            [int(state.refresh_attempts >= 2 or now >= state.refresh_deadline)],
+            torch.distributed.ReduceOp.MAX,
+        )[0]
+        return not exhausted
+
+    def _rematch(self, state: _Prefetch) -> MatchResult:
+        # FLAT_MEMORY: A metadata-only query's original node/indices may be evicted.
+        result = self.cache.match_prefix(MatchPrefixParams(key=state.key))
+        size = [len(result.device_indices)]
+        minima = self._reduce(size, torch.distributed.ReduceOp.MIN)
+        maxima = self._reduce(size, torch.distributed.ReduceOp.MAX)
+        if minima != maxima:
+            raise RuntimeError("Flat restore device anchor differs across TP ranks")
+        return result
+
+    def _refresh_query(self, state: _Prefetch, result: MatchResult) -> None:
+        state.refresh_attempts += 1
+        state.query_start = len(result.device_indices)
+        namespace = request_storage_namespace(state.key)
+        state.tail_hashes = [
+            namespace + value
+            for value in self.tree_linker._tail_hashes(
+                state.key, result, state.query_start
+            )
+        ]
+        state.queried_endpoint = state.query_start
+        if not state.tail_hashes:
             state.phase = "ready"
+            self.cache_linker.release_lookup(state.req.rid)
+            state.future = None
             return
-        # One large prefix is allowed; simultaneous prefixes share the fixed budget.
-        if occupied and occupied + state.loaded_tokens > self.max_prefetch_tokens:
+        transfers = self._lookup_transfers(state.tail_hashes)
+        if not transfers:
+            state.phase, state.bypass = "ready", True
+            self.cache_linker.release_lookup(state.req.rid)
             return
+        state.future = self.cache_linker.refresh_lookup(state.req.rid, transfers)
+        state.phase = "query"
+        self._diagnose(state, refresh_attempts=state.refresh_attempts)
+
+    def _select_restore(self, state: _Prefetch, adder) -> None:
+        result = self._rematch(state)
+        device_tokens = len(result.device_indices)
+        if device_tokens >= state.queried_endpoint:
+            self._fallback(state, "device_covers_restore", count=False)
+            return
+        if device_tokens < state.query_start:
+            if self._can_refresh(state):
+                self._refresh_query(state, result)
+            else:
+                self._fallback(state, "anchor_gap_refresh_exhausted")
+            return
+        page = self.cache.page_size
+        keys = state.tail_hashes[
+            (device_tokens - state.query_start)
+            // page : (state.queried_endpoint - state.query_start)
+            // page
+        ]
+        footprint = self.tree_linker.plan_load_tokens(keys)
+        supported = self._reduce(
+            [int(footprint is not None)], torch.distributed.ReduceOp.MIN
+        )[0]
+        if not supported:
+            self._fallback(state, "unsupported_restore_footprint")
+            return
+        state.result = result
+        state.hold_node = result.last_device_node
+        state.hold_params = self.cache.inc_lock_ref(state.hold_node).to_dec_params()
+        plan = adder.plan_flat_restore(
+            state.req,
+            restored_prefix_len=state.queried_endpoint,
+            full_tokens=footprint.get(PoolName.KV, 0),
+            swa_tokens=footprint.get(PoolName.SWA, 0),
+        )
+        can_restore, never_fits = self._sync_plan(plan)
+        if not can_restore:
+            self._release_hold(state)
+            self.restore_deferrals += 1
+            self._diagnose(state, reason=plan.reason or "restore_headroom")
+            if never_fits:
+                self._fallback(state, "restore_never_fits")
+            return
+        state.full_reservation, state.swa_reservation = self._sync_reservation(plan)
+        state.read_anchor_tokens = device_tokens
+        state.read_endpoint = state.queried_endpoint
+        state.loaded_tokens = state.read_endpoint - device_tokens
+        state.lease_started = time.monotonic()
+        self._lease_rid = state.req.rid
+        self._diagnose(
+            state,
+            read_anchor_tokens=device_tokens,
+            read_endpoint=state.read_endpoint,
+            prepared_tokens=state.loaded_tokens,
+            prepare_ms=(state.lease_started - state.started) * 1000,
+        )
+        self._prepare(state, keys=keys)
+
+    def _sync_plan(self, plan) -> tuple[bool, bool]:
+        can_restore = self._reduce(
+            [int(plan.can_restore)], torch.distributed.ReduceOp.MIN
+        )[0]
+        never_fits = self._reduce(
+            [int(plan.never_fits)], torch.distributed.ReduceOp.MAX
+        )[0]
+        return bool(can_restore), bool(never_fits)
+
+    def _sync_reservation(self, plan) -> tuple[int, int]:
+        full, swa = self._reduce(
+            [plan.full_reservation, plan.swa_reservation],
+            torch.distributed.ReduceOp.MAX,
+        )
+        return full, swa
+
+    def _revalidate_lease(self, state: _Prefetch, adder) -> None:
+        adder.set_flat_restore_reservation(full_tokens=0, swa_tokens=0)
+        plan = adder.plan_flat_restore(
+            state.req,
+            restored_prefix_len=state.read_endpoint,
+            full_tokens=0,
+            swa_tokens=0,
+        )
+        can_restore, never_fits = self._sync_plan(plan)
+        if never_fits:
+            self._fallback(state, "ready_never_fits")
+        elif can_restore:
+            state.full_reservation, state.swa_reservation = self._sync_reservation(plan)
+        else:
+            self._diagnose(state, reason=plan.reason or "ready_headroom")
+
+    def _prepare(self, state: _Prefetch, *, keys: list[str]) -> None:
         rid = state.req.rid
         self.tree_linker.hit_markers[rid] = ExternalCacheHitMarker(
-            prefix_key=state.key[
-                : len(state.result.device_indices) + state.loaded_tokens
-            ],
-            tail_hashes=state.tail_hashes,
-            device_hit_len=len(state.result.device_indices),
+            prefix_key=state.key[: state.read_endpoint],
+            tail_hashes=keys,
+            device_hit_len=state.read_anchor_tokens,
         )
         error = None
         try:
@@ -252,8 +510,7 @@ class FlatMemoryCache:
             if error is not None:
                 logger.warning("Flat private allocation failed: %s", error)
             self._restore_request(state)
-            self._release_hold(state)
-            state.phase = "ready"
+            self._fallback(state, "private_allocation_failed")
             return
         try:
             queued = self.cache_linker.load(
@@ -271,11 +528,11 @@ class FlatMemoryCache:
             self.tree_linker.abort_prepared_load(state.prepared)
             state.prepared = None
             self._restore_request(state)
-            self._release_hold(state)
-            state.phase = "ready"
+            self._fallback(state, "private_read_queue_failed")
             return
-        self.cache_linker.start_preparing_loads()
+        # FLAT_MEMORY: A dispatch failure must not make possibly active DMA evictable.
         state.phase = "read"
+        self.cache_linker.start_preparing_loads()
 
     def _poll_reads(self, states: list[_Prefetch]) -> None:
         done, errors = [], []
@@ -284,8 +541,10 @@ class FlatMemoryCache:
             if state.phase == "read":
                 try:
                     ready = self.cache_linker.load_ready(state.req.rid)
+                except FlatUnsafeIOError:
+                    ready, failed = True, 2
                 except Exception:
-                    ready, failed = True, True
+                    ready, failed = True, 1
             done.append(int(ready))
             errors.append(int(failed))
         done = self._reduce(done, torch.distributed.ReduceOp.MIN)
@@ -293,11 +552,21 @@ class FlatMemoryCache:
         for state, ready, failed in zip(states, done, errors):
             if not ready:
                 continue
-            if failed or state.cancelled:
+            if failed == 2:
+                raise FlatUnsafeIOError(
+                    "Flat restore did not quiesce on every TP rank; "
+                    "private GPU pages remain owned"
+                )
+            if failed or state.cancelled or state.revoke_reason:
                 self.tree_linker.abort_prepared_load(state.prepared)
                 state.prepared = None
                 self._restore_request(state)
-                self._release_hold(state)
+                state.phase = "ready"
+                self._fallback(
+                    state,
+                    "read_failed" if failed else state.revoke_reason or "cancelled",
+                    count=not failed and not state.cancelled,
+                )
                 if failed:
                     self.io_errors += 1
                     logger.warning(
@@ -306,19 +575,28 @@ class FlatMemoryCache:
             else:
                 self._commit(state)
                 self._record_read_metrics(state)
+                state.phase = "ready"
             self.cache_linker.forget_request(state.req.rid)
-            state.phase = "ready"
 
     def _commit(self, state: _Prefetch) -> None:
         # FLAT_MEMORY: All required components and ranks completed before tree insertion.
         _, node = self.tree_linker.commit_prepared_load(state.prepared, queue_io=False)
         state.prepared = None
+        # FLAT_MEMORY: Published SWA belongs to the tree; admission may rematch less.
+        if state.req.kv is not None:
+            state.req.kv.swa_evicted_seqlen = state.swa_evicted_before
         hold = self.cache.inc_lock_ref(node).to_dec_params()
         self._release_hold(state)
         state.hold_node, state.hold_params = node, hold
-        state.req.storage_hit_length = state.loaded_tokens
+        state.ready_started = time.monotonic()
         state.req.storage_read_tokens = state.loaded_tokens
-        state.req.storage_read_latency_ms = (time.monotonic() - state.started) * 1000
+        state.req.storage_read_latency_ms = (state.ready_started - state.started) * 1000
+        self._diagnose(
+            state,
+            committed_tokens=state.loaded_tokens,
+            ready_endpoint=state.read_endpoint,
+            ready_ms=(state.ready_started - state.started) * 1000,
+        )
 
     def _record_read_metrics(self, state: _Prefetch) -> None:
         result = self.cache_linker.take_load_result(state.req.rid)
@@ -350,28 +628,147 @@ class FlatMemoryCache:
         state = self.prefetches.get(rid)
         return state is None or state.phase == "ready"
 
-    def release_ready_holds(self) -> None:
-        # FLAT_MEMORY: Ready prefixes must remain evictable so a suffix can be admitted.
-        # Admission rematches and takes its own request lock before allocating tokens.
-        for state in self.prefetches.values():
-            if state.phase == "ready":
-                self._release_hold(state)
+    def before_admission(self, req: Req, adder) -> None:
+        state = self.prefetches.get(req.rid)
+        if state is None:
+            return
+        if state.phase != "ready":
+            raise RuntimeError("Flat attempted admission before storage readiness")
+        if req.rid == self._lease_rid:
+            # FLAT_MEMORY: Ordinary admission now charges the owner's suffix/decode.
+            adder.set_flat_restore_reservation(full_tokens=0, swa_tokens=0)
+        req.storage_hit_length = self._reused_tokens(state)
+        self._diagnose(
+            state,
+            admission_endpoint=len(req.prefix_indices),
+            admission_storage_tokens=req.storage_hit_length,
+        )
+
+    def after_admission(self, req: Req, adder) -> None:
+        state = self.prefetches.get(req.rid)
+        if state is not None:
+            state.admission_attempted = True
+            # FLAT_MEMORY: CONTINUE is not acceptance; NO_TOKEN may follow an append.
+            if any(candidate is req for candidate in adder.can_run_list):
+                self._handoff(state)
+        self.carry_reservation(adder)
+
+    def finish_admission(self, adder, *, can_progress: bool) -> None:
+        states = self._admission_states
+        if states:
+            admitted = [int(state.admitted) for state in states]
+            minima = self._reduce(admitted, torch.distributed.ReduceOp.MIN)
+            maxima = self._reduce(admitted, torch.distributed.ReduceOp.MAX)
+            if minima != maxima:
+                raise RuntimeError("Flat request admission differs across TP ranks")
+            for state, accepted in zip(states, minima):
+                if accepted:
+                    self._forget(state, keep_arrival=True)
+        state = self.prefetches.get(self._lease_rid or self._admission_candidate)
+        # FLAT_MEMORY: A rank-local gate may skip admission without rejecting the KV.
+        can_progress, admission_attempted = self._reduce(
+            [int(can_progress), int(state is not None and state.admission_attempted)],
+            torch.distributed.ReduceOp.MIN,
+        )
+        if (
+            state is not None
+            and not state.bypass
+            and not can_progress
+            and (
+                state.phase == "allocate"
+                or (state.phase == "ready" and admission_attempted)
+            )
+        ):
+            self._fallback(state, "no_admission_progress")
+        self._admission_states = []
+        self._admission_candidate = None
+        self.carry_reservation(adder)
+
+    def _reused_tokens(self, state: _Prefetch) -> int:
+        return max(
+            0,
+            min(
+                len(state.req.prefix_indices) - state.read_anchor_tokens,
+                state.loaded_tokens,
+            ),
+        )
+
+    def _handoff(self, state: _Prefetch) -> None:
+        if state.admitted:
+            return
+        if state.phase != "ready":
+            raise RuntimeError("Flat admitted an incomplete storage read")
+        req = state.req
+        reused = self._reused_tokens(state)
+        req.storage_hit_length = reused
+        dropped = state.loaded_tokens - reused
+        self.admission_dropped_tokens += dropped
+        if dropped:
+            for name in ("flat_dram", "flat_ssd", "flat_mixed"):
+                req.flat_prefetch_stats[name] = 0 if reused == 0 else None
+        now = time.monotonic()
+        self._diagnose(
+            state,
+            admission_endpoint=len(req.prefix_indices),
+            admission_storage_tokens=reused,
+            admission_dropped_tokens=dropped,
+            admitted_ms=(now - state.started) * 1000,
+            ready_wait_ms=(
+                (now - state.ready_started) * 1000 if state.ready_started else 0
+            ),
+        )
+        # FLAT_MEMORY: Release the saved endpoint/params, not req.last_node after rematch.
+        self._release_hold(state)
+        state.admitted = True
 
     def on_admitted(self, requests: list) -> None:
         for req in requests:
             state = self.prefetches.get(req.rid)
             if state is not None:
-                if state.phase != "ready":
-                    raise RuntimeError("Flat admitted an incomplete storage read")
-                start = len(state.result.device_indices)
-                reused = max(
-                    0, min(len(req.prefix_indices) - start, state.loaded_tokens)
-                )
-                req.storage_hit_length = reused
-                if reused != state.loaded_tokens:
-                    for name in ("flat_dram", "flat_ssd", "flat_mixed"):
-                        req.flat_prefetch_stats[name] = 0 if reused == 0 else None
+                self._handoff(state)
                 self._forget(state, keep_arrival=True)
+
+    def _expire_lease(self) -> None:
+        state = self.prefetches.get(self._lease_rid)
+        if state is None:
+            return
+        expired = self._reduce(
+            [int(time.monotonic() - state.lease_started >= self.lease_timeout)],
+            torch.distributed.ReduceOp.MAX,
+        )[0]
+        if expired and not state.revoke_reason:
+            self._fallback(state, "lease_expired")
+
+    def _fallback(self, state: _Prefetch, reason: str, *, count: bool = True) -> None:
+        if state.phase == "read":
+            # FLAT_MEMORY: Revocation is logical until all-rank I/O completion.
+            state.revoke_reason = reason
+            return
+        if state.prepared is not None:
+            raise RuntimeError("Flat cannot revoke a private allocation before drain")
+        if count:
+            self.lease_fallbacks += 1
+            # Tokens abandoned at ready are separate from actual admission loss.
+            if state.hold_params is not None and state.ready_started:
+                self.ready_dropped_tokens += state.loaded_tokens
+        self._release_hold(state)
+        if self._lease_rid == state.req.rid:
+            self._lease_rid = None
+        state.full_reservation = state.swa_reservation = 0
+        state.phase, state.bypass = "ready", True
+        state.revoke_reason = reason
+        self.tree_linker.hit_markers.pop(state.req.rid, None)
+        self.cache_linker.release_lookup(state.req.rid)
+        self._diagnose(
+            state,
+            reason=reason,
+            fallback_ms=(time.monotonic() - state.started) * 1000,
+        )
+
+    def _diagnose(self, state: _Prefetch, **values) -> None:
+        state.req.flat_prefetch_stats.update(
+            (f"flat_restore_{name}", value) for name, value in values.items()
+        )
 
     def release_request(self, rid: str) -> None:
         state = self.prefetches.get(rid)
@@ -379,12 +776,8 @@ class FlatMemoryCache:
             self.arrivals.pop(rid, None)
             return
         state.cancelled = True
-        if state.phase == "ready":
+        if state.phase != "read":
             self._forget(state)
-        elif state.phase == "query":
-            state.future.cancel()
-        elif state.phase == "allocate":
-            state.phase = "ready"
 
     def _release_hold(self, state: _Prefetch) -> None:
         if state.hold_params is not None:
@@ -392,10 +785,14 @@ class FlatMemoryCache:
             state.hold_node = state.hold_params = None
 
     def _forget(self, state: _Prefetch, *, keep_arrival: bool = False) -> None:
+        if state.prepared is not None or state.phase == "read":
+            raise RuntimeError("Flat cannot forget a restore before I/O drain")
         self._release_hold(state)
         self.cache_linker.forget_request(state.req.rid)
         self.tree_linker.hit_markers.pop(state.req.rid, None)
         self.prefetches.pop(state.req.rid, None)
+        if self._lease_rid == state.req.rid:
+            self._lease_rid = None
         if not keep_arrival:
             self.arrivals.pop(state.req.rid, None)
 
@@ -418,11 +815,31 @@ class FlatMemoryCache:
             [self.tree_linker.num_completed_offloads()], torch.distributed.ReduceOp.MIN
         )[0]
         if count:
-            successes = self.tree_linker.take_completed_offloads(count)
-            successes = self._reduce(
-                [int(x) for x in successes], torch.distributed.ReduceOp.MIN
+            results = [
+                self.cache_linker.pop_completed_offload_result() for _ in range(count)
+            ]
+            # FLAT_MEMORY: Pressure on one rank must not mask another rank's I/O error.
+            flags = self._reduce(
+                [
+                    flag
+                    for result in results
+                    for flag in (
+                        int(not result.success),
+                        int(result.capacity_rejected),
+                        int(not result.success and not result.capacity_rejected),
+                        int(result.unsafe),
+                    )
+                ],
+                torch.distributed.ReduceOp.MAX,
             )
-            self.io_errors += sum(not success for success in successes)
+            if any(flags[3::4]):
+                raise FlatUnsafeIOError(
+                    "Flat offload did not quiesce on every TP rank; "
+                    "source GPU pages remain owned"
+                )
+            successes = [not failed for failed in flags[0::4]]
+            self.capacity_pressure_offloads += sum(flags[1::4])
+            self.io_errors += sum(flags[2::4])
             collector = self.cache.storage_metrics_collector
             if collector is not None:
                 for success, pending in zip(successes, self.pending_offloads):
@@ -471,6 +888,8 @@ class FlatMemoryCache:
             )
         self.tree_linker.reset()
         self.arrivals.clear()
+        self._admission_states = []
+        self._admission_candidate = self._lease_rid = None
 
     def close(self) -> None:
         self.reset()
@@ -486,6 +905,12 @@ class FlatMemoryCache:
             pending_backups=len(self.pending_offloads),
             pending_prefetches=len(self.prefetches),
             flat_io_errors=self.io_errors,
+            flat_capacity_pressure_offloads=self.capacity_pressure_offloads,
+            flat_restore_lease_active=int(self._lease_rid is not None),
+            flat_restore_lease_fallbacks=self.lease_fallbacks,
+            flat_restore_deferrals=self.restore_deferrals,
+            flat_restore_ready_dropped_tokens=self.ready_dropped_tokens,
+            flat_restore_admission_dropped_tokens=self.admission_dropped_tokens,
             application_host_staging_bytes=0,
             host_pool_bytes=0,
             gds_mode="compat",

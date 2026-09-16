@@ -1379,6 +1379,22 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
     def _batch_exist(self, key_strs: List[str]) -> List[int]:
         return self.store.batch_is_exist(key_strs)
 
+    def get_io_stats_snapshot(self) -> dict:
+        # FLAT_MEMORY: The optional third-party API is cumulative and never resets.
+        snapshot = getattr(self.store, "get_io_stats_snapshot", None)
+        if not callable(snapshot):
+            return {
+                "status": "unavailable",
+                "reason": "Mooncake client lacks get_io_stats_snapshot",
+            }
+        try:
+            return snapshot()
+        except Exception as exc:
+            return {
+                "status": "unavailable",
+                "reason": f"Native snapshot failed: {type(exc).__name__}: {exc}",
+            }
+
     def get_stats(self):
         storage_metrics = StorageMetrics()
         storage_metrics.prefetch_pgs.extend(self.prefetch_pgs)

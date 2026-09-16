@@ -452,30 +452,6 @@ class HybridCacheController(BaseHiCacheController):
             counts[name] = counts.get(name, 0) + len(transfer.host_indices)
         return counts
 
-    def _transfer_num_bytes(self, op: CacheOperation) -> int:
-        """Total bytes moved by a merged transfer op across all pools.
-
-        Sidecar transfers riding another pool's indices are included here but
-        excluded from the per-pool token counts.
-        """
-        kv_tokens = len(op.device_indices)
-        num_bytes = kv_tokens * self.mem_pool_host.anchor_entry.host_pool.size_per_token
-        # Slot counts of the pools sidecars can ride on.
-        source_len = {self.mem_pool_host.anchor_entry.name: kv_tokens}
-        for t in op.pool_transfers or []:
-            if t.indices_from_pool is None and t.host_indices is not None:
-                source_len[t.name] = len(t.host_indices)
-        for t in op.pool_transfers or []:
-            entry = self.mem_pool_host.entry_map.get(t.name)
-            if entry is None:
-                continue
-            if t.indices_from_pool is not None:
-                num_slots = source_len.get(t.indices_from_pool, 0)
-            else:
-                num_slots = len(t.host_indices) if t.host_indices is not None else 0
-            num_bytes += num_slots * entry.host_pool.size_per_token
-        return num_bytes
-
     def load(
         self,
         host_indices: torch.Tensor,

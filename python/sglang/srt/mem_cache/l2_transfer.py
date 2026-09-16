@@ -39,6 +39,19 @@ class L2Transfer(NamedTuple):
     layer_mapper: Optional[Callable[[int], Optional[int]]] = None
     is_draft: bool = False
 
+    def load_layer_id(self, layer_id: int, *, is_primary: bool) -> int | None:
+        # FLAT_MEMORY: Execution and byte metering share the same layer selection.
+        local_layer_id = (
+            self.layer_mapper(layer_id) if self.layer_mapper is not None else layer_id
+        )
+        if local_layer_id is None or (
+            not is_primary
+            and self.layer_mapper is None
+            and layer_id >= self.host_pool.layer_num
+        ):
+            return None
+        return local_layer_id
+
 
 class TransferCompletion(NamedTuple):
     start_event: Any
@@ -87,16 +100,10 @@ class L2TransferEngine:
             ack_start.record()
             for layer_id in range(layer_num):
                 for transfer in transfers:
-                    local_layer_id = (
-                        transfer.layer_mapper(layer_id)
-                        if transfer.layer_mapper is not None
-                        else layer_id
+                    local_layer_id = transfer.load_layer_id(
+                        layer_id, is_primary=transfer is primary
                     )
-                    if local_layer_id is None or (
-                        transfer is not primary
-                        and transfer.layer_mapper is None
-                        and layer_id >= transfer.host_pool.layer_num
-                    ):
+                    if local_layer_id is None:
                         continue
                     transfer.host_pool.load_to_device_per_layer(
                         transfer.device_pool,

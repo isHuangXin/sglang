@@ -4920,6 +4920,21 @@ class Scheduler(
         return success
 
     def get_internal_state(self, recv_req: GetInternalStateReq):
+        from sglang.srt.observability.hicache_io import collect_hicache_io
+
+        # FLAT_MEMORY: Complete the collective before building unrelated local state.
+        hicache_io = collect_hicache_io(
+            cache=self.tree_cache,
+            tp_rank=self.ps.tp_rank,
+            tp_size=self.ps.tp_size,
+            pp_rank=self.ps.pp_rank,
+            pp_size=self.ps.pp_size,
+            dp_rank=self.ps.dp_rank,
+            dp_size=self.ps.dp_size,
+            attn_cp_size=self.ps.attn_cp_size,
+            attn_dcp_size=self.ps.attn_dcp_size,
+            tp_cpu_group=self.tp_cpu_group,
+        )
         # Resolved config (pristine server_args + post-publish overrides) so a
         # readback reflects values changed via /set_internal_state, not startup.
         ret = get_context().resolved_server_args_dict()
@@ -4943,6 +4958,7 @@ class Scheduler(
             draft_graph_memory_usage=draft_graph_memory_usage,
         )
         ret["startup_time"] = self.startup_time
+        ret["hicache_io"] = hicache_io
         # FLAT_MEMORY: All scheduler ranks execute the same control transaction.
         if self.flat_memory_cache is not None:
             from sglang.srt.managers.flat_memory_io_window import (

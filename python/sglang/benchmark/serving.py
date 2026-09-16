@@ -56,6 +56,10 @@ from sglang.benchmark.flat_memory_metrics import (
     summarize_flat_io,
 )
 from sglang.benchmark.flat_memory_report import format_flat_memory_report
+from sglang.benchmark.hicache_io_metrics import (
+    HiCacheIOCollector,
+    format_hicache_io_report,
+)
 from sglang.benchmark.utils import (
     get_tokenizer,
     parse_custom_headers,
@@ -1553,6 +1557,12 @@ async def benchmark(
         headers=get_request_headers(),
         expected_tp_size=getattr(args, "flat_memory_tp_size", None),
     )
+    hicache_io = HiCacheIOCollector(
+        base_url=base_url,
+        enabled=vars(args).get("collect_hicache_io", False),
+        owner_metrics_url=vars(args).get("mooncake_owner_metrics_url"),
+        headers=get_request_headers(),
+    )
     tasks: List[asyncio.Task] = []
     pbar_total = len(input_requests)
     if (
@@ -1581,8 +1591,8 @@ async def benchmark(
 
     pbar = None if disable_tqdm else tqdm(total=pbar_total)
     benchmark_requests: List[DatasetRow] = []
-    # FLAT_MEMORY: Window begin/drain/end and profiling are outside request timing.
-    async with flat_io:
+    # FLAT_MEMORY: I/O snapshots, owned-window control and profiling are outside request timing.
+    async with flat_io, hicache_io:
         benchmark_start_time = time.perf_counter()
         try:
             async for request in request_generator:
@@ -1882,6 +1892,14 @@ async def benchmark(
             "Legacy lifetime/proxy telemetry (not native Flat I/O-window measurements):"
         )
         print(json.dumps(legacy_metrics, default=str))
+    if hicache_io.enabled:
+        print(format_hicache_io_report(hicache_io.result))
+        storage_latency = cache_usage["avg_storage_read_latency_ms"]
+        storage_text = "N/A" if storage_latency is None else f"{storage_latency:.3f}"
+        print(f"{'Legacy Storage --> Host Latency (ms):':<44} {storage_text}")
+        print(
+            "Legacy Storage latency retains its request aggregation; it is not SSD-only."
+        )
 
     if (
         metrics.median_ttft_ms is not None
@@ -1949,6 +1967,8 @@ async def benchmark(
         if flat_mode:
             result.update(flat_cache)
             result.update(flat_io.result)
+        if hicache_io.enabled:
+            result.update(hicache_io.result)
 
         if args.cache_report:
             result["cache_report"] = {
@@ -2104,6 +2124,12 @@ def run_benchmark(args_: argparse.Namespace):
     if args.collect_flat_memory_io and args.backend != "sglang":
         raise ValueError(
             "--collect-flat-memory-io requires the native --backend sglang endpoint"
+        )
+    if vars(args).get("collect_hicache_io", False) and (
+        args.backend != "sglang" or args.collect_flat_memory_io
+    ):
+        raise ValueError(
+            "--collect-hicache-io requires native --backend sglang without Flat I/O collection"
         )
 
     if getattr(args, "print_requests", False):
@@ -2347,11 +2373,22 @@ class LoRAPathAction(argparse.Action):
 
 def cli_main():
     parser = ArgumentParser(description="Benchmark the online serving throughput.")
-    # FLAT_MEMORY: Native owned windows are separate from legacy lifetime collectors.
-    parser.add_argument(
+    # FLAT_MEMORY: Owned Flat windows and observed HiCache intervals are distinct contracts.
+    io_collection = parser.add_mutually_exclusive_group()
+    io_collection.add_argument(
         "--collect-flat-memory-io",
         action="store_true",
         help="Collect completed/durable Flat I/O over an owned, drained window.",
+    )
+    io_collection.add_argument(
+        "--collect-hicache-io",
+        action="store_true",
+        help="Observe completed/accounted HiCache and Mooncake I/O between snapshots; no drain.",
+    )
+    parser.add_argument(
+        "--mooncake-owner-metrics-url",
+        default=None,
+        help="Storage owner's HTTP(S) /metrics URL for data-synced bucket completions, not the master.",
     )
     parser.add_argument(
         "--flat-memory-tp-size",

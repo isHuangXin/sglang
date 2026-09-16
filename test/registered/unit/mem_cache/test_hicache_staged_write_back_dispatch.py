@@ -197,6 +197,7 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
 
     @staticmethod
     def _start_writing(controller):
+        controller.enable_storage = False
         with mock.patch.object(transfer_module, "device_module", _FakeDeviceModule):
             controller.l2_transfer_engine = L2TransferEngine("kernel")
             controller.start_writing()
@@ -248,6 +249,9 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
         controller._l2_load_transfers.assert_called_once()
         l2_transfers = (
             controller.l2_transfer_engine.submit_host_to_device.call_args.args[0]
+        )
+        controller._transfer_num_bytes.assert_called_once_with(
+            l2_transfers, layer_num=2
         )
         self.assertEqual(len(l2_transfers), 2)
         self.assertEqual(l2_transfers[1].host_indices.tolist(), [0, 1, 0, 1])

@@ -22,8 +22,13 @@ class HostIOMetrics:
             for direction in ("read", "write")
         }
 
-    def record(self, *, direction: str, completion: Any, num_bytes: int):
-        if not self.enabled or num_bytes <= 0:
+    def record(self, *, direction: str, completion: Any, num_bytes: int | None):
+        if not self.enabled:
+            return
+        if num_bytes is None:
+            self.error = "Native L2 transfer has unsupported payload metering"
+            return
+        if num_bytes <= 0:
             return
         if not completion.timing_enabled:
             self.error = "Native L2 completion events do not support timing"

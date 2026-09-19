@@ -48,6 +48,7 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
 from sglang.srt.mem_cache.l2_transfer import L2Transfer, L2TransferEngine
+from sglang.srt.mem_cache.l2_transfer_metrics import l2_transfer_num_bytes
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
 from sglang.srt.observability.hicache_io_metrics import (
     HostIOMetrics,
@@ -197,7 +198,8 @@ class HiCacheAck(NamedTuple):
     num_tokens_by_pool: Optional[dict[str, int]] = None
     # Total bytes moved by the op across all pools, including draft piggyback
     # and sidecar transfers that the per-pool token counts exclude.
-    num_bytes: int = 0
+    # None denotes an unsupported payload layout, not zero DMA.
+    num_bytes: Optional[int] = 0
 
 
 @dataclass
@@ -934,9 +936,9 @@ class HiCacheController:
                 self._pending_storage_d2h_ids.update(op.node_ids)
                 self.backup_idle_event.clear()
         try:
-            completion = self.l2_transfer_engine.submit_device_to_host(
-                self._l2_transfers(host_indices, device_indices, pool_transfers)
-            )
+            transfers = self._l2_transfers(host_indices, device_indices, pool_transfers)
+            num_bytes = self._transfer_num_bytes(transfers)
+            completion = self.l2_transfer_engine.submit_device_to_host(transfers)
         except Exception:
             for node_id in op.node_ids:
                 self._complete_storage_d2h(node_id)
@@ -945,7 +947,7 @@ class HiCacheController:
         self._host_io_metrics.record(
             direction="write",
             completion=completion,
-            num_bytes=self._transfer_num_bytes(op),
+            num_bytes=num_bytes,
         )
         self.ack_write_queue.append(
             HiCacheAck(
@@ -955,12 +957,16 @@ class HiCacheController:
                 num_tokens=len(op.device_indices),
                 timing_enabled=completion.timing_enabled,
                 num_tokens_by_pool=self._num_tokens_by_pool(op),
-                num_bytes=self._transfer_num_bytes(op),
+                num_bytes=num_bytes,
             )
         )
 
-    def _transfer_num_bytes(self, op: CacheOperation) -> int:
-        return len(op.device_indices) * self.mem_pool_host.size_per_token
+    def _transfer_num_bytes(
+        self, transfers: list[L2Transfer], *, layer_num: Optional[int] = None
+    ) -> Optional[int]:
+        return l2_transfer_num_bytes(
+            transfers, io_backend=self.io_backend, layer_num=layer_num
+        )
 
     def _num_tokens_by_pool(self, op: CacheOperation) -> dict[str, int]:
         return {PoolName.KV.value: len(op.device_indices)}
@@ -1066,8 +1072,10 @@ class HiCacheController:
                 self.load_fence_stream
             )
 
+        transfers = self._l2_load_transfers(host_indices, device_indices, pool_transfers)
+        num_bytes = self._transfer_num_bytes(transfers, layer_num=self.layer_num)
         completion = self.l2_transfer_engine.submit_host_to_device(
-            self._l2_load_transfers(host_indices, device_indices, pool_transfers),
+            transfers,
             start_event=producer_event.start_event,
             on_layer_done=producer_event.complete,
             layer_num=self.layer_num,
@@ -1076,7 +1084,7 @@ class HiCacheController:
         self._host_io_metrics.record(
             direction="read",
             completion=completion,
-            num_bytes=self._transfer_num_bytes(op),
+            num_bytes=num_bytes,
         )
         self.ack_load_queue.append(
             HiCacheAck(
@@ -1086,7 +1094,7 @@ class HiCacheController:
                 num_tokens=len(op.device_indices),
                 timing_enabled=completion.timing_enabled,
                 num_tokens_by_pool=self._num_tokens_by_pool(op),
-                num_bytes=self._transfer_num_bytes(op),
+                num_bytes=num_bytes,
             )
         )
         return producer_id

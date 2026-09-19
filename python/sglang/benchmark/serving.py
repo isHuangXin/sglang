@@ -41,8 +41,12 @@ from tqdm.asyncio import tqdm
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
 from sglang.benchmark.datasets import DatasetRow, get_dataset
-from sglang.benchmark.native_io_metrics import NativeIOMeasurement
 from sglang.benchmark.datasets.mooncake import get_mooncake_request_over_time
+from sglang.benchmark.hicache_io_metrics import (
+    HiCacheIOCollector,
+    format_hicache_io_report,
+)
+from sglang.benchmark.native_io_metrics import NativeIOMeasurement
 from sglang.benchmark.utils import (
     get_tokenizer,
     parse_custom_headers,
@@ -1206,9 +1210,6 @@ def fetch_sglang_bandwidth_metrics(
     return result
 
 
-
-
-
 def fetch_flat_memory_metrics(
     prefill_host: str = "localhost",
     prefill_port: int = 30010,
@@ -1580,6 +1581,16 @@ async def benchmark(
 ):
     collect_storage_io = getattr(args, "collect_mooncake_io_metrics", False)
     collect_host_io = getattr(args, "collect_hicache_io_metrics", False) or collect_storage_io
+    if args.collect_hicache_io and collect_host_io:
+        raise ValueError(
+            "Read-only HiCache snapshots cannot be combined with native I/O windows"
+        )
+    hicache_io = HiCacheIOCollector(
+        base_url=base_url,
+        enabled=args.collect_hicache_io,
+        owner_metrics_url=args.mooncake_owner_metrics_url,
+        headers=get_auth_headers(),
+    )
     native_io = NativeIOMeasurement(
         base_url=base_url,
         collect_host=collect_host_io,
@@ -1732,80 +1743,88 @@ async def benchmark(
             if profile_output.success:
                 print("Profiler started")
 
-    native_io.start()
-    # Run all requests
-    benchmark_start_time = time.perf_counter()
-    tasks: List[asyncio.Task] = []
-    pbar_total = len(input_requests)
-    if (
-        backend == "sglang" and is_mooncake
-    ):  # Assuming mooncake is mainly for sglang or similar backends
-        print("Using time-based Mooncake request scheduler, ignoring --request-rate.")
-        request_generator = get_mooncake_request_over_time(
-            input_requests, tokenizer, mooncake_slowdown_factor, mooncake_num_rounds
-        )
-        print(
-            f"Starting Mooncake trace replay. Sessions: {len(input_requests)}, Rounds per session: {mooncake_num_rounds}. Slowdown factor: {mooncake_slowdown_factor}"
-        )
-        pbar_total *= args.mooncake_num_rounds
-    else:
-        request_generator = get_request(input_requests, request_rate)
+    if not hicache_io.enabled:
+        native_io.start()
+    async with hicache_io:
+        # Run all requests
+        benchmark_start_time = time.perf_counter()
+        tasks: List[asyncio.Task] = []
+        pbar_total = len(input_requests)
+        if (
+            backend == "sglang" and is_mooncake
+        ):  # Assuming mooncake is mainly for sglang or similar backends
+            print(
+                "Using time-based Mooncake request scheduler, ignoring --request-rate."
+            )
+            request_generator = get_mooncake_request_over_time(
+                input_requests, tokenizer, mooncake_slowdown_factor, mooncake_num_rounds
+            )
+            print(
+                f"Starting Mooncake trace replay. Sessions: {len(input_requests)}, Rounds per session: {mooncake_num_rounds}. Slowdown factor: {mooncake_slowdown_factor}"
+            )
+            pbar_total *= args.mooncake_num_rounds
+        else:
+            request_generator = get_request(input_requests, request_rate)
 
-    # Prepare LoRA request distribution parameters
-    if lora_request_distribution == "distinct":
-        lora_idx = 0
-    elif lora_request_distribution == "skewed":
-        weights = np.array([lora_zipf_alpha**-i for i in range(len(lora_names))])
-        lora_probs = weights / np.sum(weights)
-    else:
-        lora_idx = None
-        lora_probs = None
+        # Prepare LoRA request distribution parameters
+        if lora_request_distribution == "distinct":
+            lora_idx = 0
+        elif lora_request_distribution == "skewed":
+            weights = np.array([lora_zipf_alpha**-i for i in range(len(lora_names))])
+            lora_probs = weights / np.sum(weights)
+        else:
+            lora_idx = None
+            lora_probs = None
 
-    pbar = None if disable_tqdm else tqdm(total=pbar_total)
-    benchmark_requests: List[DatasetRow] = []
-    try:
-        async for request in request_generator:
-            benchmark_requests.append(request)
-            if lora_names is not None and len(lora_names) != 0:
-                if lora_request_distribution == "uniform":
-                    lora_name = random.choice(lora_names)
-                elif lora_request_distribution == "distinct":
-                    lora_name = lora_names[lora_idx]
-                    lora_idx = (lora_idx + 1) % len(lora_names)
+        pbar = None if disable_tqdm else tqdm(total=pbar_total)
+        benchmark_requests: List[DatasetRow] = []
+        try:
+            async for request in request_generator:
+                benchmark_requests.append(request)
+                if lora_names is not None and len(lora_names) != 0:
+                    if lora_request_distribution == "uniform":
+                        lora_name = random.choice(lora_names)
+                    elif lora_request_distribution == "distinct":
+                        lora_name = lora_names[lora_idx]
+                        lora_idx = (lora_idx + 1) % len(lora_names)
+                    else:
+                        assert (
+                            lora_request_distribution == "skewed"
+                        ), f"Unexpected lora_request_distribution: {lora_request_distribution}. Expected 'skewed'."
+                        lora_name = np.random.choice(lora_names, p=lora_probs)
                 else:
-                    assert (
-                        lora_request_distribution == "skewed"
-                    ), f"Unexpected lora_request_distribution: {lora_request_distribution}. Expected 'skewed'."
-                    lora_name = np.random.choice(lora_names, p=lora_probs)
-            else:
-                lora_name = None
+                    lora_name = None
 
-            # Merge global extra_request_body with per-request extras
-            # Per-request parameters take precedence over global ones
-            merged_extra_body = {**extra_request_body, **request.extra_request_body}
-            request_func_input = RequestFuncInput(
-                model=model_id,
-                prompt=request.prompt,
-                api_url=api_url,
-                prompt_len=request.prompt_len,
-                output_len=request.output_len,
-                lora_name=lora_name,
-                image_data=request.image_data,
-                extra_request_body=merged_extra_body,
-                timestamp=request.timestamp,
-                routing_key=request.routing_key,
-            )
-            tasks.append(
-                asyncio.create_task(
-                    limited_request_func(request_func_input=request_func_input, pbar=pbar)
+                # Merge global extra_request_body with per-request extras
+                # Per-request parameters take precedence over global ones
+                merged_extra_body = {**extra_request_body, **request.extra_request_body}
+                request_func_input = RequestFuncInput(
+                    model=model_id,
+                    prompt=request.prompt,
+                    api_url=api_url,
+                    prompt_len=request.prompt_len,
+                    output_len=request.output_len,
+                    lora_name=lora_name,
+                    image_data=request.image_data,
+                    extra_request_body=merged_extra_body,
+                    timestamp=request.timestamp,
+                    routing_key=request.routing_key,
                 )
-            )
-        outputs: List[RequestFuncOutput] = await asyncio.gather(*tasks)
-    except BaseException:
-        native_io.abort()
-        raise
-    benchmark_duration = time.perf_counter() - benchmark_start_time
-    native_io.finish()
+                tasks.append(
+                    asyncio.create_task(
+                        limited_request_func(
+                            request_func_input=request_func_input, pbar=pbar
+                        )
+                    )
+                )
+            outputs: List[RequestFuncOutput] = await asyncio.gather(*tasks)
+        except BaseException:
+            if not hicache_io.enabled:
+                native_io.abort()
+            raise
+        benchmark_duration = time.perf_counter() - benchmark_start_time
+    if not hicache_io.enabled:
+        native_io.finish()
     if is_multi_turn:
         outputs = [x for output in outputs for x in output]
 
@@ -1828,7 +1847,7 @@ async def benchmark(
     if pbar is not None:
         pbar.close()
 
-    if native_io.enabled:
+    if hicache_io.enabled or native_io.enabled:
         accept_length = None
     elif "sglang" in backend:
         server_info = requests.get(
@@ -1973,10 +1992,18 @@ async def benchmark(
             print("{:<40} {:<10}".format(
                 "Total Host→Storage tokens:", metrics.total_storage_write_tokens
             ))
-    native_io.report()
+    if hicache_io.enabled:
+        print(format_hicache_io_report(hicache_io.result))
+    else:
+        native_io.report()
     # Fetch and print Mooncake Master eviction metrics
     mooncake_eviction = {}
-    if hasattr(args, 'mooncake_master_host') and args.mooncake_master_host and not native_io.storage_enabled:
+    if (
+        not hicache_io.enabled
+        and hasattr(args, "mooncake_master_host")
+        and args.mooncake_master_host
+        and not native_io.storage_enabled
+    ):
         mooncake_eviction = fetch_mooncake_eviction_metrics(
             master_host=args.mooncake_master_host,
             metrics_port=getattr(args, 'mooncake_metrics_port', 9003),
@@ -2002,7 +2029,11 @@ async def benchmark(
                 ))
     # Fetch and print SGLang Prefill bandwidth metrics
     bandwidth_metrics = {}
-    if hasattr(args, 'prefill_metrics_host') and args.prefill_metrics_host:
+    if (
+        not hicache_io.enabled
+        and hasattr(args, "prefill_metrics_host")
+        and args.prefill_metrics_host
+    ):
         bandwidth_metrics = fetch_sglang_bandwidth_metrics(
             prefill_host=args.prefill_metrics_host,
             prefill_port=getattr(args, 'prefill_metrics_port', 30000),
@@ -2030,7 +2061,7 @@ async def benchmark(
     # Fetch and print Flat Memory System per-backend stats
     flat_memory_metrics = {}
     fm_host = getattr(args, 'prefill_metrics_host', None)
-    if fm_host and not native_io.storage_enabled:
+    if fm_host and not native_io.storage_enabled and not hicache_io.enabled:
         flat_memory_metrics = fetch_flat_memory_metrics(
             prefill_host=fm_host,
             prefill_port=getattr(args, 'prefill_metrics_port', 30000),
@@ -2231,7 +2262,10 @@ async def benchmark(
                 print("{:<40} {:.1f}%".format(label, storage_pct))
     print("=" * 50)
 
-    if native_io.enabled:
+    if hicache_io.enabled:
+        # The projected snapshots are already retained in hicache_io_metadata.
+        server_info = None
+    elif native_io.enabled:
         server_info = (native_io.after or native_io.before)["server_config"]
     else:
         resp = requests.get(base_url + "/server_info", headers=get_auth_headers())
@@ -2317,6 +2351,7 @@ async def benchmark(
             "flat_memory": flat_memory_metrics if flat_memory_metrics else {},
             **native_io.host_metrics,
             **native_io.storage_metrics,
+            **(hicache_io.result if hicache_io.enabled else {}),
         }
 
         if args.cache_report:
@@ -3088,6 +3123,16 @@ def cli_main():
         help="Number of warmup requests to run before the benchmark",
     )
     parser.add_argument(
+        "--collect-hicache-io",
+        action="store_true",
+        help="Collect read-only completed/accounted HiCache and Mooncake snapshots without draining I/O.",
+    )
+    parser.add_argument(
+        "--mooncake-owner-metrics-url",
+        default=None,
+        help="Owner /metrics URL for --collect-hicache-io; queried once at each measurement boundary.",
+    )
+    parser.add_argument(
         "--collect-hicache-io-metrics",
         action="store_true",
         help="Collect completed direct HiCache Host copies across TP ranks; requires server metrics, PP1/DP1 and no PD.",
@@ -3278,6 +3323,14 @@ def cli_main():
     )
     args = parser.parse_args()
     _validate_parsed_gsp_args(parser, args)
+    if args.collect_hicache_io and (
+        args.collect_hicache_io_metrics or args.collect_mooncake_io_metrics
+    ):
+        parser.error(
+            "--collect-hicache-io cannot be combined with native I/O window flags"
+        )
+    if args.mooncake_owner_metrics_url and not args.collect_hicache_io:
+        parser.error("--mooncake-owner-metrics-url requires --collect-hicache-io")
     run_benchmark(args)
 
 

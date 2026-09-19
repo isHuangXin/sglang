@@ -2083,7 +2083,7 @@ class ScaleElasticEPReqOutput(BaseReq, kw_only=True):
 
 
 class GetInternalStateReq(BaseReq, kw_only=True):
-    pass
+    hicache_io_mode: Optional[Literal["readonly"]] = None
 
 
 class GetInternalStateReqOutput(BaseReq, kw_only=True):

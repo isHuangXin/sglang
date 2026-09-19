@@ -844,9 +844,13 @@ class TokenizerControlMixin:
         self.auto_create_handle_loop()
         await self.slow_down_communicator(obj)
 
-    async def get_internal_state(self: TokenizerManager) -> List[Dict[Any, Any]]:
+    async def get_internal_state(
+        self: TokenizerManager, hicache_io_mode: Optional[str] = None
+    ) -> List[Dict[Any, Any]]:
+        if hicache_io_mode not in (None, "readonly"):
+            raise ValueError("hicache_io_mode must be 'readonly' or omitted")
         self.auto_create_handle_loop()
-        req = GetInternalStateReq()
+        req = GetInternalStateReq(hicache_io_mode=hicache_io_mode)
         responses: List[GetInternalStateReqOutput] = (
             await self.get_internal_state_communicator(req)
         )

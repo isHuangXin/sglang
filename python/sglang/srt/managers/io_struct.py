@@ -2099,6 +2099,7 @@ class GetInternalStateReq(BaseReq, kw_only=True):
     flat_io_window_id: Optional[str] = None
     gds_io_action: Optional[str] = None
     gds_io_window_id: Optional[str] = None
+    hicache_io_mode: Optional[Literal["readonly"]] = None
 
 
 class GetInternalStateReqOutput(BaseReq, kw_only=True):

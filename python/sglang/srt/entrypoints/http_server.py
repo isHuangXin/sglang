@@ -36,6 +36,7 @@ from typing import (
     Callable,
     Dict,
     List,
+    Literal,
     Optional,
     Union,
 )
@@ -819,7 +820,7 @@ async def get_server_info():
 
 
 @app.get("/server_info")
-async def server_info():
+async def server_info(hicache_io_mode: Optional[Literal["readonly"]] = None):
     """The startup configuration, plus live scheduler state.
 
     The values here are the resolution result: what the launcher was given,
@@ -830,7 +831,9 @@ async def server_info():
     """
     # Returns internal states per DP.
     internal_states: List[Dict[Any, Any]] = (
-        await _global_state.tokenizer_manager.get_internal_state()
+        await _global_state.tokenizer_manager.get_internal_state(
+            hicache_io_mode=hicache_io_mode
+        )
     )
 
     server_args = _global_state.tokenizer_manager.server_args

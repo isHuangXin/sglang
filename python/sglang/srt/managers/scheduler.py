@@ -4940,7 +4940,23 @@ class Scheduler(
         )
         ret["startup_time"] = self.startup_time
         ret["effective_max_running_requests_per_dp"] = self.max_running_requests
-        ret.update(self._hicache_io_state(recv_req))
+        if recv_req.hicache_io_mode == "readonly":
+            from sglang.srt.observability.hicache_io import collect_hicache_io
+
+            ret["hicache_io"] = collect_hicache_io(
+                cache=self.tree_cache,
+                tp_rank=self.ps.tp_rank,
+                tp_size=self.ps.tp_size,
+                pp_rank=self.ps.pp_rank,
+                pp_size=self.ps.pp_size,
+                dp_rank=self.ps.dp_rank,
+                dp_size=self.ps.dp_size,
+                attn_cp_size=self.ps.attn_cp_size,
+                attn_dcp_size=self.ps.attn_dcp_size,
+                tp_cpu_group=self.tp_cpu_group,
+            )
+        else:
+            ret.update(self._hicache_io_state(recv_req))
 
         if get_exec().moe.elastic_ep_backend is not None:
             from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager

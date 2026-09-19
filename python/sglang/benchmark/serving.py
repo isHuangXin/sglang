@@ -77,6 +77,11 @@ from sglang.benchmark.tiered_cache_metrics import (
     print_tiered_cache,
     summarize_tiered_cache,
 )
+
+from sglang.benchmark.hicache_io_metrics import (
+    HiCacheIOCollector,
+    format_hicache_io_report,
+)
 from sglang.benchmark.utils import (
     get_tokenizer,
     parse_custom_headers,
@@ -1436,6 +1441,12 @@ async def benchmark(
     profile_prefill_url: Optional[List[str]] = None,
     profile_decode_url: Optional[List[str]] = None,
 ):
+    hicache_io = HiCacheIOCollector(
+        base_url=base_url,
+        enabled=args.collect_hicache_io,
+        owner_metrics_url=args.mooncake_owner_metrics_url,
+        headers=get_request_headers(),
+    )
     native_io = NativeIOWindow(
         base_url,
         backend,
@@ -1621,7 +1632,7 @@ async def benchmark(
     pbar = None if disable_tqdm else tqdm(total=pbar_total)
     benchmark_requests: List[DatasetRow] = []
     # FLAT_MEMORY: Window begin/drain/end and profiling are outside request timing.
-    async with native_io, flat_io:
+    async with native_io, flat_io, hicache_io:
         benchmark_start_time = time.perf_counter()
         try:
             async for request in request_generator:
@@ -1897,6 +1908,8 @@ async def benchmark(
                 print("{:<40} {:.1f}%".format(label, storage_pct))
     print("=" * 50)
     native_io.print_metrics()
+    if hicache_io.enabled:
+        print(format_hicache_io_report(hicache_io.result))
 
     cache_usage = summarize_cache_usage(outputs)
     flat_cache = summarize_flat_cache(outputs, cache_usage["total_prompt_tokens"])
@@ -1990,6 +2003,7 @@ async def benchmark(
             "accept_length": accept_length,
             "max_output_tokens_per_s": metrics.max_output_tokens_per_s,
             "max_concurrent_requests": metrics.max_concurrent_requests,
+            **(hicache_io.result if hicache_io.enabled else {}),
         }
         # FLAT_MEMORY: Preserve the old JSON contract, separate from upstream cache_report.
         result.update(cache_usage)
@@ -2872,6 +2886,16 @@ def cli_main():
         help="Number of warmup requests to run before the benchmark",
     )
     parser.add_argument(
+        "--collect-hicache-io",
+        action="store_true",
+        help="Collect read-only completed/accounted HiCache and Mooncake snapshots without draining I/O.",
+    )
+    parser.add_argument(
+        "--mooncake-owner-metrics-url",
+        default=None,
+        help="Owner /metrics URL for --collect-hicache-io; queried once at each measurement boundary.",
+    )
+    parser.add_argument(
         "--tokenize-prompt",
         action="store_true",
         help="Use integer ids instead of string for inputs. Useful to control prompt lengths accurately",
@@ -3015,6 +3039,16 @@ def cli_main():
     )
     args = parser.parse_args()
     _validate_parsed_gsp_args(parser, args)
+    if args.collect_hicache_io and (
+        args.collect_hicache_io_metrics
+        or args.collect_mooncake_io_metrics
+        or args.collect_mooncake_gds_io
+    ):
+        parser.error(
+            "--collect-hicache-io cannot be combined with native I/O window flags"
+        )
+    if args.mooncake_owner_metrics_url and not args.collect_hicache_io:
+        parser.error("--mooncake-owner-metrics-url requires --collect-hicache-io")
     run_benchmark(args)
 
 

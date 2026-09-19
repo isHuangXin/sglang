@@ -850,7 +850,12 @@ class TokenizerControlMixin:
         flat_io_window_id: Optional[str] = None,
         gds_io_action: Optional[str] = None,
         gds_io_window_id: Optional[str] = None,
+        hicache_io_mode: Optional[str] = None,
     ) -> List[Dict[Any, Any]]:
+        if hicache_io_mode not in (None, "readonly"):
+            raise ValueError("hicache_io_mode must be 'readonly' or omitted")
+        if hicache_io_mode and (flat_io_action or gds_io_action):
+            raise ValueError("Read-only snapshots cannot control I/O windows")
         self.auto_create_handle_loop()
         # FLAT_MEMORY: Keep window control serialized with ordinary state requests.
         req = GetInternalStateReq(
@@ -858,6 +863,7 @@ class TokenizerControlMixin:
             flat_io_window_id=flat_io_window_id,
             gds_io_action=gds_io_action,
             gds_io_window_id=gds_io_window_id,
+            hicache_io_mode=hicache_io_mode,
         )
         # FLAT_MEMORY: An HTTP disconnect must not let the next window consume this reply.
         responses: List[GetInternalStateReqOutput] = await asyncio.shield(

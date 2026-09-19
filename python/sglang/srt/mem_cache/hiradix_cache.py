@@ -1195,7 +1195,7 @@ class HiRadixCache(RadixCache):
                 self.metrics_collector.increment_backup_num_tokens(
                     num_tokens=num_tokens, pool=pool
                 )
-        if ack.num_bytes > 0:
+        if ack.num_bytes is not None and ack.num_bytes > 0:
             self.metrics_collector.increment_backup_num_bytes(ack.num_bytes)
         if ack.timing_enabled:
             duration_ms = ack.start_event.elapsed_time(ack.finish_event)
@@ -1229,7 +1229,7 @@ class HiRadixCache(RadixCache):
                         self.metrics_collector.increment_load_back_num_tokens(
                             num_tokens=num_tokens, pool=pool
                         )
-                if ack.num_bytes > 0:
+                if ack.num_bytes is not None and ack.num_bytes > 0:
                     self.metrics_collector.increment_load_back_num_bytes(ack.num_bytes)
                 if ack.timing_enabled:
                     duration_ms = ack.start_event.elapsed_time(ack.finish_event)

@@ -5,6 +5,7 @@ import logging
 import os
 import threading
 import time
+from contextlib import nullcontext
 from dataclasses import replace
 from queue import Empty, Queue
 from typing import TYPE_CHECKING, Any, Callable, List, Optional
@@ -367,14 +368,32 @@ class HybridCacheController(BaseHiCacheController):
         node_id: int = -1,
         extra_pools: Optional[list[PoolTransfer]] = None,
     ) -> Optional[torch.Tensor]:
-        host_indices = self.mem_pool_host.alloc(len(device_indices))
+        with (
+            self.slow_stage_logger.stage(
+                "hicache.write.host_alloc",
+                pool=PoolName.KV.value,
+                requested_count=device_indices.numel(),
+            )
+            if self.slow_stage_logger is not None
+            else nullcontext()
+        ):
+            host_indices = self.mem_pool_host.alloc(len(device_indices))
         if host_indices is None:
             return None
-        pool_transfers = self.mem_pool_host.resolve_host_transfers(
-            extra_pools,
-            primary_device_indices=device_indices,
-            primary_host_indices=host_indices,
-        )
+        with (
+            self.slow_stage_logger.stage(
+                "hicache.write.resolve_host_transfers",
+                aux_pool_count=len(extra_pools or ()),
+                primary_index_count=device_indices.numel(),
+            )
+            if self.slow_stage_logger is not None
+            else nullcontext()
+        ):
+            pool_transfers = self.mem_pool_host.resolve_host_transfers(
+                extra_pools,
+                primary_device_indices=device_indices,
+                primary_host_indices=host_indices,
+            )
         if pool_transfers is None and extra_pools:
             self.mem_pool_host.free(host_indices)
             return None
@@ -635,16 +654,26 @@ class HybridCacheController(BaseHiCacheController):
     def move_hybrid_indices(
         self, operation: CacheOperation
     ) -> tuple[torch.Tensor, torch.Tensor, Optional[list[PoolTransfer]]]:
-        host_indices, device_indices = self.move_indices(
-            operation.host_indices, operation.device_indices
-        )
+        with (
+            self.slow_stage_logger.scope(pool=PoolName.KV.value)
+            if self.slow_stage_logger is not None
+            else nullcontext()
+        ):
+            host_indices, device_indices = self.move_indices(
+                operation.host_indices, operation.device_indices
+            )
         resolved_pool_transfers = None
         if operation.pool_transfers:
             resolved_pool_transfers = []
             for transfer in operation.pool_transfers:
-                transfer_host_indices, transfer_device_indices = self.move_indices(
-                    transfer.host_indices, transfer.device_indices
-                )
+                with (
+                    self.slow_stage_logger.scope(pool=transfer.name.value)
+                    if self.slow_stage_logger is not None
+                    else nullcontext()
+                ):
+                    transfer_host_indices, transfer_device_indices = self.move_indices(
+                        transfer.host_indices, transfer.device_indices
+                    )
                 # Keep the original PoolTransfer unchanged because tree-owned
                 # transfers may still reference radix-tree host state. The
                 # controller only needs a normalized execution-time copy.

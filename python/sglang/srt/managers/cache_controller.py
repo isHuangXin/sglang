@@ -21,7 +21,7 @@ import threading
 import time
 from collections import deque
 from concurrent.futures import Future, TimeoutError as FutureTimeoutError
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from queue import Empty, Queue
 from typing import TYPE_CHECKING, Callable, List, NamedTuple, Optional
@@ -53,6 +53,7 @@ from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
 from sglang.srt.observability.hicache_io_metrics import HostIOMetrics, host_pool_capacities
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import get_device_module
+from sglang.srt.utils.log_utils import SlowStageLogger
 
 logger = logging.getLogger(__name__)
 
@@ -372,6 +373,7 @@ class GPUStorageOperation(StorageOperation):
 
 
 class HiCacheController:
+    slow_stage_logger: Optional[SlowStageLogger] = None
 
     def __init__(
         self,
@@ -1094,39 +1096,79 @@ class HiCacheController:
         if len(self.write_queue) == 0:
             return
 
-        op = CacheOperation.merge_ops(self.write_queue)
-        host_indices, device_indices, pool_transfers = self._move_write_operation(op)
-        self.write_queue.clear()
+        with (
+            self.slow_stage_logger.stage(
+                "hicache.start_writing",
+                operation_count=len(self.write_queue),
+                io_backend=self.io_backend,
+                layout=self.mem_pool_host.layout,
+            )
+            if self.slow_stage_logger is not None
+            else nullcontext()
+        ):
+            with (
+                self.slow_stage_logger.stage("hicache.start_writing.merge_ops")
+                if self.slow_stage_logger is not None
+                else nullcontext()
+            ):
+                op = CacheOperation.merge_ops(self.write_queue)
+            with (
+                self.slow_stage_logger.stage(
+                    "hicache.start_writing.move_indices",
+                    host_index_count=op.host_indices.numel(),
+                    device_index_count=op.device_indices.numel(),
+                    aux_pool_count=len(op.pool_transfers or ()),
+                )
+                if self.slow_stage_logger is not None
+                else nullcontext()
+            ):
+                host_indices, device_indices, pool_transfers = (
+                    self._move_write_operation(op)
+                )
+            self.write_queue.clear()
 
-        if self.enable_storage:
-            with self.pending_backup_lock:
-                self._pending_storage_d2h_ids.update(op.node_ids)
-                self.backup_idle_event.clear()
-        try:
-            transfers = self._l2_transfers(host_indices, device_indices, pool_transfers)
-            num_bytes = self._transfer_num_bytes(transfers)
-            completion = self.l2_transfer_engine.submit_device_to_host(transfers)
-        except Exception:
-            for node_id in op.node_ids:
-                self._complete_storage_d2h(node_id)
-            raise
+            if self.enable_storage:
+                with self.pending_backup_lock:
+                    self._pending_storage_d2h_ids.update(op.node_ids)
+                    self.backup_idle_event.clear()
+            try:
+                transfers = self._l2_transfers(
+                    host_indices, device_indices, pool_transfers
+                )
+                num_bytes = self._transfer_num_bytes(transfers)
+                with (
+                    self.slow_stage_logger.stage(
+                        "hicache.start_writing.submit",
+                        transfer_count=len(transfers),
+                        num_bytes=num_bytes,
+                    )
+                    if self.slow_stage_logger is not None
+                    else nullcontext()
+                ):
+                    completion = self.l2_transfer_engine.submit_device_to_host(
+                        transfers
+                    )
+            except Exception:
+                for node_id in op.node_ids:
+                    self._complete_storage_d2h(node_id)
+                raise
 
-        self._host_io_metrics.record(
-            direction="write",
-            completion=completion,
-            num_bytes=num_bytes,
-        )
-        self.ack_write_queue.append(
-            HiCacheAck(
-                start_event=completion.start_event,
-                finish_event=completion.finish_event,
-                node_ids=op.node_ids,
-                num_tokens=len(op.device_indices),
-                timing_enabled=completion.timing_enabled,
-                num_tokens_by_pool=self._num_tokens_by_pool(op),
+            self._host_io_metrics.record(
+                direction="write",
+                completion=completion,
                 num_bytes=num_bytes,
             )
-        )
+            self.ack_write_queue.append(
+                HiCacheAck(
+                    start_event=completion.start_event,
+                    finish_event=completion.finish_event,
+                    node_ids=op.node_ids,
+                    num_tokens=len(op.device_indices),
+                    timing_enabled=completion.timing_enabled,
+                    num_tokens_by_pool=self._num_tokens_by_pool(op),
+                    num_bytes=num_bytes,
+                )
+            )
 
     def _transfer_num_bytes(
         self, transfers: list[L2Transfer], *, layer_num: Optional[int] = None
@@ -1165,9 +1207,25 @@ class HiCacheController:
             return host_indices, device_indices
         elif self.io_backend == "direct":
             if self.mem_pool_host.layout == "layer_first":
-                device_indices = device_indices.cpu()
-                host_indices, idx = host_indices.sort()
-                return host_indices, device_indices.index_select(0, idx)
+                with (
+                    self.slow_stage_logger.stage(
+                        "hicache.move_indices.device_to_cpu",
+                        index_count=device_indices.numel(),
+                    )
+                    if self.slow_stage_logger is not None
+                    else nullcontext()
+                ):
+                    device_indices = device_indices.cpu()
+                with (
+                    self.slow_stage_logger.stage(
+                        "hicache.move_indices.cpu_sort",
+                        index_count=host_indices.numel(),
+                    )
+                    if self.slow_stage_logger is not None
+                    else nullcontext()
+                ):
+                    host_indices, idx = host_indices.sort()
+                    return host_indices, device_indices.index_select(0, idx)
             elif self.mem_pool_host.layout == "page_first_direct":
                 return host_indices, device_indices.cpu()
             else:
@@ -1224,47 +1282,83 @@ class HiCacheController:
         if len(self.load_queue) == 0:
             return -1
 
-        producer_id = self.layer_done_counter.update_producer()
-        op = CacheOperation.merge_ops(self.load_queue)
-        host_indices, device_indices, pool_transfers = self._move_op_indices(op)
-        self.load_queue.clear()
-        producer_event = self.layer_done_counter.events[producer_id]
-        producer_event.start_event.record()
-
-        if self.load_fence_stream is not None:
-            # in overlap scheduling, reclaimed pages might still be written by the forward thread
-            # therefore a fence is needed for loading thread to prevent memory corruption
-            # todo: it's possible to use a finer-grained fence
-            self.l2_transfer_engine.host_to_device_stream.wait_stream(
-                self.load_fence_stream
+        with (
+            self.slow_stage_logger.stage(
+                "hicache.start_loading",
+                operation_count=len(self.load_queue),
+                io_backend=self.io_backend,
+                layout=self.mem_pool_host.layout,
             )
+            if self.slow_stage_logger is not None
+            else nullcontext()
+        ):
+            producer_id = self.layer_done_counter.update_producer()
+            with (
+                self.slow_stage_logger.stage("hicache.start_loading.merge_ops")
+                if self.slow_stage_logger is not None
+                else nullcontext()
+            ):
+                op = CacheOperation.merge_ops(self.load_queue)
+            with (
+                self.slow_stage_logger.stage(
+                    "hicache.start_loading.move_indices",
+                    host_index_count=op.host_indices.numel(),
+                    device_index_count=op.device_indices.numel(),
+                    aux_pool_count=len(op.pool_transfers or ()),
+                )
+                if self.slow_stage_logger is not None
+                else nullcontext()
+            ):
+                host_indices, device_indices, pool_transfers = self._move_op_indices(op)
+            self.load_queue.clear()
+            producer_event = self.layer_done_counter.events[producer_id]
+            producer_event.start_event.record()
 
-        transfers = self._l2_load_transfers(host_indices, device_indices, pool_transfers)
-        num_bytes = self._transfer_num_bytes(transfers, layer_num=self.layer_num)
-        completion = self.l2_transfer_engine.submit_host_to_device(
-            transfers,
-            start_event=producer_event.start_event,
-            on_layer_done=producer_event.complete,
-            layer_num=self.layer_num,
-        )
+            if self.load_fence_stream is not None:
+                # in overlap scheduling, reclaimed pages might still be written by the forward thread
+                # therefore a fence is needed for loading thread to prevent memory corruption
+                # todo: it's possible to use a finer-grained fence
+                self.l2_transfer_engine.host_to_device_stream.wait_stream(
+                    self.load_fence_stream
+                )
 
-        self._host_io_metrics.record(
-            direction="read",
-            completion=completion,
-            num_bytes=num_bytes,
-        )
-        self.ack_load_queue.append(
-            HiCacheAck(
-                start_event=completion.start_event,
-                finish_event=completion.finish_event,
-                node_ids=op.node_ids,
-                num_tokens=len(op.device_indices),
-                timing_enabled=completion.timing_enabled,
-                num_tokens_by_pool=self._num_tokens_by_pool(op),
+            transfers = self._l2_load_transfers(
+                host_indices, device_indices, pool_transfers
+            )
+            num_bytes = self._transfer_num_bytes(transfers, layer_num=self.layer_num)
+            with (
+                self.slow_stage_logger.stage(
+                    "hicache.start_loading.submit",
+                    transfer_count=len(transfers),
+                    num_bytes=num_bytes,
+                )
+                if self.slow_stage_logger is not None
+                else nullcontext()
+            ):
+                completion = self.l2_transfer_engine.submit_host_to_device(
+                    transfers,
+                    start_event=producer_event.start_event,
+                    on_layer_done=producer_event.complete,
+                    layer_num=self.layer_num,
+                )
+
+            self._host_io_metrics.record(
+                direction="read",
+                completion=completion,
                 num_bytes=num_bytes,
             )
-        )
-        return producer_id
+            self.ack_load_queue.append(
+                HiCacheAck(
+                    start_event=completion.start_event,
+                    finish_event=completion.finish_event,
+                    node_ids=op.node_ids,
+                    num_tokens=len(op.device_indices),
+                    timing_enabled=completion.timing_enabled,
+                    num_tokens_by_pool=self._num_tokens_by_pool(op),
+                    num_bytes=num_bytes,
+                )
+            )
+            return producer_id
 
     def evict_device(self, device_indices: torch.Tensor) -> int:
         self.mem_pool_device_allocator.free(device_indices)

@@ -331,6 +331,7 @@ from sglang.srt.utils.hf_transformers_utils import (
     get_tokenizer_from_processor,
     resolve_image_processor_backend,
 )
+from sglang.srt.utils.log_utils import SlowStageLogger
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 from sglang.srt.utils.numa_utils import get_numa_node_if_available, numa_bind_to_node
 from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
@@ -420,6 +421,7 @@ class Scheduler(
     # Class-level default so on_idle's stall gate works even if a fork
     # overrides init_load_publisher (which would otherwise not set it).
     _last_stall_publish_ts: float = float("-inf")
+    slow_stage_logger: Optional[SlowStageLogger] = None
 
     def __init__(
         self,
@@ -597,6 +599,7 @@ class Scheduler(
                 cache_controller.load_fence_stream = (
                     self.tp_worker.model_runner.forward_stream
                 )
+        self.init_slow_stage_logger()
         self.emit_metrics_constants()
         self.maybe_init_hccl_dp_prewarm()
 
@@ -701,6 +704,64 @@ class Scheduler(
 
         self.is_initializing = False
         self.init_startup_timing_summary()
+
+    def init_slow_stage_logger(self) -> None:
+        threshold_ms = envs.SGLANG_LOG_SLOW_STAGE_MS.get()
+        if threshold_ms <= 0:
+            self.slow_stage_logger = None
+            return
+        self.slow_stage_logger = SlowStageLogger(
+            threshold_ms,
+            logger=logger,
+            tp_rank=self.ps.tp_rank,
+            pp_rank=self.ps.pp_rank,
+            dp_rank=self.ps.dp_rank,
+            gpu_id=self.ps.gpu_id,
+        )
+        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+        if isinstance(self.tree_cache, UnifiedRadixCache):
+            self.tree_cache.slow_stage_logger = self.slow_stage_logger
+            if self.tree_cache.cache_controller is not None:
+                self.tree_cache.cache_controller.slow_stage_logger = (
+                    self.slow_stage_logger
+                )
+        logger.info("Slow-stage diagnostics enabled: threshold=%s ms", threshold_ms)
+
+    def _slow_stage(
+        self, name, batch=None, *, prospective=False, received=None, reqs=None
+    ):
+        if self.slow_stage_logger is None:
+            return nullcontext()
+        metadata = {
+            "forward_iter": None
+            if prospective or batch is None
+            else batch.forward_iter,
+            "next_forward_iter": self.forward_ct + 1 if prospective else None,
+            "last_launched_iter": self.forward_ct,
+            "waiting_requests": len(self.waiting_queue),
+            "batch_size": None,
+            "forward_mode": None,
+            "request_ids": (),
+            "request_count": None,
+        }
+        if batch is not None:
+            metadata.update(
+                batch_size=len(batch.reqs),
+                forward_mode=(
+                    batch.forward_mode.name if batch.forward_mode is not None else None
+                ),
+                extend_tokens=batch.extend_num_tokens,
+            )
+            reqs = batch.reqs
+        elif received is not None:
+            reqs = [req for msg in received for req in self._tokenized_requests(msg)]
+            metadata["received_messages"] = len(received)
+        if reqs is not None:
+            metadata.update(
+                SlowStageLogger.request_metadata((req.rid for req in reqs), len(reqs))
+            )
+        return self.slow_stage_logger.stage(name, **metadata)
 
     def init_startup_timing_begin(self) -> None:
         self.scheduler_startup_begin = time.perf_counter()
@@ -1812,27 +1873,33 @@ class Scheduler(
                 break
 
             # Receive requests
-            recv_reqs = self.request_receiver.recv_requests()
-            self.process_input_requests(recv_reqs)
+            with self._slow_stage("scheduler.receive"):
+                recv_reqs = self.request_receiver.recv_requests()
+            with self._slow_stage("scheduler.process_input", received=recv_reqs):
+                self.process_input_requests(recv_reqs)
             if self._engine_paused:
                 continue
 
             # Get the next batch to run
-            plan = self.get_next_batch_to_run(
-                running_batch=self.running_batch, last_batch=self.last_batch
-            )
+            with self._slow_stage("scheduler.prepare", prospective=True):
+                plan = self.get_next_batch_to_run(
+                    running_batch=self.running_batch, last_batch=self.last_batch
+                )
             self.running_batch = plan.running_batch
             batch = plan.batch_to_run
             self.cur_batch_for_debug = batch
 
             # Launch the current batch
             if batch:
-                result = self.run_batch(batch)
-                self.process_batch_result(batch, result)
+                with self._slow_stage("scheduler.forward", batch, prospective=True):
+                    result = self.run_batch(batch)
+                with self._slow_stage("scheduler.result", batch):
+                    self.process_batch_result(batch, result)
             else:
                 # When the server is idle, do self-check and re-init some states.
                 self._sched_idled = True
-                self.on_idle()
+                with self._slow_stage("scheduler.idle"):
+                    self.on_idle()
 
             # Update last_batch
             self.last_batch = batch
@@ -1849,22 +1916,26 @@ class Scheduler(
         def pop_and_process():
             # Process the results of the last batch
             tmp_batch, tmp_result = self.result_queue.popleft()
-            self.process_batch_result(tmp_batch, tmp_result)
+            with self._slow_stage("scheduler.result", tmp_batch):
+                self.process_batch_result(tmp_batch, tmp_result)
 
         while True:
             if self.gracefully_exit:
                 break
 
             # Receive requests
-            recv_reqs = self.request_receiver.recv_requests()
-            self.process_input_requests(recv_reqs)
+            with self._slow_stage("scheduler.receive"):
+                recv_reqs = self.request_receiver.recv_requests()
+            with self._slow_stage("scheduler.process_input", received=recv_reqs):
+                self.process_input_requests(recv_reqs)
             if self._engine_paused:
                 continue
 
             # Get the next batch to run
-            plan = self.get_next_batch_to_run(
-                running_batch=self.running_batch, last_batch=self.last_batch
-            )
+            with self._slow_stage("scheduler.prepare", prospective=True):
+                plan = self.get_next_batch_to_run(
+                    running_batch=self.running_batch, last_batch=self.last_batch
+                )
             self.running_batch = plan.running_batch
             batch = plan.batch_to_run
             self.cur_batch_for_debug = batch
@@ -1887,10 +1958,12 @@ class Scheduler(
 
             # Launch the current batch
             if batch:
-                batch_result = self.run_batch(batch)
+                with self._slow_stage("scheduler.forward", batch, prospective=True):
+                    batch_result = self.run_batch(batch)
                 # Fence result processing behind this forward's shared reads.
-                self._apply_war_barrier()
-                self.result_queue.append((batch.copy(), batch_result))
+                with self._slow_stage("scheduler.forward_fence_enqueue", batch):
+                    self._apply_war_barrier()
+                    self.result_queue.append((batch.copy(), batch_result))
             else:
                 batch_result = None
                 self._sched_idled = True
@@ -1901,12 +1974,14 @@ class Scheduler(
                     pop_and_process()
             elif batch is None:
                 # When the server is idle, do self-check and re-init some states
-                self.on_idle()
+                with self._slow_stage("scheduler.idle"):
+                    self.on_idle()
 
             # Run sample of the current batch
             # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.
             if self.is_generation:
-                self.launch_batch_sample_if_needed(batch_result, batch)
+                with self._slow_stage("scheduler.delayed_sample", batch):
+                    self.launch_batch_sample_if_needed(batch_result, batch)
 
             # Update last_batch
             self.last_batch = batch
@@ -2185,6 +2260,7 @@ class Scheduler(
             stream_output=lambda *a, **kw: self.output_streamer.stream_output(*a, **kw),
             get_last_batch=lambda: self.last_batch,
             scripted_scheduler_hook=self.scripted_scheduler_hook,
+            slow_stage_logger=self.slow_stage_logger,
         )
 
     def init_dp_attn_adapter(self) -> None:
@@ -2367,6 +2443,7 @@ class Scheduler(
             output_streamer=self.output_streamer,
             beam_coordinator=self.beam_coordinator,
             abort_request=self.abort_request,
+            slow_stage_logger=self.slow_stage_logger,
         )
 
     def init_req_max_new_tokens(self, req):
@@ -3774,16 +3851,19 @@ class Scheduler(
         set_time_batch(can_run_list, "set_forward_entry_time")
 
         # Create a new batch
-        new_batch = ScheduleBatch.init_new(
-            can_run_list,
-            self.req_to_token_pool,
-            self.token_to_kv_pool_allocator,
-            self.tree_cache,
-            self.model_config,
-            self.enable_overlap,
-            self.spec_algorithm,
-            chunked_req=self.chunked_req,
-        )
+        with self._slow_stage(
+            "scheduler.batch_init", prospective=True, reqs=can_run_list
+        ):
+            new_batch = ScheduleBatch.init_new(
+                can_run_list,
+                self.req_to_token_pool,
+                self.token_to_kv_pool_allocator,
+                self.tree_cache,
+                self.model_config,
+                self.enable_overlap,
+                self.spec_algorithm,
+                chunked_req=self.chunked_req,
+            )
 
         new_batch.contains_last_prefill_chunk = (
             self.chunked_req is None or len(can_run_list) != 1
@@ -3791,11 +3871,17 @@ class Scheduler(
 
         if self.enable_hierarchical_cache:
             # todo (zhiqiang): disable cuda graph execution if hicache loading triggered
-            new_batch.hicache_consumer_index = (
-                self.tree_cache.ready_to_load_host_cache()
-            )
+            with self._slow_stage(
+                "scheduler.host_load_prepare", new_batch, prospective=True
+            ):
+                new_batch.hicache_consumer_index = (
+                    self.tree_cache.ready_to_load_host_cache()
+                )
 
-        new_batch.prepare_for_extend()
+        with self._slow_stage(
+            "scheduler.prepare_for_extend", new_batch, prospective=True
+        ):
+            new_batch.prepare_for_extend()
 
         if self.tp_worker.model_runner.prefill_aware_swa:
             for req in can_run_list:

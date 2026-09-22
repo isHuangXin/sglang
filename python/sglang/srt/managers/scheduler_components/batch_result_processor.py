@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import (
     TYPE_CHECKING,
@@ -71,6 +72,7 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
     from sglang.srt.observability.metrics_collector import SchedulerMetricsCollector
     from sglang.srt.sampling.sampling_observer import HostAuxiliaryOutput
+    from sglang.srt.utils.log_utils import SlowStageLogger
 
 logger = logging.getLogger(__name__)
 
@@ -95,6 +97,15 @@ class SchedulerBatchResultProcessor:
     output_streamer: SchedulerOutputStreamer
     beam_coordinator: BeamCoordinator
     abort_request: Callable
+    slow_stage_logger: Optional[SlowStageLogger] = None
+
+    def _synchronize_result_copy(self, result):
+        with (
+            self.slow_stage_logger.stage("scheduler.result_copy_wait")
+            if self.slow_stage_logger is not None
+            else nullcontext()
+        ):
+            result.copy_done.synchronize()
 
     def process_batch_result_prebuilt(self, batch: ScheduleBatch):
         assert self.disaggregation_mode == DisaggregationMode.DECODE
@@ -247,7 +258,7 @@ class SchedulerBatchResultProcessor:
 
         if self.is_generation:
             if result.copy_done is not None:
-                result.copy_done.synchronize()
+                self._synchronize_result_copy(result)
             auxiliary_output_starts = self.snapshot_auxiliary_output_starts(
                 batch, result
             )
@@ -400,7 +411,7 @@ class SchedulerBatchResultProcessor:
 
         else:  # embedding or reward model
             if result.copy_done is not None:
-                result.copy_done.synchronize()
+                self._synchronize_result_copy(result)
 
             embeddings = self._convert_embeddings(result=result)
             phs = result.pooled_hidden_states
@@ -825,7 +836,7 @@ class SchedulerBatchResultProcessor:
         if not (is_decode or batch.forward_mode.is_extend()):
             return
         if result.copy_done is not None:
-            result.copy_done.synchronize()
+            self._synchronize_result_copy(result)
         next_token_ids = result.next_token_ids.tolist()
 
         if not is_decode:
@@ -869,7 +880,7 @@ class SchedulerBatchResultProcessor:
         result: GenerationBatchResult,
     ):
         if result.copy_done is not None:
-            result.copy_done.synchronize()
+            self._synchronize_result_copy(result)
 
         self.output_streamer._stream_output_generation(
             batch.reqs, batch.return_logprob, is_idle_batch=True
@@ -881,7 +892,7 @@ class SchedulerBatchResultProcessor:
         result: GenerationBatchResult,
     ):
         if result.copy_done is not None:
-            result.copy_done.synchronize()
+            self._synchronize_result_copy(result)
         auxiliary_output_starts = self.snapshot_auxiliary_output_starts(batch, result)
         auxiliary_output = result.auxiliary_host_output
         if result.routed_experts_output is not None:

@@ -42,6 +42,17 @@ from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
 from sglang.benchmark.datasets import DatasetRow, get_dataset
 from sglang.benchmark.datasets.mooncake import get_mooncake_request_over_time
+from sglang.benchmark.flat_memory_metrics import (
+    FlatMemoryIOWindow,
+    consume_native_usage,
+    summarize_cache_usage,
+    summarize_flat_cache,
+)
+from sglang.benchmark.flat_memory_report import (
+    format_cache_reports,
+    project_cache_reports,
+    resolve_metrics_mode,
+)
 from sglang.benchmark.hicache_io_metrics import (
     HiCacheIOCollector,
     format_hicache_io_report,
@@ -112,24 +123,36 @@ class RequestFuncOutput:
     error: str = ""
     output_len: int = 0
     start_time: float = 0.0
-    cached_tokens: int = 0
-    cached_tokens_device: int = 0
-    cached_tokens_host: int = 0
-    cached_tokens_storage: int = 0
+    cached_tokens: Optional[int] = None
+    cached_tokens_device: Optional[int] = None
+    cached_tokens_host: Optional[int] = None
+    cached_tokens_storage: Optional[int] = None
     cached_tokens_details: Optional[Dict[str, Any]] = None
+    server_usage: Dict[str, Any] = field(default_factory=dict)
     server_prompt_tokens: Optional[int] = None
     server_completion_tokens: Optional[int] = None
     server_cached_tokens: Optional[int] = None
+    server_cached_tokens_device: Optional[int] = None
+    server_cached_tokens_host: Optional[int] = None
+    server_cached_tokens_storage: Optional[int] = None
+    cache_source_mode: Optional[str] = None
+    flat_dram: Optional[int] = None
+    flat_ssd: Optional[int] = None
+    flat_mixed: Optional[int] = None
+    flat_prefetch_dram_ms: Optional[float] = None
+    flat_prefetch_ssd_ms: Optional[float] = None
+    flat_prefetch_dram_ops: Optional[int] = None
+    flat_prefetch_ssd_ops: Optional[int] = None
     spec_accept_length: float = 0.0
     spec_cap_length: float = 0.0
     spec_block_accept_length: float = 0.0
     spec_cap_lens_histogram: List[int] = field(default_factory=list)
-    kvcache_page_size: int = 0
-    kvcache_bytes_per_page: int = 0
-    storage_read_latency_ms: float = 0.0
-    storage_read_tokens: int = 0
-    d2h_tokens: int = 0
-    storage_write_tokens: int = 0
+    kvcache_page_size: Optional[int] = None
+    kvcache_bytes_per_page: Optional[int] = None
+    storage_read_latency_ms: Optional[float] = None
+    storage_read_tokens: Optional[int] = None
+    d2h_tokens: Optional[int] = None
+    storage_write_tokens: Optional[int] = None
 
     @staticmethod
     def init_new(request_func_input: RequestFuncInput):
@@ -259,16 +282,43 @@ async def async_request_trt_llm(
 
 
 def _extract_cache_from_sglext(data, output):
-    """Extract cache hit details from sglext in OAI-compatible responses."""
-    sglext = data.get("sglext") or {}
-    details = sglext.get("cached_tokens_details")
-    if details:
-        output.cached_tokens = (
-            (details.get("device") or 0)
-            + (details.get("host") or 0)
-            + (details.get("storage") or 0)
+    """Capture cumulative usage, including OAI metadata-only chunks."""
+    usage = data.get("usage") or {}
+    meta = dict(usage)
+    prompt_details = usage.get("prompt_tokens_details") or {}
+    if "cached_tokens" not in meta and "cached_tokens" in prompt_details:
+        meta["cached_tokens"] = prompt_details["cached_tokens"]
+    for choice in data.get("choices") or []:
+        meta.update(choice.get("meta_info") or {})
+    meta.update(data.get("meta_info") or {})
+    meta.update(data.get("sglext") or {})
+    consume_native_usage(output, meta)
+
+
+def _fetch_cache_server_info(base_url):
+    try:
+        response = requests.get(
+            base_url + "/server_info",
+            params={"hicache_io_mode": "readonly"},
+            headers=get_auth_headers(),
+            timeout=5,
         )
-        output.cached_tokens_details = details
+        response.raise_for_status()
+        info = response.json()
+        if not isinstance(info, dict):
+            raise ValueError("Invalid server-info response")
+        return info
+    except (requests.RequestException, ValueError) as exc:
+        warnings.warn(f"Cache mode evidence unavailable: {type(exc).__name__}")
+        return None
+
+
+async def _response_chunks(response):
+    if args.disable_stream:
+        yield await response.read()
+    else:
+        async for chunk in response.content:
+            yield chunk
 
 
 # set ignore_eos True by default
@@ -306,6 +356,11 @@ async def async_request_openai_completions(
 
         # Merge in extra parameters - these will override defaults if present
         payload.update(request_func_input.extra_request_body)
+        if "sglang" in args.backend and payload["stream"]:
+            payload["stream_options"] = {
+                "include_usage": True,
+                **(payload.get("stream_options") or {}),
+            }
 
         # hack to accommodate different LoRA conventions between SGLang and vLLM.
         if request_func_input.lora_name:
@@ -332,7 +387,7 @@ async def async_request_openai_completions(
                 url=api_url, json=payload, headers=headers
             ) as response:
                 if response.status == 200:
-                    async for chunk_bytes in response.content:
+                    async for chunk_bytes in _response_chunks(response):
                         chunk_bytes = chunk_bytes.strip()
                         if not chunk_bytes:
                             continue
@@ -344,13 +399,14 @@ async def async_request_openai_completions(
                         else:
                             data = json.loads(chunk)
 
-                            if getattr(args, "cache_report", False):
-                                _extract_cache_from_sglext(data, output)
+                            _extract_cache_from_sglext(data, output)
+                            output_len = (data.get("usage") or {}).get(
+                                "completion_tokens", output_len
+                            )
+                            choices = data.get("choices") or []
 
-                            # NOTE: Some completion API might have a last
-                            # usage summary response without a token so we
-                            # want to check a token was generated
-                            if data["choices"][0]["text"]:
+                            # Usage-only chunks have no generated text.
+                            if choices and choices[0].get("text"):
                                 timestamp = time.perf_counter()
                                 # First token
                                 if ttft == 0.0:
@@ -464,6 +520,11 @@ async def async_request_openai_chat_completions(
         # Merge in extra parameters (tools, temperature, top_p, etc.)
         # These will override defaults if present
         payload.update(request_func_input.extra_request_body)
+        if "sglang" in args.backend and payload["stream"]:
+            payload["stream_options"] = {
+                "include_usage": True,
+                **(payload.get("stream_options") or {}),
+            }
 
         # hack to accommodate different LoRA conventions between SGLang and vLLM.
         if request_func_input.lora_name:
@@ -513,8 +574,7 @@ async def async_request_openai_chat_completions(
                         output.spec_cap_lens_histogram = (
                             _meta_info.get("spec_cap_lens_histogram", []) or []
                         )
-                        if getattr(args, "cache_report", False):
-                            _extract_cache_from_sglext(response_json, output)
+                        _extract_cache_from_sglext(response_json, output)
                     else:
                         # Streaming response
                         async for chunk_bytes in response.content:
@@ -534,8 +594,7 @@ async def async_request_openai_chat_completions(
                                     "completion_tokens", output_len
                                 )
 
-                                if getattr(args, "cache_report", False):
-                                    _extract_cache_from_sglext(data, output)
+                                _extract_cache_from_sglext(data, output)
 
                                 choices = data.get("choices") or []
                                 if not choices:
@@ -713,7 +772,6 @@ async def async_request_sglang_generate(
 
         generated_text = ""
         output_len = request_func_input.output_len
-        ttft = 0.0
         st = time.perf_counter()
         output.start_time = st
         most_recent_timestamp = st
@@ -723,7 +781,7 @@ async def async_request_sglang_generate(
                 url=api_url, json=payload, headers=headers
             ) as response:
                 if response.status == 200:
-                    async for chunk_bytes in response.content:
+                    async for chunk_bytes in _response_chunks(response):
                         chunk_bytes = chunk_bytes.strip()
                         if not chunk_bytes:
                             continue
@@ -746,23 +804,7 @@ async def async_request_sglang_generate(
                                 output.spec_accept_length = meta_info["spec_accept_length"]
                             if "text" in data:
                                 generated_text = data["text"]
-                            if "prompt_tokens" in meta_info:
-                                output.server_prompt_tokens = meta_info["prompt_tokens"]
-                            if "cached_tokens" in meta_info:
-                                output.server_cached_tokens = meta_info["cached_tokens"]
-                                output.cached_tokens = output.server_cached_tokens
-                            details = meta_info.get("cached_tokens_details")
-                            if details is not None:
-                                output.cached_tokens_details = details
-                                output.cached_tokens_device = details.get("device", 0)
-                                output.cached_tokens_host = details.get("host", 0)
-                                output.cached_tokens_storage = details.get("storage", 0)
-                                output.kvcache_page_size = details.get("page_size", 0)
-                                output.kvcache_bytes_per_page = details.get("bytes_per_page", 0)
-                                output.storage_read_latency_ms = details.get("storage_read_latency_ms", 0.0)
-                                output.storage_read_tokens = details.get("storage_read_tokens", 0)
-                                output.d2h_tokens = details.get("d2h_tokens", 0)
-                                output.storage_write_tokens = details.get("storage_write_tokens", 0)
+                            consume_native_usage(output, meta_info)
                             completion_tokens = meta_info.get("completion_tokens")
                             if completion_tokens is not None:
                                 output.server_completion_tokens = completion_tokens
@@ -1069,18 +1111,18 @@ class BenchmarkMetrics:
     concurrency: float
     max_output_tokens_per_s: float = 0.0
     max_concurrent_requests: int = 0
-    total_cached_tokens: int = 0
-    total_prompt_tokens: int = 0
-    cache_hit_rate: float = 0.0
-    total_cached_tokens_device: int = 0
-    total_cached_tokens_host: int = 0
-    total_cached_tokens_storage: int = 0
-    kvcache_page_size: int = 0
-    kvcache_bytes_per_page: int = 0
-    avg_storage_read_latency_ms: float = 0.0
-    total_storage_read_tokens: int = 0
-    total_d2h_tokens: int = 0
-    total_storage_write_tokens: int = 0
+    total_cached_tokens: Optional[int] = None
+    total_prompt_tokens: Optional[int] = None
+    cache_hit_rate: Optional[float] = None
+    total_cached_tokens_device: Optional[int] = None
+    total_cached_tokens_host: Optional[int] = None
+    total_cached_tokens_storage: Optional[int] = None
+    kvcache_page_size: Optional[int] = None
+    kvcache_bytes_per_page: Optional[int] = None
+    avg_storage_read_latency_ms: Optional[float] = None
+    total_storage_read_tokens: Optional[int] = None
+    total_d2h_tokens: Optional[int] = None
+    total_storage_write_tokens: Optional[int] = None
 
 
 async def get_request(
@@ -1421,7 +1463,6 @@ def calculate_metrics(
                 print("tip: install termplotlib and gnuplot to plot the metrics")
 
     itls = retokenized_itls if use_retokenized_itl else itls
-    total_cached_tokens = sum(output.cached_tokens for output in successful_outputs)
     metrics = BenchmarkMetrics(
         completed=completed,
         total_input=total_input,
@@ -1465,29 +1506,7 @@ def calculate_metrics(
         concurrency=np.sum(e2e_latencies) / dur_s,
         max_output_tokens_per_s=max_output_tokens_per_s,
         max_concurrent_requests=max_concurrent_requests,
-        total_cached_tokens=total_cached_tokens,
-        total_prompt_tokens=total_input,
-        cache_hit_rate=total_cached_tokens / total_input if total_input > 0 else 0.0,
-        total_cached_tokens_device=sum(
-            output.cached_tokens_device for output in successful_outputs
-        ),
-        total_cached_tokens_host=sum(
-            output.cached_tokens_host for output in successful_outputs
-        ),
-        total_cached_tokens_storage=sum(
-            output.cached_tokens_storage for output in successful_outputs
-        ),
-        # KVCache block granularity (take from first successful output that has it)
-        kvcache_page_size=next((o.kvcache_page_size for o in outputs if o.success and o.kvcache_page_size > 0), 0),
-        kvcache_bytes_per_page=next((o.kvcache_bytes_per_page for o in outputs if o.success and o.kvcache_bytes_per_page > 0), 0),
-        # Transfer metrics
-        avg_storage_read_latency_ms=(
-            np.mean([o.storage_read_latency_ms for o in outputs if o.success and o.storage_read_latency_ms > 0])
-            if any(o.storage_read_latency_ms > 0 for o in outputs if o.success) else 0.0
-        ),
-        total_storage_read_tokens=sum(o.storage_read_tokens for o in outputs if o.success),
-        total_d2h_tokens=sum(o.d2h_tokens for o in outputs if o.success),
-        total_storage_write_tokens=sum(o.storage_write_tokens for o in outputs if o.success),
+        **summarize_cache_usage(outputs),
     )
 
     return metrics, output_lens
@@ -1579,35 +1598,13 @@ async def benchmark(
     profile_prefill_url: Optional[List[str]] = None,
     profile_decode_url: Optional[List[str]] = None,
 ):
-    collect_storage_io = getattr(args, "collect_mooncake_io_metrics", False)
-    collect_host_io = getattr(args, "collect_hicache_io_metrics", False) or collect_storage_io
-    if args.collect_hicache_io and collect_host_io:
-        raise ValueError(
-            "Read-only HiCache snapshots cannot be combined with native I/O windows"
+    _validate_cache_io_options(args)
+    collect_storage_io = args.collect_mooncake_io_metrics
+    collect_host_io = args.collect_hicache_io_metrics or collect_storage_io
+    if collect_host_io:
+        flush_cache_timeout = max(
+            flush_cache_timeout, float(os.environ.get("HICACHE_FLUSH_TIMEOUT", "150"))
         )
-    hicache_io = HiCacheIOCollector(
-        base_url=base_url,
-        enabled=args.collect_hicache_io,
-        owner_metrics_url=args.mooncake_owner_metrics_url,
-        headers=get_auth_headers(),
-    )
-    native_io = NativeIOMeasurement(
-        base_url=base_url,
-        collect_host=collect_host_io,
-        collect_storage=collect_storage_io,
-        headers=get_auth_headers(),
-        master_host=getattr(args, "mooncake_master_host", None),
-        master_port=getattr(args, "mooncake_metrics_port", 9003),
-        client_url=(
-            f"http://{getattr(args, 'mooncake_client_host', '127.0.0.1')}:"
-            f"{getattr(args, 'mooncake_client_metrics_port', 9301)}"
-        ),
-        drain_timeout=float(os.environ.get("HICACHE_IO_DRAIN_TIMEOUT", "120")) if collect_host_io else 120.0,
-        flush_timeout=float(os.environ.get("HICACHE_FLUSH_TIMEOUT", "150")) if collect_host_io else 150.0,
-    )
-    native_io.validate(backend=backend)
-    if native_io.enabled:
-        flush_cache_timeout = max(flush_cache_timeout, native_io.flush_timeout)
     if backend in ASYNC_REQUEST_FUNCS:
         request_func = ASYNC_REQUEST_FUNCS[backend]
     else:
@@ -1743,86 +1740,138 @@ async def benchmark(
             if profile_output.success:
                 print("Profiler started")
 
+    server_info_before = (
+        _fetch_cache_server_info(base_url) if "sglang" in backend else None
+    )
+    metrics_mode = resolve_metrics_mode(
+        before=server_info_before,
+        details=[output.server_usage for output in warmup_outputs if output.success],
+    )
+    native_mode = metrics_mode["metrics_mode"] == "native"
+    hicache_io = HiCacheIOCollector(
+        base_url=base_url,
+        enabled=args.collect_hicache_io and native_mode,
+        owner_metrics_url=args.mooncake_owner_metrics_url,
+        headers=get_auth_headers(),
+    )
+    native_io = NativeIOMeasurement(
+        base_url=base_url,
+        collect_host=collect_host_io and native_mode,
+        collect_storage=collect_storage_io and native_mode,
+        headers=get_auth_headers(),
+        master_host=args.mooncake_master_host,
+        master_port=args.mooncake_metrics_port,
+        client_url=(
+            f"http://{args.mooncake_client_host}:{args.mooncake_client_metrics_port}"
+        ),
+        drain_timeout=(
+            float(os.environ.get("HICACHE_IO_DRAIN_TIMEOUT", "120"))
+            if collect_host_io
+            else 120.0
+        ),
+        flush_timeout=(
+            float(os.environ.get("HICACHE_FLUSH_TIMEOUT", "150"))
+            if collect_host_io
+            else 150.0
+        ),
+    )
+    flat_io = FlatMemoryIOWindow(
+        base_url=base_url,
+        enabled=args.collect_flat_memory_io,
+        headers=get_auth_headers(),
+        expected_tp_size=args.flat_memory_tp_size,
+        mode=metrics_mode,
+    )
+    native_io.validate(backend=backend)
     if not hicache_io.enabled:
         native_io.start()
-    async with hicache_io:
-        # Run all requests
-        benchmark_start_time = time.perf_counter()
-        tasks: List[asyncio.Task] = []
-        pbar_total = len(input_requests)
-        if (
-            backend == "sglang" and is_mooncake
-        ):  # Assuming mooncake is mainly for sglang or similar backends
-            print(
-                "Using time-based Mooncake request scheduler, ignoring --request-rate."
-            )
-            request_generator = get_mooncake_request_over_time(
-                input_requests, tokenizer, mooncake_slowdown_factor, mooncake_num_rounds
-            )
-            print(
-                f"Starting Mooncake trace replay. Sessions: {len(input_requests)}, Rounds per session: {mooncake_num_rounds}. Slowdown factor: {mooncake_slowdown_factor}"
-            )
-            pbar_total *= args.mooncake_num_rounds
-        else:
-            request_generator = get_request(input_requests, request_rate)
-
-        # Prepare LoRA request distribution parameters
-        if lora_request_distribution == "distinct":
-            lora_idx = 0
-        elif lora_request_distribution == "skewed":
-            weights = np.array([lora_zipf_alpha**-i for i in range(len(lora_names))])
-            lora_probs = weights / np.sum(weights)
-        else:
-            lora_idx = None
-            lora_probs = None
-
-        pbar = None if disable_tqdm else tqdm(total=pbar_total)
-        benchmark_requests: List[DatasetRow] = []
-        try:
-            async for request in request_generator:
-                benchmark_requests.append(request)
-                if lora_names is not None and len(lora_names) != 0:
-                    if lora_request_distribution == "uniform":
-                        lora_name = random.choice(lora_names)
-                    elif lora_request_distribution == "distinct":
-                        lora_name = lora_names[lora_idx]
-                        lora_idx = (lora_idx + 1) % len(lora_names)
-                    else:
-                        assert (
-                            lora_request_distribution == "skewed"
-                        ), f"Unexpected lora_request_distribution: {lora_request_distribution}. Expected 'skewed'."
-                        lora_name = np.random.choice(lora_names, p=lora_probs)
-                else:
-                    lora_name = None
-
-                # Merge global extra_request_body with per-request extras
-                # Per-request parameters take precedence over global ones
-                merged_extra_body = {**extra_request_body, **request.extra_request_body}
-                request_func_input = RequestFuncInput(
-                    model=model_id,
-                    prompt=request.prompt,
-                    api_url=api_url,
-                    prompt_len=request.prompt_len,
-                    output_len=request.output_len,
-                    lora_name=lora_name,
-                    image_data=request.image_data,
-                    extra_request_body=merged_extra_body,
-                    timestamp=request.timestamp,
-                    routing_key=request.routing_key,
+    async with flat_io:
+        async with hicache_io:
+            # Run all requests
+            benchmark_start_time = time.perf_counter()
+            tasks: List[asyncio.Task] = []
+            pbar_total = len(input_requests)
+            if (
+                backend == "sglang" and is_mooncake
+            ):  # Assuming mooncake is mainly for sglang or similar backends
+                print(
+                    "Using time-based Mooncake request scheduler, ignoring --request-rate."
                 )
-                tasks.append(
-                    asyncio.create_task(
-                        limited_request_func(
-                            request_func_input=request_func_input, pbar=pbar
+                request_generator = get_mooncake_request_over_time(
+                    input_requests,
+                    tokenizer,
+                    mooncake_slowdown_factor,
+                    mooncake_num_rounds,
+                )
+                print(
+                    f"Starting Mooncake trace replay. Sessions: {len(input_requests)}, Rounds per session: {mooncake_num_rounds}. Slowdown factor: {mooncake_slowdown_factor}"
+                )
+                pbar_total *= args.mooncake_num_rounds
+            else:
+                request_generator = get_request(input_requests, request_rate)
+
+            # Prepare LoRA request distribution parameters
+            if lora_request_distribution == "distinct":
+                lora_idx = 0
+            elif lora_request_distribution == "skewed":
+                weights = np.array(
+                    [lora_zipf_alpha**-i for i in range(len(lora_names))]
+                )
+                lora_probs = weights / np.sum(weights)
+            else:
+                lora_idx = None
+                lora_probs = None
+
+            pbar = None if disable_tqdm else tqdm(total=pbar_total)
+            benchmark_requests: List[DatasetRow] = []
+            try:
+                async for request in request_generator:
+                    benchmark_requests.append(request)
+                    if lora_names is not None and len(lora_names) != 0:
+                        if lora_request_distribution == "uniform":
+                            lora_name = random.choice(lora_names)
+                        elif lora_request_distribution == "distinct":
+                            lora_name = lora_names[lora_idx]
+                            lora_idx = (lora_idx + 1) % len(lora_names)
+                        else:
+                            assert (
+                                lora_request_distribution == "skewed"
+                            ), f"Unexpected lora_request_distribution: {lora_request_distribution}. Expected 'skewed'."
+                            lora_name = np.random.choice(lora_names, p=lora_probs)
+                    else:
+                        lora_name = None
+
+                    # Merge global extra_request_body with per-request extras
+                    # Per-request parameters take precedence over global ones
+                    merged_extra_body = {
+                        **extra_request_body,
+                        **request.extra_request_body,
+                    }
+                    request_func_input = RequestFuncInput(
+                        model=model_id,
+                        prompt=request.prompt,
+                        api_url=api_url,
+                        prompt_len=request.prompt_len,
+                        output_len=request.output_len,
+                        lora_name=lora_name,
+                        image_data=request.image_data,
+                        extra_request_body=merged_extra_body,
+                        timestamp=request.timestamp,
+                        routing_key=request.routing_key,
+                    )
+                    tasks.append(
+                        asyncio.create_task(
+                            limited_request_func(
+                                request_func_input=request_func_input, pbar=pbar
+                            )
                         )
                     )
-                )
-            outputs: List[RequestFuncOutput] = await asyncio.gather(*tasks)
-        except BaseException:
-            if not hicache_io.enabled:
-                native_io.abort()
-            raise
-        benchmark_duration = time.perf_counter() - benchmark_start_time
+                outputs: List[RequestFuncOutput] = await asyncio.gather(*tasks)
+            except BaseException:
+                if not hicache_io.enabled:
+                    native_io.abort()
+                raise
+            benchmark_duration = time.perf_counter() - benchmark_start_time
     if not hicache_io.enabled:
         native_io.finish()
     if is_multi_turn:
@@ -1847,29 +1896,26 @@ async def benchmark(
     if pbar is not None:
         pbar.close()
 
-    if hicache_io.enabled or native_io.enabled:
-        accept_length = None
-    elif "sglang" in backend:
-        server_info = requests.get(
-            base_url + "/server_info", headers=get_auth_headers()
-        )
-        if server_info.status_code == 200:
-            server_info_json = server_info.json()
-            if "decode" in server_info_json:
-                server_info_json = server_info_json["decode"][0]
-            if (
-                "internal_states" in server_info_json
-                and server_info_json["internal_states"]
-            ):
-                accept_length = server_info_json["internal_states"][0].get(
-                    "avg_spec_accept_length", None
-                )
-            else:
-                accept_length = None
-        else:
-            accept_length = None
+    if flat_io.server_info_before is not None:
+        server_info_before = flat_io.server_info_before
+    if flat_io.server_info_after is not None:
+        server_info_after = flat_io.server_info_after
+    elif native_io.after is not None:
+        server_info_after = native_io.after["server_config"]
     else:
-        accept_length = None
+        server_info_after = (
+            _fetch_cache_server_info(base_url) if "sglang" in backend else None
+        )
+    server_info = server_info_after or server_info_before
+    accept_length = None
+    if not (hicache_io.enabled or native_io.enabled) and server_info_after:
+        decode_info = server_info_after
+        if decode_info.get("decode"):
+            decode_info = decode_info["decode"][0]
+        if decode_info.get("internal_states"):
+            accept_length = decode_info["internal_states"][0].get(
+                "avg_spec_accept_length"
+            )
 
     # Compute metrics and print results
     metrics, output_lens = calculate_metrics(
@@ -1881,6 +1927,47 @@ async def benchmark(
         accept_length=accept_length,
         plot_throughput=args.plot_throughput,
     )
+
+    result_details = {
+        "input_lens": [output.prompt_len for output in outputs],
+        "output_lens": output_lens,
+        "ttfts": [output.ttft for output in outputs],
+        "itls": [output.itl for output in outputs],
+        "generated_texts": [output.generated_text for output in outputs],
+        "errors": [output.error for output in outputs],
+        "cached_tokens": [output.cached_tokens for output in outputs],
+        "cached_tokens_device": [output.cached_tokens_device for output in outputs],
+        "cached_tokens_host": [output.cached_tokens_host for output in outputs],
+        "cached_tokens_storage": [output.cached_tokens_storage for output in outputs],
+        "server_prompt_tokens": [output.server_prompt_tokens for output in outputs],
+        "server_completion_tokens": [
+            output.server_completion_tokens for output in outputs
+        ],
+        "server_cached_tokens": [output.server_cached_tokens for output in outputs],
+        "cached_tokens_details": [o.cached_tokens_details for o in outputs],
+        "server_usage": [o.server_usage for o in outputs],
+        "cache_source_modes": [o.cache_source_mode for o in outputs],
+    }
+
+    cache_usage = summarize_cache_usage(outputs)
+    flat_cache = summarize_flat_cache(outputs, cache_usage["total_prompt_tokens"])
+    metrics_mode = resolve_metrics_mode(
+        before=server_info_before,
+        after=server_info_after,
+        details=[output.server_usage for output in outputs if output.success],
+    )
+    cache_reports = project_cache_reports(
+        {
+            **cache_usage,
+            **flat_cache,
+            **flat_io.result,
+            **result_details,
+            "server_info_before": server_info_before,
+            "server_info_after": server_info_after,
+        },
+        mode=metrics_mode,
+    )
+    native_mode = cache_reports["metrics_mode"] == "native"
 
     print("\n{s:{c}^{n}}".format(s=" Serving Benchmark Result ", n=50, c="="))
     print("{:<40} {:<10}".format("Backend:", backend))
@@ -1948,54 +2035,63 @@ async def benchmark(
             )
         )
     print("{:<40} {:<10.2f}".format("Concurrency:", metrics.concurrency))
-    if not args.cache_report and (
-        metrics.total_cached_tokens > 0 or metrics.total_prompt_tokens > 0
+    print(format_cache_reports(cache_reports))
+    if (
+        metrics.kvcache_page_size is not None
+        or metrics.kvcache_bytes_per_page is not None
     ):
-        print("{s:{c}^{n}}".format(s="Cache Hit Statistics", n=50, c="-"))
-        print("{:<40} {:<10}".format("Total cached tokens:", metrics.total_cached_tokens))
-        print("{:<40} {:<10}".format("Total prompt tokens:", metrics.total_prompt_tokens))
-        print("{:<40} {:<10.4f}".format("Cache hit rate:", metrics.cache_hit_rate))
-        if (
-            metrics.total_cached_tokens_device > 0
-            or metrics.total_cached_tokens_host > 0
-            or metrics.total_cached_tokens_storage > 0
-        ):
-            for label, value in (
-                ("  - Device (GPU HBM):", metrics.total_cached_tokens_device),
-                ("  - Host (CPU DRAM):", metrics.total_cached_tokens_host),
-                ("  - Storage (L3):", metrics.total_cached_tokens_storage),
-            ):
-                print("{:<40} {:<10}".format(label, value))
-    if metrics.kvcache_page_size > 0 or metrics.kvcache_bytes_per_page > 0:
         print("{s:{c}^{n}}".format(s="KVCache Block Granularity", n=50, c="-"))
-        print("{:<40} {:<10}".format("Page size (tokens):", metrics.kvcache_page_size))
-        print("{:<40} {:<10}".format("Bytes per page (K+V):", metrics.kvcache_bytes_per_page))
-        print("{:<40} {:<10.2f}".format(
-            "Bytes per page (K+V, KB):", metrics.kvcache_bytes_per_page / 1024.0
-        ))
-    if (metrics.avg_storage_read_latency_ms > 0 or metrics.total_storage_read_tokens > 0
-            or metrics.total_d2h_tokens > 0 or metrics.total_storage_write_tokens > 0):
+        for label, value in (
+            ("Page size (tokens):", metrics.kvcache_page_size),
+            ("Bytes per page (K+V):", metrics.kvcache_bytes_per_page),
+        ):
+            print("{:<40} {:<10}".format(label, "" if value is None else value))
+        if metrics.kvcache_bytes_per_page is not None:
+            print(
+                "{:<40} {:<10.2f}".format(
+                    "Bytes per page (K+V, KB):", metrics.kvcache_bytes_per_page / 1024.0
+                )
+            )
+    if native_mode and any(
+        value is not None and value > 0
+        for value in (
+            metrics.avg_storage_read_latency_ms,
+            metrics.total_storage_read_tokens,
+            metrics.total_d2h_tokens,
+            metrics.total_storage_write_tokens,
+        )
+    ):
         print("{s:{c}^{n}}".format(s="Transfer Metrics", n=50, c="-"))
-        if metrics.avg_storage_read_latency_ms > 0:
+        if (
+            metrics.avg_storage_read_latency_ms is not None
+            and metrics.avg_storage_read_latency_ms > 0
+        ):
             print("{:<40} {:<10.2f}".format(
                 "Avg Storage→Host latency (ms):", metrics.avg_storage_read_latency_ms
             ))
-        if metrics.total_storage_read_tokens > 0:
+        if (
+            metrics.total_storage_read_tokens is not None
+            and metrics.total_storage_read_tokens > 0
+        ):
             print("{:<40} {:<10}".format(
                 "Total Storage→Host tokens:", metrics.total_storage_read_tokens
             ))
-        if metrics.total_d2h_tokens > 0:
+        if metrics.total_d2h_tokens is not None and metrics.total_d2h_tokens > 0:
             print("{:<40} {:<10}".format(
                 "Total GPU→Host tokens:", metrics.total_d2h_tokens
             ))
-        if metrics.total_storage_write_tokens > 0:
+        if (
+            metrics.total_storage_write_tokens is not None
+            and metrics.total_storage_write_tokens > 0
+        ):
             print("{:<40} {:<10}".format(
                 "Total Host→Storage tokens:", metrics.total_storage_write_tokens
             ))
-    if hicache_io.enabled:
-        print(format_hicache_io_report(hicache_io.result))
-    else:
-        native_io.report()
+    if native_mode:
+        if hicache_io.enabled:
+            print(format_hicache_io_report(hicache_io.result))
+        else:
+            native_io.report()
     # Fetch and print Mooncake Master eviction metrics
     mooncake_eviction = {}
     if (
@@ -2008,7 +2104,7 @@ async def benchmark(
             master_host=args.mooncake_master_host,
             metrics_port=getattr(args, 'mooncake_metrics_port', 9003),
         )
-        if mooncake_eviction:
+        if mooncake_eviction and native_mode:
             print("{s:{c}^{n}}".format(s="Mooncake Eviction Statistics", n=50, c="-"))
             if "successful_evictions" in mooncake_eviction:
                 print("{:<40} {:<10}".format(
@@ -2038,7 +2134,7 @@ async def benchmark(
             prefill_host=args.prefill_metrics_host,
             prefill_port=getattr(args, 'prefill_metrics_port', 30000),
         )
-        if bandwidth_metrics:
+        if bandwidth_metrics and native_mode:
             print("{s:{c}^{n}}".format(s="KVCache Transfer Bandwidth", n=50, c="-"))
             if "backup_bandwidth_avg_gbs" in bandwidth_metrics:
                 print("{:<40} {:<10.3f}".format(
@@ -2061,109 +2157,16 @@ async def benchmark(
     # Fetch and print Flat Memory System per-backend stats
     flat_memory_metrics = {}
     fm_host = getattr(args, 'prefill_metrics_host', None)
-    if fm_host and not native_io.storage_enabled and not hicache_io.enabled:
+    if (
+        fm_host
+        and cache_reports["metrics_mode"] == "flat"
+        and not native_io.storage_enabled
+        and not hicache_io.enabled
+    ):
         flat_memory_metrics = fetch_flat_memory_metrics(
             prefill_host=fm_host,
             prefill_port=getattr(args, 'prefill_metrics_port', 30000),
         )
-    if flat_memory_metrics:
-        print("{s:{c}^{n}}".format(s="Flat Memory System Statistics", n=50, c="-"))
-        # Storage usage
-        dram_used = flat_memory_metrics.get("dram_used_bytes", 0)
-        ssd_used = flat_memory_metrics.get("ssd_used_bytes", 0)
-        total_blocks = int(flat_memory_metrics.get("total_blocks", 0))
-        if dram_used > 0 or ssd_used > 0:
-            print("{:<40} {:<10.2f}".format(
-                "DRAM used (GB):", dram_used / (1024**3)
-            ))
-            print("{:<40} {:<10.2f}".format(
-                "SSD used (GB):", ssd_used / (1024**3)
-            ))
-            print("{:<40} {:<10}".format(
-                "Total blocks stored:", total_blocks
-            ))
-        # DRAM bandwidth
-        dram_write_bw = flat_memory_metrics.get("dram_write_bw_gbps", 0)
-        dram_read_bw = flat_memory_metrics.get("dram_read_bw_gbps", 0)
-        dram_write_ops = int(flat_memory_metrics.get("dram_write_ops", 0))
-        dram_read_ops = int(flat_memory_metrics.get("dram_read_ops", 0))
-        dram_write_bytes = flat_memory_metrics.get("dram_write_total_bytes", 0)
-        dram_read_bytes = flat_memory_metrics.get("dram_read_total_bytes", 0)
-        if dram_write_ops > 0 or dram_read_ops > 0:
-            print("{:<40} {:<10.2f}".format(
-                "DRAM write bandwidth (GB/s):", dram_write_bw
-            ))
-            print("{:<40} {:<10}".format(
-                "DRAM write ops:", dram_write_ops
-            ))
-            print("{:<40} {:<10.2f}".format(
-                "DRAM write total (GB):", dram_write_bytes / (1024**3)
-            ))
-            print("{:<40} {:<10.2f}".format(
-                "DRAM read bandwidth (GB/s):", dram_read_bw
-            ))
-            print("{:<40} {:<10}".format(
-                "DRAM read ops:", dram_read_ops
-            ))
-            print("{:<40} {:<10.2f}".format(
-                "DRAM read total (GB):", dram_read_bytes / (1024**3)
-            ))
-        # SSD bandwidth
-        ssd_write_bw = flat_memory_metrics.get("ssd_write_bw_gbps", 0)
-        ssd_read_bw = flat_memory_metrics.get("ssd_read_bw_gbps", 0)
-        ssd_write_ops = int(flat_memory_metrics.get("ssd_write_ops", 0))
-        ssd_read_ops = int(flat_memory_metrics.get("ssd_read_ops", 0))
-        ssd_write_bytes = flat_memory_metrics.get("ssd_write_total_bytes", 0)
-        ssd_read_bytes = flat_memory_metrics.get("ssd_read_total_bytes", 0)
-        if ssd_write_ops > 0 or ssd_read_ops > 0:
-            print("{:<40} {:<10.2f}".format(
-                "SSD write bandwidth (GB/s):", ssd_write_bw
-            ))
-            print("{:<40} {:<10}".format(
-                "SSD write ops:", ssd_write_ops
-            ))
-            print("{:<40} {:<10.2f}".format(
-                "SSD write total (GB):", ssd_write_bytes / (1024**3)
-            ))
-            print("{:<40} {:<10.2f}".format(
-                "SSD read bandwidth (GB/s):", ssd_read_bw
-            ))
-            print("{:<40} {:<10}".format(
-                "SSD read ops:", ssd_read_ops
-            ))
-            print("{:<40} {:<10.2f}".format(
-                "SSD read total (GB):", ssd_read_bytes / (1024**3)
-            ))
-        # Flat Memory Capacity Management Statistics
-        overflow_count = int(flat_memory_metrics.get("dram_overflow_count", 0))
-        overflow_bytes = flat_memory_metrics.get("dram_overflow_bytes", 0)
-        dup_skips = int(flat_memory_metrics.get("duplicate_key_skips", 0))
-        del_count = int(flat_memory_metrics.get("delete_count", 0))
-        del_bytes = flat_memory_metrics.get("delete_bytes", 0)
-        put_fails = int(flat_memory_metrics.get("put_failures", 0))
-        dram_util = flat_memory_metrics.get("dram_utilization_pct", 0)
-        ssd_util = flat_memory_metrics.get("ssd_utilization_pct", 0)
-        if overflow_count > 0 or dup_skips > 0 or del_count > 0:
-            print("{s:{c}^{n}}".format(
-                s="Flat Memory Capacity Statistics", n=50, c="-"))
-            print("{:<40} {:<10}".format(
-                "DRAM overflow events:", overflow_count))
-            print("{:<40} {:<10.2f}".format(
-                "DRAM overflow size (GB):", overflow_bytes / (1024**3)))
-            print("{:<40} {:<10}".format(
-                "Duplicate key skips:", dup_skips))
-            if del_count > 0:
-                print("{:<40} {:<10}".format(
-                    "Delete operations:", del_count))
-                print("{:<40} {:<10.2f}".format(
-                    "Deleted size (GB):", del_bytes / (1024**3)))
-            if put_fails > 0:
-                print("{:<40} {:<10}".format(
-                    "Put failures (no space):", put_fails))
-            print("{:<40} {:<10.1f}".format(
-                "DRAM utilization (%):", dram_util))
-            print("{:<40} {:<10.1f}".format(
-                "SSD utilization (%):", ssd_util))
     if accept_length:
         print("{:<40} {:<10.2f}".format("Accept length:", accept_length))
     print("{s:{c}^{n}}".format(s="End-to-End Latency", n=50, c="-"))
@@ -2208,68 +2211,7 @@ async def benchmark(
         print("{:<40} {:<10.2f}".format("P95 ITL (ms):", metrics.p95_itl_ms))
         print("{:<40} {:<10.2f}".format("P99 ITL (ms):", metrics.p99_itl_ms))
         print("{:<40} {:<10.2f}".format("Max ITL (ms):", metrics.max_itl_ms))
-    if args.cache_report:
-        total_prompt_tokens = 0
-        total_cached = 0
-        total_device = total_host = total_storage = 0
-        storage_backend_name = None
-        has_details = False
-        for o in outputs:
-            if not o.success:
-                continue
-            total_prompt_tokens += o.prompt_len
-            total_cached += o.cached_tokens
-            if o.cached_tokens_details:
-                has_details = True
-                total_device += o.cached_tokens_details.get("device") or 0
-                total_host += o.cached_tokens_details.get("host") or 0
-                s = o.cached_tokens_details.get("storage") or 0
-                if s:
-                    total_storage += s
-                    storage_backend_name = o.cached_tokens_details.get(
-                        "storage_backend"
-                    )
-        hit_rate = (
-            total_cached / total_prompt_tokens * 100 if total_prompt_tokens > 0 else 0.0
-        )
-
-        print("{s:{c}^{n}}".format(s="Cache Hit Details", n=50, c="-"))
-        print("{:<40} {:<10}".format("Total prompt tokens:", total_prompt_tokens))
-        print("{:<40} {:<10}".format("Total cached tokens:", total_cached))
-        if has_details and total_cached > 0:
-            print("{:<40} {:<10}".format("  Device:", total_device))
-            print("{:<40} {:<10}".format("  Host:", total_host))
-            if total_storage > 0:
-                label = (
-                    f"  Storage ({storage_backend_name}):"
-                    if storage_backend_name
-                    else "  Storage:"
-                )
-                print("{:<40} {:<10}".format(label, total_storage))
-        print("{:<40} {:.1f}%".format("Cache hit rate:", hit_rate))
-        if has_details and total_cached > 0:
-            device_pct = total_device / total_cached * 100
-            host_pct = total_host / total_cached * 100
-            print("{:<40} {:.1f}%".format("  Device:", device_pct))
-            print("{:<40} {:.1f}%".format("  Host:", host_pct))
-            if total_storage > 0:
-                storage_pct = total_storage / total_cached * 100
-                label = (
-                    f"  Storage ({storage_backend_name}):"
-                    if storage_backend_name
-                    else "  Storage:"
-                )
-                print("{:<40} {:.1f}%".format(label, storage_pct))
     print("=" * 50)
-
-    if hicache_io.enabled:
-        # The projected snapshots are already retained in hicache_io_metadata.
-        server_info = None
-    elif native_io.enabled:
-        server_info = (native_io.after or native_io.before)["server_config"]
-    else:
-        resp = requests.get(base_url + "/server_info", headers=get_auth_headers())
-        server_info = resp.json() if resp.status_code == 200 else None
 
     if (
         metrics.median_ttft_ms is not None
@@ -2289,6 +2231,7 @@ async def benchmark(
             "random_range_ratio": args.random_range_ratio,
             # Information
             "server_info": server_info,
+            "cache_usage": cache_usage | flat_cache,
             # Results
             "duration": benchmark_duration,
             "completed": metrics.completed,
@@ -2349,21 +2292,13 @@ async def benchmark(
             "kvcache_bandwidth": bandwidth_metrics if bandwidth_metrics else {},
             # Flat Memory System per-backend stats
             "flat_memory": flat_memory_metrics if flat_memory_metrics else {},
+            **flat_io.result,
             **native_io.host_metrics,
             **native_io.storage_metrics,
             **(hicache_io.result if hicache_io.enabled else {}),
         }
 
-        if args.cache_report:
-            result["cache_report"] = {
-                "total_prompt_tokens": total_prompt_tokens,
-                "total_cached_tokens": total_cached,
-                "cache_hit_rate_pct": round(hit_rate, 2),
-                "device_cached_tokens": total_device if has_details else None,
-                "host_cached_tokens": total_host if has_details else None,
-                "storage_cached_tokens": (total_storage if total_storage > 0 else None),
-                "storage_backend": storage_backend_name,
-            }
+        result.update(cache_reports)
     else:
         print(f"Error running benchmark for request rate: {request_rate}")
         print("-" * 30)
@@ -2386,27 +2321,6 @@ async def benchmark(
                 f"{args.backend}_{now}_{args.num_prompts}_{args.dataset_name}.jsonl"
             )
 
-    result_details = {
-        "input_lens": [output.prompt_len for output in outputs],
-        "output_lens": output_lens,
-        "ttfts": [output.ttft for output in outputs],
-        "itls": [output.itl for output in outputs],
-        "generated_texts": [output.generated_text for output in outputs],
-        "errors": [output.error for output in outputs],
-        "cached_tokens": [output.cached_tokens for output in outputs],
-        "cached_tokens_device": [output.cached_tokens_device for output in outputs],
-        "cached_tokens_host": [output.cached_tokens_host for output in outputs],
-        "cached_tokens_storage": [output.cached_tokens_storage for output in outputs],
-        "server_prompt_tokens": [output.server_prompt_tokens for output in outputs],
-        "server_completion_tokens": [output.server_completion_tokens for output in outputs],
-        "server_cached_tokens": [output.server_cached_tokens for output in outputs],
-    }
-
-    if args.cache_report:
-        result_details["cached_tokens_details"] = [
-            o.cached_tokens_details for o in outputs
-        ]
-
     # Append results to a JSONL file
     with open(output_file_name, "a") as file:
         if args.output_details:
@@ -2425,6 +2339,31 @@ def check_chat_template(model_path):
     except Exception as e:
         print(f"Fail to load tokenizer config with error={e}")
         return False
+
+
+def _validate_cache_io_options(options):
+    native_requested = (
+        options.collect_hicache_io_metrics or options.collect_mooncake_io_metrics
+    )
+    if options.collect_flat_memory_io and (
+        options.collect_hicache_io or native_requested
+    ):
+        raise ValueError(
+            "--collect-flat-memory-io cannot be combined with native I/O collectors"
+        )
+    if options.collect_hicache_io and native_requested:
+        raise ValueError(
+            "--collect-hicache-io cannot be combined with native I/O window flags"
+        )
+    if options.collect_flat_memory_io and options.backend not in (
+        "sglang",
+        "sglang-native",
+        "sglang-oai",
+        "sglang-oai-chat",
+    ):
+        raise ValueError("--collect-flat-memory-io requires an SGLang backend")
+    if options.flat_memory_tp_size is not None and options.flat_memory_tp_size < 1:
+        raise ValueError("--flat-memory-tp-size must be positive")
 
 
 def set_global_args(args_: argparse.Namespace):
@@ -2484,6 +2423,20 @@ def run_benchmark(args_: argparse.Namespace):
 
     if not hasattr(args, "cache_report"):
         args.cache_report = False
+    for name, default in (
+        ("collect_flat_memory_io", False),
+        ("flat_memory_tp_size", None),
+        ("collect_hicache_io", False),
+        ("collect_hicache_io_metrics", False),
+        ("collect_mooncake_io_metrics", False),
+        ("mooncake_owner_metrics_url", None),
+        ("mooncake_master_host", None),
+        ("mooncake_metrics_port", 9003),
+        ("mooncake_client_host", "127.0.0.1"),
+        ("mooncake_client_metrics_port", 9301),
+    ):
+        vars(args).setdefault(name, default)
+    _validate_cache_io_options(args)
 
     if getattr(args, "print_requests", False):
         assert args.backend == "sglang-oai-chat"  # only support this now
@@ -2960,8 +2913,8 @@ def cli_main():
     parser.add_argument(
         "--cache-report",
         action="store_true",
-        help="Collect and display cache hit statistics after the benchmark. "
-        "Supported with sglang backends (native, oai, oai-chat).",
+        help="Request detailed cache metadata from SGLang backends (native, oai, oai-chat). "
+        "Runtime evidence selects the report mode independently of this flag.",
     )
     parser.add_argument("--seed", type=int, default=42, help="The random seed.")
     parser.add_argument(
@@ -3121,6 +3074,17 @@ def cli_main():
         type=int,
         default=1,
         help="Number of warmup requests to run before the benchmark",
+    )
+    parser.add_argument(
+        "--collect-flat-memory-io",
+        action="store_true",
+        help="Collect completed/durable Flat I/O only when runtime evidence identifies a Flat server; mutually exclusive with native I/O collectors.",
+    )
+    parser.add_argument(
+        "--flat-memory-tp-size",
+        type=int,
+        default=None,
+        help="Expected TP rank count for validating Flat I/O windows.",
     )
     parser.add_argument(
         "--collect-hicache-io",
@@ -3323,12 +3287,10 @@ def cli_main():
     )
     args = parser.parse_args()
     _validate_parsed_gsp_args(parser, args)
-    if args.collect_hicache_io and (
-        args.collect_hicache_io_metrics or args.collect_mooncake_io_metrics
-    ):
-        parser.error(
-            "--collect-hicache-io cannot be combined with native I/O window flags"
-        )
+    try:
+        _validate_cache_io_options(args)
+    except ValueError as exc:
+        parser.error(str(exc))
     if args.mooncake_owner_metrics_url and not args.collect_hicache_io:
         parser.error("--mooncake-owner-metrics-url requires --collect-hicache-io")
     run_benchmark(args)

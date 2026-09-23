@@ -3072,6 +3072,16 @@ class Scheduler(
                     cache_salt=req.cache_salt,
                 )
 
+    def _retry_deferred_storage_prefetch(self, req: Req):
+        if not self.enable_hicache_storage:
+            return
+        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+        if isinstance(self.tree_cache, UnifiedRadixCache) and (
+            self.tree_cache.pop_storage_prefetch_deferred(req.rid)
+        ):
+            self._prefetch_kvcache(req)
+
     def _retry_missed_storage_prefetches(self):
         """Re-issue the availability check for queued requests whose prefetch
         missed. Pacing counts scheduling passes so TP ranks re-issue on the
@@ -3760,6 +3770,7 @@ class Scheduler(
                     break
 
             if self.enable_hicache_storage:
+                self._retry_deferred_storage_prefetch(req)
                 prefetch_done = self.tree_cache.check_prefetch_progress(req.rid)
                 if not prefetch_done:
                     # skip staging requests that are ongoing prefetch
@@ -3856,6 +3867,14 @@ class Scheduler(
         can_run_list: List[Req] = adder.can_run_list
         if len(can_run_list) == 0:
             return None, running_batch
+
+        if self.enable_hicache_storage:
+            from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+            if isinstance(self.tree_cache, UnifiedRadixCache):
+                for req in can_run_list:
+                    self.tree_cache.pop_storage_prefetch_deferred(req.rid)
+                    self.tree_cache.release_prefetch_hold(req.rid)
 
         can_run_set = set(can_run_list)
         self.waiting_queue = [x for x in self.waiting_queue if x not in can_run_set]

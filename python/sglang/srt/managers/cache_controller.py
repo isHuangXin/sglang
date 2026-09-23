@@ -1813,6 +1813,16 @@ class HiCacheController:
                 )
             )
 
+    def _sync_prefetch_query_hit(self, operation, storage_hit_count: int) -> int:
+        """Resolve the common query prefix in ordered publication."""
+        storage_hit_count_tensor = torch.tensor(storage_hit_count, dtype=torch.int)
+        self._all_reduce(
+            storage_hit_count_tensor,
+            torch.distributed.ReduceOp.MIN,
+            self.prefetch_hits_sync_groups,
+        )
+        return int(storage_hit_count_tensor.item())
+
     def _publish_prefetch_query(self, operation, result):
         if isinstance(result, Exception):
             operation.error = str(result)
@@ -1821,13 +1831,7 @@ class HiCacheController:
             )
             result = ([], 0)
         hash_value, storage_hit_count = result
-        storage_hit_count_tensor = torch.tensor(storage_hit_count, dtype=torch.int)
-        self._all_reduce(
-            storage_hit_count_tensor,
-            torch.distributed.ReduceOp.MIN,
-            self.prefetch_hits_sync_groups,
-        )
-        storage_hit_count = int(storage_hit_count_tensor.item())
+        storage_hit_count = self._sync_prefetch_query_hit(operation, storage_hit_count)
         operation.hash_value = hash_value[: storage_hit_count // self.page_size]
         operation.storage_hit_count = storage_hit_count
         with self._prefetch_stats_lock:

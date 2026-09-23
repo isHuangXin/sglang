@@ -8,6 +8,7 @@ and the published instance stays as the launcher left it.
 
 import unittest
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 from sglang.srt.arg_groups.overrides import resolution_result
 from sglang.srt.managers.io_struct import (
@@ -15,6 +16,7 @@ from sglang.srt.managers.io_struct import (
     DetachHiCacheStorageReqInput,
 )
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.runtime_context import get_context, get_memory
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -40,6 +42,44 @@ class TestSchedulerHiCacheAttach(CustomTestCase):
             detach_storage_backend=lambda: (True, "detached"),
         )
         return scheduler
+
+    def test_pressure_retry_works_without_miss_retry_polling(self):
+        scheduler = self._scheduler(hicache_storage_prefetch_retry_poll_interval=0)
+        scheduler.enable_hicache_storage = True
+        cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+        cache._storage_prefetch_deferred_rids = {"r"}
+        scheduler.tree_cache = cache
+        scheduler._prefetch_kvcache = MagicMock()
+        req = SimpleNamespace(rid="r", storage_prefetch_retry_attempts=0)
+
+        scheduler._retry_deferred_storage_prefetch(req)
+        scheduler._retry_deferred_storage_prefetch(req)
+
+        scheduler._prefetch_kvcache.assert_called_once_with(req)
+        self.assertEqual(req.storage_prefetch_retry_attempts, 0)
+        self.assertEqual(get_memory().hicache_storage_prefetch_retry_poll_interval, 0)
+
+    def test_rejected_pressure_retry_does_not_spend_query_attempts(self):
+        scheduler = self._scheduler(hicache_storage_prefetch_retry_poll_interval=0)
+        scheduler.enable_hicache_storage = True
+        cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+        cache._storage_prefetch_deferred_rids = {"r"}
+        scheduler.tree_cache = cache
+        scheduler._prefetch_kvcache = MagicMock(
+            side_effect=lambda req: cache._storage_prefetch_deferred_rids.add(req.rid)
+        )
+        req = SimpleNamespace(rid="r", storage_prefetch_retry_attempts=2)
+
+        scheduler._retry_deferred_storage_prefetch(req)
+
+        self.assertTrue(cache.pop_storage_prefetch_deferred("r"))
+        self.assertEqual(req.storage_prefetch_retry_attempts, 2)
+
+    def test_no_pressure_retry_when_storage_is_disabled(self):
+        scheduler = self._scheduler()
+        scheduler._prefetch_kvcache = MagicMock()
+        scheduler._retry_deferred_storage_prefetch(SimpleNamespace(rid="r"))
+        scheduler._prefetch_kvcache.assert_not_called()
 
     def test_attach_reaches_the_namespace_readers(self):
         scheduler = self._scheduler(hicache_storage_backend=None)

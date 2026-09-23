@@ -645,11 +645,45 @@ class HybridCacheController(BaseHiCacheController):
 
         kv_hit_pages = hit_result.kv_hit_pages
         operation.pool_storage_result.update_kv_hit_pages(kv_hit_pages)
+        restorable = hit_result.restorable_prefix_pages
+        operation.pool_storage_result.restorable_prefix_pages = (
+            list(restorable) if restorable is not None else None
+        )
 
         return (
             hash_value[:kv_hit_pages],
             kv_hit_pages * self.page_size,
         )
+
+    def _sync_prefetch_query_hit(self, operation, storage_hit_count: int) -> int:
+        if not any(
+            transfer.hit_policy == PoolHitPolicy.TRAILING_PAGES
+            for transfer in operation.pool_transfers or []
+        ):
+            operation.pool_storage_result.restorable_prefix_pages = None
+            return super()._sync_prefetch_query_hit(operation, storage_hit_count)
+
+        # Sparse checkpoint sets need intersection; MIN of rank maxima is unsafe.
+        num_pages = len(operation.token_ids) // self.page_size
+        mask = torch.zeros(num_pages + 1, dtype=torch.int, device="cpu")
+        hit_pages = min(storage_hit_count // self.page_size, num_pages)
+        if operation.is_terminated():
+            hit_pages = 0
+        candidates = operation.pool_storage_result.restorable_prefix_pages
+        if candidates is None:
+            # A legacy backend proves only its reported trailing-state endpoint.
+            candidates = [hit_pages]
+        for pages in candidates:
+            if type(pages) is int and 0 < pages <= hit_pages:
+                mask[pages] = 1
+        self._all_reduce(
+            mask,
+            torch.distributed.ReduceOp.MIN,
+            self.prefetch_hits_sync_groups,
+        )
+        common = mask.nonzero(as_tuple=True)[0].tolist()
+        operation.pool_storage_result.restorable_prefix_pages = common
+        return common[-1] * self.page_size if common else 0
 
     def move_hybrid_indices(
         self, operation: CacheOperation

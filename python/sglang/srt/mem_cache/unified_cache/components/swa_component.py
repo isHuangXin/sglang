@@ -537,6 +537,9 @@ class SWAComponent(TreeComponent):
         new_parent.component_data[self.component_type].session_ref = (
             child.component_data[self.component_type].session_ref
         )
+        new_parent.component_data[self.component_type].host_lock_ref = (
+            child.component_data[self.component_type].host_lock_ref
+        )
         assert new_parent.component_data[self.component_type].session_ids is None
 
         child_swa_value = child.component_data[self.component_type].value
@@ -573,6 +576,10 @@ class SWAComponent(TreeComponent):
             child.component_data[self.component_type].metadata.get("uuid")
         )
         child.component_data[self.component_type].metadata.pop("uuid", None)
+        new_parent.component_data[self.component_type].metadata["host_uuid"] = (
+            child.component_data[self.component_type].metadata.get("host_uuid")
+        )
+        child.component_data[self.component_type].metadata.pop("host_uuid", None)
 
     def evict_component(
         self,
@@ -907,7 +914,10 @@ class SWAComponent(TreeComponent):
         host_indices = self.cache.host_pool_group.alloc(
             num_tokens,
             pool=PoolName.SWA,
-            reclaim=lambda size: self.cache.evict_host(size, ComponentType.SWA),
+            reclaim=lambda size: self.cache.evict_host(
+                max(0, size - self._swa_kv_pool_host.available_size()),
+                ComponentType.SWA,
+            ),
         )
         if host_indices is None:
             return PreparePrefetchResult(alloc_failed=True)

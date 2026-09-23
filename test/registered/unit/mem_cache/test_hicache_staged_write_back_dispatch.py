@@ -1,7 +1,9 @@
 """Unit tests for HiCache staged write-back host-pool dispatch."""
 
+import threading
 import unittest
 from contextlib import contextmanager
+from queue import Queue
 from types import SimpleNamespace
 from unittest import mock
 
@@ -13,9 +15,11 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
     PoolName,
     PoolTransfer,
+    PoolTransferResult,
 )
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
+    PrefetchOperation,
 )
 from sglang.srt.mem_cache.l2_transfer import L2Transfer, L2TransferEngine
 from sglang.srt.mem_cache.memory_pool_host import (
@@ -1048,6 +1052,151 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
 
         controller.move_indices.assert_called_once()
         self.assertEqual(captured["host_indices"].device.type, "cpu")
+
+
+class TestHybridPrefetchQueryEndpoints(CustomTestCase):
+    @staticmethod
+    def _controller_and_operation(*, trailing=True):
+        controller = HybridCacheController.__new__(HybridCacheController)
+        controller.page_size = 256
+        controller.prefetch_threshold = 256
+        controller.prefetch_hits_sync_groups = [object()]
+        controller._prefetch_stats_lock = threading.Lock()
+        controller.storage_prefetch_queries = 0
+        controller.storage_prefetch_hits = 0
+        controller.storage_prefetch_tokens_hit = 0
+        controller.prefetch_hit_queue = Queue()
+        transfers = [
+            PoolTransfer(name=PoolName.DEEPSEEK_V4_C4, indices_from_pool=PoolName.KV)
+        ]
+        if trailing:
+            transfers.append(
+                PoolTransfer(
+                    name=PoolName.SWA,
+                    host_indices=_indices(0, controller.page_size),
+                    hit_policy=PoolHitPolicy.TRAILING_PAGES,
+                )
+            )
+        operation = PrefetchOperation(
+            "query-endpoints",
+            list(range(8 * controller.page_size)),
+            pool_transfers=transfers,
+        )
+        return controller, operation
+
+    def _peer_reducer(self, controller, peer_endpoints):
+        def reduce(tensor, op, groups):
+            self.assertIs(op, torch.distributed.ReduceOp.MIN)
+            self.assertIs(groups, controller.prefetch_hits_sync_groups)
+            if tensor.ndim == 0:
+                peer_tokens = max(peer_endpoints, default=0) * controller.page_size
+                tensor.fill_(min(int(tensor.item()), peer_tokens))
+            else:
+                self.assertEqual(tuple(tensor.shape), (9,))
+                self.assertEqual(tensor.device.type, "cpu")
+                peer_mask = torch.zeros_like(tensor)
+                peer_mask[peer_endpoints] = 1
+                tensor.copy_(torch.minimum(tensor, peer_mask))
+
+        return mock.Mock(side_effect=reduce)
+
+    def test_query_keeps_restorable_endpoints_not_aux_read_completions(self):
+        """Existence metadata must survive until capacity limits choose a checkpoint."""
+        controller, operation = self._controller_and_operation()
+        hashes = [f"page-{index}" for index in range(8)]
+        result = PoolTransferResult(8, {PoolName.SWA: 1}, [4, 8])
+        controller.get_hash_str = mock.Mock(return_value=hashes)
+        controller.storage_backend = SimpleNamespace(
+            batch_exists_v2=mock.Mock(return_value=result)
+        )
+
+        self.assertEqual(controller._storage_hit_query(operation), (hashes, 2048))
+        self.assertEqual(operation.pool_storage_result.restorable_prefix_pages, [4, 8])
+        self.assertEqual(operation.pool_storage_result.extra_pool_hit_pages, {})
+
+    def test_sparse_checkpoints_are_intersected_not_minimum_of_maxima(self):
+        """Rank maxima 8 and 6 share only checkpoint 4, not checkpoint 6."""
+        controller, operation = self._controller_and_operation()
+        operation.pool_storage_result.restorable_prefix_pages = [4, 8]
+        controller._all_reduce = self._peer_reducer(controller, [4, 6])
+        hashes = [f"page-{index}" for index in range(8)]
+
+        controller._publish_prefetch_query(operation, (hashes, 2048))
+
+        self.assertEqual(operation.storage_hit_count, 1024)
+        self.assertEqual(operation.hash_value, hashes[:4])
+        self.assertEqual(operation.pool_storage_result.restorable_prefix_pages, [4])
+        self.assertEqual(controller.storage_prefetch_tokens_hit, 1024)
+        self.assertIs(controller.prefetch_hit_queue.get_nowait(), operation)
+        controller._all_reduce.assert_called_once()
+
+    def test_missing_and_empty_trailing_endpoint_metadata_are_distinct(self):
+        """Legacy hits validate only their endpoint; an explicit empty set is a miss."""
+        for endpoints, peer, expected in (
+            (None, [8], [8]),
+            (None, [6], []),
+            ([], [8], []),
+        ):
+            with self.subTest(endpoints=endpoints, peer=peer):
+                controller, operation = self._controller_and_operation()
+                operation.pool_storage_result.restorable_prefix_pages = endpoints
+                controller._all_reduce = self._peer_reducer(controller, peer)
+
+                controller._publish_prefetch_query(operation, (list(range(8)), 2048))
+
+                self.assertEqual(
+                    operation.pool_storage_result.restorable_prefix_pages, expected
+                )
+                self.assertEqual(
+                    operation.storage_hit_count,
+                    max(expected, default=0) * controller.page_size,
+                )
+                controller._all_reduce.assert_called_once()
+                self.assertEqual(
+                    tuple(controller._all_reduce.call_args.args[0].shape), (9,)
+                )
+
+    def test_failed_and_cancelled_queries_still_reduce_the_full_zero_mask(self):
+        """One failed rank must veto restore without skipping a query collective."""
+        for outcome in ("worker_error", "caught_error", "cancelled"):
+            with self.subTest(outcome=outcome):
+                controller, operation = self._controller_and_operation()
+                operation.pool_storage_result.restorable_prefix_pages = [4, 8]
+                controller._all_reduce = self._peer_reducer(controller, [4, 8])
+                result = (list(range(8)), 2048)
+                if outcome == "worker_error":
+                    result = RuntimeError("lookup failed")
+                elif outcome == "caught_error":
+                    result = ([], 0)
+                else:
+                    operation.mark_terminate()
+
+                controller._publish_prefetch_query(operation, result)
+
+                self.assertEqual(operation.storage_hit_count, 0)
+                self.assertEqual(operation.hash_value, [])
+                self.assertEqual(
+                    operation.pool_storage_result.restorable_prefix_pages, []
+                )
+                self.assertEqual(controller.storage_prefetch_queries, 1)
+                self.assertEqual(controller.storage_prefetch_hits, 0)
+                controller._all_reduce.assert_called_once()
+                mask = controller._all_reduce.call_args.args[0]
+                self.assertEqual(tuple(mask.shape), (9,))
+                self.assertEqual(mask.count_nonzero().item(), 0)
+
+    def test_all_pages_layout_retains_prefix_closed_scalar_reduction(self):
+        controller, operation = self._controller_and_operation(trailing=False)
+        operation.pool_storage_result.restorable_prefix_pages = [4, 8]
+        controller._all_reduce = self._peer_reducer(controller, [6])
+
+        controller._publish_prefetch_query(operation, (list(range(8)), 2048))
+
+        self.assertEqual(operation.storage_hit_count, 1536)
+        self.assertEqual(operation.hash_value, list(range(6)))
+        self.assertIsNone(operation.pool_storage_result.restorable_prefix_pages)
+        controller._all_reduce.assert_called_once()
+        self.assertEqual(controller._all_reduce.call_args.args[0].ndim, 0)
 
 
 if __name__ == "__main__":

@@ -435,6 +435,12 @@ class StorageAttachment:
                 logger.exception("Failed to release pending prefetch %s", req_id)
                 cache.ongoing_prefetch.pop(req_id, None)
 
+        for req_id in list(cache.completed_prefetch_holds):
+            try:
+                cache.release_prefetch_hold(req_id)
+            except Exception:
+                logger.exception("Failed to release completed prefetch %s", req_id)
+
         for ack_id in list(cache.ongoing_backup):
             node_id, lock_params = cache.ongoing_backup.pop(ack_id)
             try:

@@ -1,8 +1,14 @@
 import unittest
+from queue import Queue
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-from sglang.srt.mem_cache.hicache_storage import PoolName, SidecarPoolSpec
+import torch
+
+from sglang.srt.mem_cache.base_prefix_cache import IncLockRefResult
+from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer, SidecarPoolSpec
 from sglang.srt.mem_cache.hybrid_cache import hybrid_pool_assembler
+from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import PrefetchOperation
 from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
     _STRATEGIES,
     StackBuildResult,
@@ -18,7 +24,17 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
     register_stack_strategy,
 )
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
+from sglang.srt.mem_cache.unified_cache.components.full_component import FullComponent
+from sglang.srt.mem_cache.unified_cache.components.swa_component import SWAComponent
+from sglang.srt.mem_cache.unified_cache.storage_attachment import StorageAttachment
+from sglang.srt.mem_cache.unified_cache.unified_tree_core import (
+    UnifiedLRUList,
+    UnifiedTreeCore,
+    UnifiedTreeNode,
+)
+from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache, _OngoingPrefetch
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
@@ -228,6 +244,338 @@ class TestApplyStackResult(unittest.TestCase):
         kvcache.register_layer_transfer_counter.assert_called_once()
         params.req_to_token_pool.register_layer_transfer_counter.assert_not_called()
         cache.register_sidecar_pool.assert_not_called()
+
+
+class _PrefetchHostPool:
+    def __init__(self, available):
+        self.available = available
+        self.next_index = 0
+        self.allocated = set()
+        self.released = []
+
+    def available_size(self):
+        return self.available
+
+    def alloc(self, size):
+        if size > self.available:
+            return None
+        indices = torch.arange(self.next_index, self.next_index + size)
+        self.next_index += size
+        self.available -= size
+        self.allocated.update(indices.tolist())
+        return indices
+
+    def free(self, indices):
+        values = indices.tolist()
+        assert set(values) <= self.allocated, "Host slots released twice"
+        self.allocated.difference_update(values)
+        self.released.extend(values)
+        self.available += len(values)
+
+    def reclaim(self, size, *args):
+        self.available += size
+
+
+class TestNativePrefetchCapacity(CustomTestCase):
+    PAGE = 256
+
+    def _cache(self, free_pages=6):
+        cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+        cache.tree_core = SimpleNamespace(
+            page_size=self.PAGE,
+            enable_storage=True,
+            is_root=lambda node: node == 0,
+            has_swa_host_pool=False,
+            is_eagle=False,
+            prefetch_anchor_info=lambda node: (None, None),
+        )
+        cache.prefetch_threshold = self.PAGE
+        cache.host_memory_mode = "cache"
+        cache.buffer_pipeline = None
+        cache.linker = None
+        cache.tree_components = [FULL]
+        cache.components = {}
+        cache.ongoing_prefetch = {}
+        cache.completed_prefetch_holds = {}
+        cache.prefetch_loaded_tokens_by_reqid = {}
+        cache._storage_prefetch_missed_rids = set()
+        cache._storage_prefetch_deferred_rids = set()
+        cache._prefetch_outcome_stats = {
+            "attempts": 0,
+            "issued": 0,
+            "declined_too_short": 0,
+            "declined_rate_limited": 0,
+        }
+        cache._all_reduce = MagicMock()
+        cache.evict_host = MagicMock()
+        cache.inc_host_lock_ref = MagicMock(
+            return_value=SimpleNamespace(to_dec_params=lambda: None)
+        )
+        cache.dec_host_lock_ref = MagicMock()
+        cache._build_sidecar_transfers = MagicMock(return_value=[])
+        cache.cache_controller = SimpleNamespace(
+            mem_pool_host=_PrefetchHostPool(free_pages * self.PAGE),
+            prefetch_hit_queue=Queue(),
+            ack_prefetch_queue=Queue(),
+            ack_backup_queue=Queue(),
+            host_mem_release_queue=Queue(),
+            extra_host_mem_release_queues={},
+            prefetch_buffer=Queue(),
+            prefetch_tokens_occupied=0,
+            prefetch_capacity_limit=8 * self.PAGE,
+            prefetch_rate_limited=MagicMock(return_value=False),
+            append_host_mem_release=MagicMock(),
+            prefetch=MagicMock(return_value=SimpleNamespace()),
+        )
+        return cache
+
+    def _drain_hit(self, cache, endpoints):
+        operation = PrefetchOperation("r", [1024] * (8 * self.PAGE), None)
+        operation.hash_value = [f"page-{i}" for i in range(8)]
+        operation.storage_hit_count = 8 * self.PAGE
+        operation.pool_storage_result.restorable_prefix_pages = endpoints
+        aux = PoolTransfer(name=PoolName.SWA, host_indices=torch.arange(self.PAGE))
+        cache.ongoing_prefetch["r"] = _OngoingPrefetch(
+            0, operation.token_ids, None, operation, None, {SWA: [aux]}
+        )
+        cache.cache_controller.prefetch_tokens_occupied = 8 * self.PAGE
+        cache.cache_controller.prefetch_hit_queue.put(operation)
+        cache._drain_storage_control_queues_impl(1, 0, 0, 0, {}, False)
+        return operation, aux
+
+    def test_pressure_shrink_uses_a_restorable_endpoint(self):
+        """A six-page allocation must not target a checkpoint stored only at four/eight."""
+        cache = self._cache()
+        operation, _ = self._drain_hit(cache, [4, 8])
+        self.assertEqual(operation.storage_hit_count, 4 * self.PAGE)
+        self.assertEqual(len(operation.host_indices), 4 * self.PAGE)
+        self.assertEqual(operation.hash_value, [f"page-{i}" for i in range(4)])
+        self.assertIs(cache.cache_controller.prefetch_buffer.get_nowait(), operation)
+
+    def test_dense_prefix_still_uses_all_available_pages(self):
+        cache = self._cache()
+        operation, _ = self._drain_hit(cache, None)
+        self.assertEqual(operation.storage_hit_count, 6 * self.PAGE)
+
+    def test_no_fitting_checkpoint_releases_aux_without_a_read(self):
+        cache = self._cache()
+        _, aux = self._drain_hit(cache, [8])
+        controller = cache.cache_controller
+        self.assertTrue(controller.prefetch_buffer.empty())
+        self.assertNotIn("r", cache.ongoing_prefetch)
+        self.assertEqual(controller.prefetch_tokens_occupied, 0)
+        controller.append_host_mem_release.assert_called_once_with(extra_pools=[aux])
+        self.assertFalse(controller.mem_pool_host.allocated)
+
+    def test_rank_capacity_shrink_frees_provisional_surplus(self):
+        cache = self._cache(free_pages=8)
+        calls = []
+
+        def reduce_capacity(value, op):
+            calls.append(value.item())
+            if len(calls) == 1:
+                value.fill_(6 * self.PAGE)
+
+        cache._all_reduce.side_effect = reduce_capacity
+        operation, _ = self._drain_hit(cache, [4, 8])
+        self.assertEqual(operation.storage_hit_count, 4 * self.PAGE)
+        self.assertEqual(
+            len(cache.cache_controller.mem_pool_host.released), 4 * self.PAGE
+        )
+        self.assertEqual(
+            len(cache.cache_controller.mem_pool_host.allocated), 4 * self.PAGE
+        )
+
+    def test_full_reclaim_requests_only_missing_tokens(self):
+        cache = self._cache(free_pages=2)
+        cache.evict_host.side_effect = cache.cache_controller.mem_pool_host.reclaim
+        operation, _ = self._drain_hit(cache, [4, 8])
+        cache.evict_host.assert_called_once_with(6 * self.PAGE)
+        self.assertEqual(operation.storage_hit_count, 8 * self.PAGE)
+
+    def test_swa_reclaim_requests_only_missing_tokens(self):
+        cache = self._cache()
+        pool = _PrefetchHostPool(2 * self.PAGE)
+        component = SWAComponent.__new__(SWAComponent)
+        component.cache = cache
+        component._swa_kv_pool_host = pool
+        component.full_window_pages = 4
+        cache.evict_host.side_effect = pool.reclaim
+
+        def alloc(size, *, pool: PoolName, reclaim):
+            indices = component._swa_kv_pool_host.alloc(size)
+            if indices is None:
+                reclaim(size)
+                indices = component._swa_kv_pool_host.alloc(size)
+            return indices
+
+        cache.host_pool_group = SimpleNamespace(alloc=alloc)
+        result = component.prepare_prefetch(0, prefetch_tokens=8 * self.PAGE)
+        self.assertEqual(len(result.host_indices), 4 * self.PAGE)
+        cache.evict_host.assert_called_once_with(2 * self.PAGE, SWA)
+
+    def test_projected_budget_defers_before_any_host_allocation(self):
+        cache = self._cache()
+        cache.cache_controller.prefetch_tokens_occupied = 6 * self.PAGE
+        cache.prefetch_from_storage("r", 0, [1024] * (4 * self.PAGE))
+        cache.inc_host_lock_ref.assert_not_called()
+        cache._build_sidecar_transfers.assert_not_called()
+        cache.cache_controller.prefetch.assert_not_called()
+        self.assertTrue(cache.pop_storage_prefetch_deferred("r"))
+        self.assertFalse(cache.pop_storage_prefetch_deferred("r"))
+        self.assertFalse(cache.pop_storage_prefetch_miss("r"))
+
+    def test_oversized_query_preserves_input_and_demand_accounting(self):
+        cache = self._cache()
+        tokens = [1024] * (12 * self.PAGE)
+        cache.prefetch_from_storage(
+            "r", 0, tokens, matched_prefix_tokens=[1024] * (2 * self.PAGE)
+        )
+        call = cache.cache_controller.prefetch.call_args
+        self.assertEqual(len(call.args[1]), 8 * self.PAGE)
+        self.assertEqual(len(tokens), 12 * self.PAGE)
+        operation = cache.cache_controller.prefetch.return_value
+        self.assertEqual(operation.stats_requested_tokens, 12 * self.PAGE)
+        self.assertEqual(operation.stats_total_tokens, 14 * self.PAGE)
+        self.assertEqual(cache.cache_controller.prefetch_tokens_occupied, 8 * self.PAGE)
+
+    def _complete_prefetch(self, cache, *, matched_pages=0, overlap_pages=0):
+        tokens = [1024] * (4 * self.PAGE)
+        operation = PrefetchOperation("r", tokens, None)
+        operation.completed_tokens = len(tokens)
+        operation.hash_value = ["page"] * 4
+        operation.stats_requested_tokens = len(tokens)
+        operation.stats_total_tokens = len(tokens) + matched_pages * self.PAGE
+        indices = cache.cache_controller.mem_pool_host.alloc(len(tokens))
+        cache.ongoing_prefetch["r"] = _OngoingPrefetch(
+            0, tokens, indices, operation, None, {}
+        )
+        cache.cache_controller.prefetch_tokens_occupied += len(tokens)
+        root, leaf = UnifiedTreeNode((FULL,)), UnifiedTreeNode((FULL,))
+        leaf.parent = root
+        leaf.component_data[FULL].host_value = torch.arange(len(tokens))
+        cache.tree_core.root_node = root
+        cache.tree_core.is_write_back = False
+        cache.tree_core._update_evictable_leaf_sets = MagicMock()
+        cache.tree_core.insert_host = MagicMock(
+            return_value=SimpleNamespace(
+                cache_actions=[],
+                host_insert_dropped=False,
+                inserted_host_node=leaf.id,
+                prefix_len=overlap_pages * self.PAGE,
+            )
+        )
+        cache.tree_core.commit_hicache_transfers = MagicMock()
+        cache._apply_cache_actions = MagicMock()
+        cache._check_hybrid_prefetch_result = MagicMock(return_value=True)
+        cache.enable_storage_metrics = False
+        full = FullComponent.__new__(FullComponent)
+        full.tree_core = cache.tree_core
+
+        def acquire(node_id):
+            cache.tree_core.commit_hicache_transfers.assert_called_once()
+            return full.acquire_component_lock(leaf, IncLockRefResult(), lock_host=True)
+
+        def release(node_id, params):
+            if node_id == leaf.id:
+                full.release_component_lock(leaf, params, lock_host=True)
+
+        cache.inc_host_lock_ref.side_effect = acquire
+        cache.dec_host_lock_ref.side_effect = release
+        cache._handle_prefetch_result(operation)
+        return leaf
+
+    def test_completed_prefetch_survives_until_handoff(self):
+        """Popping hit statistics must not expose a queued prefix to eviction."""
+        for overlap in (0, 4):
+            with self.subTest(overlap=overlap):
+                cache = self._cache()
+                leaf = self._complete_prefetch(cache, overlap_pages=overlap)
+                self.assertTrue(cache.check_prefetch_progress("r"))
+                cache.pop_prefetch_loaded_tokens("r")
+                self.assertFalse(UnifiedTreeCore._is_host_leaf(cache.tree_core, leaf))
+                self.assertEqual(leaf.component_data[FULL].host_lock_ref, 1)
+                cache.prefetch_from_storage("r", 0, [1024] * self.PAGE)
+                cache.cache_controller.prefetch.assert_not_called()
+                allocated = set(cache.cache_controller.mem_pool_host.allocated)
+
+                cache.release_prefetch_hold("r")
+                cache.release_prefetch_hold("r")
+                self.assertTrue(UnifiedTreeCore._is_host_leaf(cache.tree_core, leaf))
+                self.assertEqual(cache.cache_controller.prefetch_tokens_occupied, 0)
+                self.assertEqual(
+                    cache.cache_controller.mem_pool_host.allocated, allocated
+                )
+
+    def test_completed_hold_charges_full_prefix_within_budget(self):
+        """A short fetched suffix must not undercharge the retained ancestor path."""
+        for capacity, retained in ((8, 6), (6, 0)):
+            with self.subTest(capacity=capacity):
+                cache = self._cache()
+                cc = cache.cache_controller
+                cc.prefetch_capacity_limit = capacity * self.PAGE
+                cc.prefetch_tokens_occupied = 2 * self.PAGE
+                leaf = self._complete_prefetch(cache, matched_pages=2)
+                self.assertEqual(
+                    cc.prefetch_tokens_occupied, (2 + retained) * self.PAGE
+                )
+                self.assertEqual(
+                    leaf.component_data[FULL].host_lock_ref, int(retained > 0)
+                )
+                cache.release_prefetch_hold("r")
+                self.assertEqual(cc.prefetch_tokens_occupied, 2 * self.PAGE)
+
+    def test_completed_hold_released_on_abort_or_detach(self):
+        """Completed reads are no longer in ongoing_prefetch when cleanup runs."""
+        for cleanup in ("abort", "detach"):
+            with self.subTest(cleanup=cleanup):
+                cache = self._cache()
+                leaf = self._complete_prefetch(cache)
+                self.assertFalse(cache.ongoing_prefetch)
+                if cleanup == "abort":
+                    cache.release_aborted_request("r")
+                else:
+                    cache.ongoing_backup = {}
+                    attachment = StorageAttachment.__new__(StorageAttachment)
+                    attachment._cache = cache
+                    attachment._release_pending_storage_ops()
+                self.assertFalse(cache.completed_prefetch_holds)
+                self.assertEqual(cache.cache_controller.prefetch_tokens_occupied, 0)
+                self.assertEqual(leaf.component_data[FULL].host_lock_ref, 0)
+
+    def test_swa_host_hold_survives_split_and_releases_both_halves(self):
+        """Splitting a held window must not expose its parent to host eviction."""
+        root, child, parent = (UnifiedTreeNode((SWA,)) for _ in range(3))
+        child.parent = root
+        child.key = list(range(8))
+        child.component_data[SWA].host_value = torch.arange(8)
+        lru = UnifiedLRUList(SWA, (SWA,), use_host_ptr=True)
+        lru.insert_mru(child)
+        component = SWAComponent.__new__(SWAComponent)
+        component.tree_core = SimpleNamespace(root_node=root, host_lru_lists={SWA: lru})
+        component.sliding_window_size = 6
+        params = component.acquire_component_lock(
+            child, IncLockRefResult(), lock_host=True
+        ).to_dec_params()
+
+        parent.key, child.key = child.key[:4], child.key[4:]
+        parent.parent, child.parent = root, parent
+        component.redistribute_on_node_split(parent, child)
+        self.assertIsNone(lru.get_lru_no_host_lock())
+        self.assertEqual(parent.component_data[SWA].host_lock_ref, 1)
+        self.assertEqual(child.component_data[SWA].host_lock_ref, 1)
+        component.release_component_lock(child, params, lock_host=True)
+        self.assertEqual(parent.component_data[SWA].host_lock_ref, 0)
+        self.assertEqual(child.component_data[SWA].host_lock_ref, 0)
+        self.assertIsNotNone(lru.get_lru_no_host_lock())
+
+    def test_storage_disabled_does_not_touch_host(self):
+        cache = self._cache()
+        cache.enable_storage = False
+        cache.prefetch_from_storage("r", 0, [1024] * (4 * self.PAGE))
+        cache.inc_host_lock_ref.assert_not_called()
+        cache.cache_controller.prefetch.assert_not_called()
+        cache.evict_host.assert_not_called()
 
 
 if __name__ == "__main__":

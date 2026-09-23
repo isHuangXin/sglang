@@ -239,6 +239,10 @@ class DecodeHiCacheTransferMixin:
         )
         dr.hicache_restored_node = restored_node
         self.tree_cache.inc_lock_ref(restored_node)
+        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+        if isinstance(self.tree_cache, UnifiedRadixCache):
+            self.tree_cache.release_prefetch_hold(dr.req.rid)
 
         if len(new_indices) == 0:
             # Whole prefix already on device; no DMA needed.

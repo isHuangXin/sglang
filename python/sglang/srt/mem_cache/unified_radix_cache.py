@@ -157,6 +157,12 @@ class _OngoingPrefetch(NamedTuple):
     comp_xfers: dict[ComponentType, list[PoolTransfer]]
 
 
+class _CompletedPrefetchHold(NamedTuple):
+    node_id: NodeId
+    host_lock_params: DecLockRefParams
+    reserved_tokens: int
+
+
 class UnifiedRadixCache(BasePrefixCache):
     slow_stage_logger: Optional[SlowStageLogger] = None
 
@@ -378,9 +384,11 @@ class UnifiedRadixCache(BasePrefixCache):
         self.enable_storage = False
         self.prefetch_loaded_tokens_by_reqid: dict[str, int] = {}
         self.ongoing_prefetch: dict[str, _OngoingPrefetch] = {}
+        self.completed_prefetch_holds: dict[str, _CompletedPrefetchHold] = {}
         # Rids whose storage prefetch resolved without a usable result;
         # popped by the scheduler to pace availability-check retries.
         self._storage_prefetch_missed_rids: set[str] = set()
+        self._storage_prefetch_deferred_rids: set[str] = set()
         self.ongoing_backup: dict[int, tuple[NodeId, DecLockRefParams]] = {}
         if self.buffer_pipeline is not None:
             self.buffer_pipeline.reset()
@@ -1827,6 +1835,14 @@ class UnifiedRadixCache(BasePrefixCache):
             cache_salt=cache_salt,
         ).page_aligned(self.page_size)
         prefetch_length = len(prefetch_key)
+        if (
+            req_id in self.ongoing_prefetch
+            or req_id in self.completed_prefetch_holds
+            or (buffer_mode and self.buffer_pipeline.has_staged(req_id))
+        ):
+            # A fetch (or an unconsumed hold) already exists for this rid;
+            # overwriting would leak its staging slots.
+            return
         stats = self._prefetch_outcome_stats
         if prefetch_length > 0:
             stats["attempts"] += 1
@@ -1837,16 +1853,20 @@ class UnifiedRadixCache(BasePrefixCache):
             # the device match evicts while queued; arm the paced retry.
             self._storage_prefetch_missed_rids.add(req_id)
             return
-        if not buffer_mode and self.cache_controller.prefetch_rate_limited():
-            stats["declined_rate_limited"] += 1
-            self._storage_prefetch_missed_rids.add(req_id)
-            return
-        if req_id in self.ongoing_prefetch or (
-            buffer_mode and self.buffer_pipeline.has_staged(req_id)
-        ):
-            # A fetch (or an unconsumed hold) already exists for this rid;
-            # overwriting would leak its staging slots.
-            return
+        if not buffer_mode:
+            cc = self.cache_controller
+            budget = int(cc.prefetch_capacity_limit) // self.page_size * self.page_size
+            if budget < self.prefetch_threshold:
+                stats["declined_rate_limited"] += 1
+                return
+            # Limit the storage query, never the request's model input.
+            if prefetch_length > budget:
+                prefetch_key = prefetch_key[:budget]
+            if cc.prefetch_tokens_occupied + len(prefetch_key) > budget:
+                stats["declined_rate_limited"] += 1
+                self._storage_prefetch_deferred_rids.add(req_id)
+                return
+            self._storage_prefetch_deferred_rids.discard(req_id)
 
         # Buffer mode holds no tree state during the fetch: buffers are
         # operation-owned, so the anchor needs no pin.
@@ -2077,19 +2097,39 @@ class UnifiedRadixCache(BasePrefixCache):
             )
             loaded_from_storage = completed_tokens - insert_result.prefix_len
 
+        self.cache_controller.prefetch_tokens_occupied -= len(prefetch_key)
+        retained_tokens = 0
+        hold_reason = "unavailable"
+        matched_tokens = operation.stats_total_tokens - operation.stats_requested_tokens
+        if (
+            not insert_result.host_insert_dropped
+            and insert_result.inserted_host_node is not None
+            and 0 < completed_tokens <= len(prefetch_key)
+            and len(prefetch_key) <= operation.stats_requested_tokens
+            and matched_tokens >= 0
+            and (matched_tokens > 0 or self.tree_core.is_root(last_host_node_id))
+        ):
+            retained_tokens = self._retain_completed_prefetch(
+                req_id=req_id,
+                node_id=insert_result.inserted_host_node,
+                reserved_tokens=matched_tokens + completed_tokens,
+            )
+            hold_reason = "held" if retained_tokens else "budget"
         self.dec_host_lock_ref(last_host_node_id, anchor_lock_params)
         del self.ongoing_prefetch[req_id]
-        self.cache_controller.prefetch_tokens_occupied -= len(prefetch_key)
 
         self.prefetch_loaded_tokens_by_reqid[req_id] = loaded_from_storage
         logger.info(
-            "HiCache prefetch %s req=%s completed=%d matched=%d loaded=%d occupied=%d",
+            "HiCache prefetch %s req=%s completed=%d matched=%d loaded=%d "
+            "occupied=%d held=%d hold_reason=%s",
             "dropped" if insert_result.host_insert_dropped else "success",
             req_id,
             completed_tokens,
             insert_result.prefix_len,
             loaded_from_storage,
             self.cache_controller.prefetch_tokens_occupied,
+            retained_tokens,
+            hold_reason,
         )
         if self.enable_storage_metrics and self.storage_metrics_collector is not None:
             self.storage_metrics_collector.log_prefetched_tokens(loaded_from_storage)
@@ -2176,16 +2216,50 @@ class UnifiedRadixCache(BasePrefixCache):
                 self._prefetch_occupied_span(prefetch_key, host_indices)
             )
             self.prefetch_loaded_tokens_by_reqid[req_id] = 0
+            failed_pools = {
+                transfer.name.value: {
+                    "expected_pages": (
+                        len(transfer.keys) if transfer.keys is not None else None
+                    ),
+                    "completed_pages": count,
+                }
+                for transfer, count in zip(pool_transfers, pool_hit_pages)
+                if transfer.keys is None or count != len(transfer.keys)
+            }
             logger.warning(
                 "HiCache hybrid prefetch discarded req=%s completed=%d requested=%d "
-                "kv_beliefs_kept_pages=%d",
+                "kv_beliefs_kept_pages=%d failed_pools=%s",
                 req_id,
                 completed_tokens,
                 expected_tokens,
                 keep_pages,
+                failed_pools,
             )
             return False
         return True
+
+    def _retain_completed_prefetch(
+        self, *, req_id: str, node_id: NodeId, reserved_tokens: int
+    ) -> int:
+        cc = self.cache_controller
+        budget = int(cc.prefetch_capacity_limit) // self.page_size * self.page_size
+        if cc.prefetch_tokens_occupied + reserved_tokens > budget:
+            return 0
+        assert req_id not in self.completed_prefetch_holds
+        # Pin after auxiliary commit, which may split the inserted endpoint.
+        lock_params = self.inc_host_lock_ref(node_id).to_dec_params()
+        self.completed_prefetch_holds[req_id] = _CompletedPrefetchHold(
+            node_id, lock_params, reserved_tokens
+        )
+        cc.prefetch_tokens_occupied += reserved_tokens
+        return reserved_tokens
+
+    def release_prefetch_hold(self, req_id: str) -> None:
+        hold = self.completed_prefetch_holds.pop(req_id, None)
+        if hold is None:
+            return
+        self.dec_host_lock_ref(hold.node_id, hold.host_lock_params)
+        self.cache_controller.prefetch_tokens_occupied -= hold.reserved_tokens
 
     def pop_prefetch_loaded_tokens(self, req_id: str) -> int:
         # The request is being scheduled; a still-unserved miss marker is moot.
@@ -2197,6 +2271,13 @@ class UnifiedRadixCache(BasePrefixCache):
         the scheduler uses it to arm the paced availability-check retry."""
         if req_id in self._storage_prefetch_missed_rids:
             self._storage_prefetch_missed_rids.discard(req_id)
+            return True
+        return False
+
+    def pop_storage_prefetch_deferred(self, req_id: str) -> bool:
+        """Consume a pressure-only retry marker, independent of miss retry pacing."""
+        if req_id in self._storage_prefetch_deferred_rids:
+            self._storage_prefetch_deferred_rids.discard(req_id)
             return True
         return False
 
@@ -2222,6 +2303,8 @@ class UnifiedRadixCache(BasePrefixCache):
             self.linker.release_request(rid)
         self.prefetch_loaded_tokens_by_reqid.pop(rid, None)
         self._storage_prefetch_missed_rids.discard(rid)
+        self._storage_prefetch_deferred_rids.discard(rid)
+        self.release_prefetch_hold(rid)
         if (
             self.buffer_pipeline is not None
             and self.buffer_pipeline.release_staged_hold(rid)
@@ -2346,6 +2429,72 @@ class UnifiedRadixCache(BasePrefixCache):
             - self._prefetch_occupied_span(prefetch_key, _host_indices),
         )
 
+    def _alloc_cache_prefetch(
+        self,
+        *,
+        hit_tokens: int,
+        restorable_prefix_pages: Optional[list[int]],
+        last_host_node_id: NodeId,
+    ) -> Optional[torch.Tensor]:
+        pool = self.cache_controller.mem_pool_host
+        host_indices = pool.alloc(hit_tokens)
+        if host_indices is None:
+            deficit = max(0, hit_tokens - pool.available_size())
+            if deficit:
+                self.evict_host(deficit)
+            host_indices = pool.alloc(hit_tokens)
+
+        capacity = (
+            len(host_indices)
+            if host_indices is not None
+            else min(
+                hit_tokens, pool.available_size() // self.page_size * self.page_size
+            )
+        )
+        # Allocation runs on the scheduler's groups, not the query/IO publishers'.
+        capacity_tensor = torch.tensor(capacity, dtype=torch.int, device="cpu")
+        self._all_reduce(capacity_tensor, torch.distributed.ReduceOp.MIN)
+        alloc_len = int(capacity_tensor.item())
+        if restorable_prefix_pages is not None:
+            alloc_len = max(
+                (
+                    pages * self.page_size
+                    for pages in restorable_prefix_pages
+                    if 0 < pages * self.page_size <= alloc_len
+                ),
+                default=0,
+            )
+        minimum = self.prefetch_threshold
+        if (
+            ComponentType.SWA in self.tree_components
+            and self.tree_core.has_swa_host_pool
+            and not self.tree_core.is_root(last_host_node_id)
+        ):
+            minimum = max(
+                minimum,
+                self.components[ComponentType.SWA].full_window_pages * self.page_size,
+            )
+        if alloc_len < minimum:
+            if host_indices is not None:
+                pool.free(host_indices)
+            return None
+
+        if host_indices is None:
+            host_indices = pool.alloc(alloc_len)
+        else:
+            if len(host_indices) > alloc_len:
+                pool.free(host_indices[alloc_len:])
+            host_indices = host_indices[:alloc_len]
+        allocated = torch.tensor(
+            host_indices is not None, dtype=torch.int, device="cpu"
+        )
+        self._all_reduce(allocated, torch.distributed.ReduceOp.MIN)
+        if not allocated.item():
+            if host_indices is not None:
+                pool.free(host_indices)
+            return None
+        return host_indices
+
     def _drain_storage_control_queues_impl(
         self,
         n_storage_hit: Optional[int],
@@ -2416,25 +2565,23 @@ class UnifiedRadixCache(BasePrefixCache):
                     self.revoke_pending_prefetch(req_id)
                     return True
             alloc_len = operation.storage_hit_count
-            host_indices = cc.mem_pool_host.alloc(alloc_len)
-            if host_indices is None:
-                self.evict_host(alloc_len)
+            if buffer_mode:
                 host_indices = cc.mem_pool_host.alloc(alloc_len)
-            if host_indices is None and not buffer_mode:
-                # Memory-pressure fallback: a shorter page-aligned prefix.
-                # (Cache mode only — buffer mode parks for the full hit.)
-                available_size = cc.mem_pool_host.available_size()
-                alloc_len = min(
-                    operation.storage_hit_count,
-                    available_size - (available_size % self.page_size),
-                )
-                if alloc_len >= self.prefetch_threshold:
+                if host_indices is None:
+                    self.evict_host(alloc_len)
                     host_indices = cc.mem_pool_host.alloc(alloc_len)
-            if host_indices is None:
-                if buffer_mode:
+                if host_indices is None:
                     return False
-                self.revoke_pending_prefetch(req_id)
-                return True
+            else:
+                host_indices = self._alloc_cache_prefetch(
+                    hit_tokens=alloc_len,
+                    restorable_prefix_pages=operation.pool_storage_result.restorable_prefix_pages,
+                    last_host_node_id=info.anchor_node_id,
+                )
+                if host_indices is None:
+                    self.revoke_pending_prefetch(req_id)
+                    return True
+                alloc_len = len(host_indices)
 
             operation.storage_hit_count = alloc_len
             operation.hash_value = operation.hash_value[: alloc_len // self.page_size]

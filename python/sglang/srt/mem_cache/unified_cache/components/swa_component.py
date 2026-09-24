@@ -799,6 +799,8 @@ class SWAComponent(TreeComponent):
                 comp.host_lock_ref = ref - 1
             else:
                 comp.lock_ref = ref - 1
+                if ref == 1:
+                    self.tree_core._update_evictable_leaf_sets(cur)
             if swa_uuid_for_lock and comp.metadata.get(uuid_key) == swa_uuid_for_lock:
                 dec_swa = False
             cur = cur.parent

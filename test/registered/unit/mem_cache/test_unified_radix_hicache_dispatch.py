@@ -15,6 +15,7 @@ from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     EvictParams,
     IncLockRefResult,
+    InsertParams,
     MatchPrefixParams,
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
@@ -606,7 +607,7 @@ class TestNativePrefetchCapacity(CustomTestCase):
 
 
 class TestTieredGDSSWAFrontier(CustomTestCase):
-    def _fixture(self):
+    def _cache(self):
         pool = SWAKVPool(
             size=64,
             size_swa=64,
@@ -644,6 +645,12 @@ class TestTieredGDSSWAFrontier(CustomTestCase):
                     tree_components=(FULL, SWA),
                 )
             )
+        return cache
+
+    def _fixture(self):
+        cache = self._cache()
+        rows = cache.req_to_token_pool
+        allocator = cache.token_to_kv_pool_allocator
         req = Req("gds", "", array("q", range(29)), SamplingParams(max_new_tokens=1))
         req.init_next_round_input(cache)
         rows.alloc([req])
@@ -745,6 +752,74 @@ class TestTieredGDSSWAFrontier(CustomTestCase):
         self.assertFalse(runtime.pending)
         self.assertFalse(runtime.completed_holds)
         self.assertEqual(runtime.controller.prefetch_tokens_occupied, 0)
+
+    def test_host_anchor_unlock_restores_device_eviction(self):
+        """Releasing a Host-only anchor must make its device ancestor reclaimable."""
+        cache = self._cache()
+        allocator = cache.token_to_kv_pool_allocator
+        slots = allocator.alloc(8)
+        self.assertIsNotNone(slots)
+        for end in (4, 8):
+            cache.insert(
+                InsertParams(
+                    key=RadixKey(array("q", range(end))),
+                    value=slots[:end],
+                    prev_prefix_len=end - 4,
+                )
+            )
+        match = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", range(8))))
+        )
+        core = cache.tree_core
+        anchor = core.node_by_id(match.last_device_node)
+        parent = anchor.parent
+        for node in (parent, anchor):
+            core.commit_backup(
+                node.id,
+                host_indices=node.component_data[FULL].value,
+                comp_xfers={
+                    SWA: [
+                        PoolTransfer(
+                            name=PoolName.SWA,
+                            host_indices=node.component_data[SWA].value,
+                        )
+                    ]
+                },
+            )
+        cache.evict(EvictParams(num_tokens=4))
+        self.assertTrue(anchor.evicted)
+        self.assertTrue(anchor.backuped)
+        self.assertIn(parent, core.evictable_device_leaves)
+        self.assertEqual(allocator.full_available_size(), 60)
+        self.assertEqual(allocator.swa_available_size(), 60)
+
+        locks = [cache.inc_lock_ref(anchor.id).to_dec_params() for _ in range(2)]
+        for remaining, lock in zip((1, 0), locks):
+            cache.dec_lock_ref(anchor.id, lock)
+            for ct in (FULL, SWA):
+                self.assertEqual(parent.component_data[ct].lock_ref, remaining)
+                self.assertEqual(anchor.component_data[ct].lock_ref, 0)
+                self.assertEqual(
+                    core.component_evictable_size_[ct], 0 if remaining else 4
+                )
+                self.assertEqual(
+                    core.component_protected_size_[ct], 4 if remaining else 0
+                )
+            if remaining:
+                self.assertNotIn(parent, core.evictable_device_leaves)
+                result = cache.evict_for_alloc(EvictParams(num_tokens=4))
+                self.assertEqual(result.num_tokens_evicted, 0)
+                self.assertEqual(allocator.full_available_size(), 60)
+
+        self.assertEqual(core.evictable_device_leaves, {parent})
+        result = cache.evict_for_alloc(EvictParams(num_tokens=4))
+        self.assertEqual(result.num_tokens_evicted, 4)
+        self.assertEqual(allocator.full_available_size(), 64)
+        self.assertEqual(allocator.swa_available_size(), 64)
+        self.assertFalse(core.evictable_device_leaves)
+        for ct in (FULL, SWA):
+            self.assertEqual(core.component_evictable_size_[ct], 0)
+            self.assertEqual(core.component_protected_size_[ct], 0)
 
     def test_duplicate_restore_then_shorter_chunk_recovers_swa(self):
         """A farther duplicate restore must not mark the next computed chunk dead."""

@@ -3082,7 +3082,9 @@ class Scheduler(
         ):
             self._prefetch_kvcache(req)
 
-    def _retry_missed_storage_prefetches(self):
+    def _retry_missed_storage_prefetches(
+        self, *, skip_rids: frozenset[str] = frozenset()
+    ):
         """Re-issue the availability check for queued requests whose prefetch
         missed. Pacing counts scheduling passes so TP ranks re-issue on the
         same pass; a sweep (the admission loop stops at the first
@@ -3092,6 +3094,8 @@ class Scheduler(
             return
         max_attempts = get_memory().hicache_storage_prefetch_retry_max_attempts
         for req in self.waiting_queue:
+            if req.rid in skip_rids:
+                continue
             if self.tree_cache.pop_storage_prefetch_miss(req.rid):
                 req.storage_prefetch_retry_pending = True
                 req.storage_prefetch_retry_wait_polls = 0
@@ -3112,13 +3116,22 @@ class Scheduler(
             )
             self._prefetch_kvcache(req)
 
-    def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
+    def _add_request_to_queue(
+        self,
+        req: Req,
+        is_retracted: bool = False,
+        *,
+        defer_storage_prefetch: bool = False,
+    ):
         if not self._set_or_validate_priority(req):
             return
         if self.disaggregation_mode == DisaggregationMode.NULL:
             if self._abort_on_queued_limit(req):
                 return
-            self._prefetch_kvcache(req)
+            if defer_storage_prefetch:
+                self.tree_cache.defer_storage_prefetch(req.rid)
+            else:
+                self._prefetch_kvcache(req)
             self.waiting_queue.append(req)
             req.time_stats.set_wait_queue_entry_time()
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
@@ -3630,13 +3643,37 @@ class Scheduler(
         prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor],
         running_batch: ScheduleBatch,
     ) -> Tuple[Optional[ScheduleBatch], ScheduleBatch]:
+        tiered_gds_prefetch = False
+        if self.enable_hicache_storage:
+            from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+            tiered_gds_prefetch = (
+                isinstance(self.tree_cache, UnifiedRadixCache)
+                and self.tree_cache.tiered_runtime is not None
+            )
+        deferred_prefetch_rids = (
+            frozenset(
+                req.rid
+                for req in self.waiting_queue
+                if self.tree_cache.pop_storage_prefetch_deferred(req.rid)
+            )
+            if tiered_gds_prefetch
+            else frozenset()
+        )
+
         # Check if the grammar is ready in the grammar queue
         if self.grammar_manager.has_waiting_grammars():
             ready_grammar_requests = self.grammar_manager.get_ready_grammar_requests()
             for req in ready_grammar_requests:
                 self._add_request_to_queue(req)
 
-        if self.enable_hierarchical_cache or get_memory().enable_flexkv:
+        if tiered_gds_prefetch:
+            for req in self.waiting_queue:
+                if req.rid in deferred_prefetch_rids:
+                    self._prefetch_kvcache(req)
+            self._retry_missed_storage_prefetches(skip_rids=deferred_prefetch_rids)
+            self.tree_cache.check_hicache_events()
+        elif self.enable_hierarchical_cache or get_memory().enable_flexkv:
             self.tree_cache.check_hicache_events()
             if self.enable_hicache_storage:
                 self._retry_missed_storage_prefetches()
@@ -3770,8 +3807,11 @@ class Scheduler(
                     break
 
             if self.enable_hicache_storage:
-                self._retry_deferred_storage_prefetch(req)
-                prefetch_done = self.tree_cache.check_prefetch_progress(req.rid)
+                if tiered_gds_prefetch:
+                    prefetch_done = req.rid not in self.tree_cache.tiered_prefetch
+                else:
+                    self._retry_deferred_storage_prefetch(req)
+                    prefetch_done = self.tree_cache.check_prefetch_progress(req.rid)
                 if not prefetch_done:
                     # skip staging requests that are ongoing prefetch
                     continue
@@ -3880,7 +3920,10 @@ class Scheduler(
         self.waiting_queue = [x for x in self.waiting_queue if x not in can_run_set]
         if adder.preempt_list:
             for req in adder.preempt_list:
-                self._add_request_to_queue(req)
+                if tiered_gds_prefetch:
+                    self._add_request_to_queue(req, defer_storage_prefetch=True)
+                else:
+                    self._add_request_to_queue(req)
 
         if adder.new_chunked_req is not None:
             # Update chunked prefill

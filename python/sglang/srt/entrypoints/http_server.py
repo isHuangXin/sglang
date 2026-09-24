@@ -874,7 +874,7 @@ async def flat_memory_io_window(obj: FlatMemoryIOWindowReq):
 
 @app.post("/mooncake/gds_io_window")
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
-async def mooncake_gds_io_window(obj: MooncakeGDSIOWindowReq):
+async def mooncake_gds_io_window(obj: Annotated[MooncakeGDSIOWindowReq, Body()]):
     try:
         validate_gds_window_request(obj.action, obj.window_id)
     except ValueError as exc:

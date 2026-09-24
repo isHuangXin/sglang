@@ -92,6 +92,12 @@ class _TieredPrefetch(msgspec.Struct, kw_only=True):
     swa_tokens: int = 0
 
 
+class _CompletedGPUHold(msgspec.Struct, frozen=True):
+    node_id: Any
+    lock_params: Any
+    reserved_tokens: int
+
+
 class TieredMooncakeRuntime:
     def __init__(self, *, cache: UnifiedRadixCache):
         # This leaf needs live tree/allocator state; it never becomes cache.linker.
@@ -101,6 +107,7 @@ class TieredMooncakeRuntime:
         self.payload = self.controller.tiered_payload
         self.loads = UnifiedCacheLinkerWrapper(cache, None, configure_tree=False)
         self.pending: dict[str, _TieredPrefetch] = {}
+        self.completed_holds: dict[str, _CompletedGPUHold] = {}
         self.sources: dict[str, list[tuple[int, int, int]]] = {}
         self.loaded: dict[str, int] = {}
         self.latencies: dict[str, tuple[float, int]] = {}
@@ -138,6 +145,7 @@ class TieredMooncakeRuntime:
         if (
             self.closed
             or req.rid in self.pending
+            or req.rid in self.completed_holds
             or req.session is not None
             or req.input_embeds is not None
             or req.positional_embed_overrides is not None
@@ -154,8 +162,17 @@ class TieredMooncakeRuntime:
         prefix_len = self._prefix_length(self.cache.resolve_node_handle(anchor))
         if prefix_len != len(req.prefix_indices) + req.host_hit_length:
             return
-        if len(key) - prefix_len < self.cache.prefetch_threshold:
+        budget = self.controller.prefetch_capacity_limit // page * page
+        if budget < self.cache.prefetch_threshold:
             return
+        key = key[: prefix_len + budget]
+        suffix_tokens = len(key) - prefix_len
+        if suffix_tokens < self.cache.prefetch_threshold:
+            return
+        if self.controller.prefetch_tokens_occupied + suffix_tokens > budget:
+            self.cache._storage_prefetch_deferred_rids.add(req.rid)
+            return
+        self.cache._storage_prefetch_deferred_rids.discard(req.rid)
         hashes = get_hash_str(key, page_size=page)[prefix_len // page :]
         transfers = [
             component.build_external_linker_transfer(
@@ -184,9 +201,13 @@ class TieredMooncakeRuntime:
         key = RadixKey(tokens, extra_key=extra_key, cache_salt=salt).page_aligned(
             self.cache.page_size
         )
-        if len(key) < self.cache.prefetch_threshold:
+        page = self.cache.page_size
+        budget = self.controller.prefetch_capacity_limit // page * page
+        key = key[:budget]
+        if (len(key) < self.cache.prefetch_threshold
+                or self.controller.prefetch_tokens_occupied >= budget):
             return 0
-        hashes = get_hash_str(key, last_hash, page_size=self.cache.page_size)
+        hashes = get_hash_str(key, last_hash, page_size=page)
         transfers = [
             component.build_external_linker_transfer(
                 LinkerTransferPhase.LOOKUP, None, hashes
@@ -339,7 +360,7 @@ class TieredMooncakeRuntime:
         page = self.cache.page_size
         host_needed = max(0, op.prefix_len - len(op.req.prefix_indices))
         budget = min(
-            self.controller.prefetch_capacity_limit,
+            self.controller.prefetch_capacity_limit - self.controller.prefetch_tokens_occupied,
             self.cache._component_available_size(ComponentType.FULL)
             + self.cache.full_evictable_size()
             - host_needed
@@ -350,6 +371,8 @@ class TieredMooncakeRuntime:
             n for n in boundaries if self.cache.prefetch_threshold <= n * page <= budget
         ]
         if not candidates:
+            if boundaries:
+                self.cache._storage_prefetch_deferred_rids.add(rid)
             self._discard(rid, op)
             return
         pages = max(candidates)
@@ -444,26 +467,41 @@ class TieredMooncakeRuntime:
         self.sources.setdefault(rid, []).extend(
             (pos, pos + page, mask) for pos, mask in sorted(adopted_media.items())
         )
-        op.req.kv.swa_evicted_seqlen = max(
-            op.req.kv.swa_evicted_seqlen, op.prepared.req.kv.swa_evicted_seqlen
-        )
         self.loaded[rid] = self.loaded.get(rid, 0) + loaded
         latency = (time.monotonic() - op.started) * 1000
         self.latencies[rid] = (latency, loaded)
         if self.cache.enable_storage_metrics:
             self.cache.storage_metrics_collector.log_prefetched_tokens(loaded)
             self.cache.storage_metrics_collector.log_prefetch_latency_ms(latency)
+        held_tokens = self._hold_completed(rid, op, node_id)
+        self._release(rid, op, retained_tokens=held_tokens)
         logger.info(
             "MOONCAKE_GDS_PREFETCH req=%s completed_tokens=%d inserted_tokens=%d "
-            "ssd_tokens=%d dram_tokens=%d latency_ms=%.3f",
+            "ssd_tokens=%d dram_tokens=%d latency_ms=%.3f held_tokens=%d",
             rid,
             op.full_tokens,
             loaded,
             sum(mask in (2, 3) for mask in adopted_media.values()) * page,
             sum(mask == 1 for mask in adopted_media.values()) * page,
             latency,
+            held_tokens,
         )
-        self._release(rid, op)
+
+    def _hold_completed(self, rid, op, node_id):
+        reserved = self._prefix_length(self.cache.resolve_node_handle(node_id))
+        remaining = self.controller.prefetch_tokens_occupied - op.full_tokens
+        if reserved <= 0 or remaining + reserved > self.controller.prefetch_capacity_limit:
+            return 0
+        assert rid not in self.completed_holds
+        lock = self.cache.inc_lock_ref(node_id).to_dec_params()
+        self.completed_holds[rid] = _CompletedGPUHold(node_id, lock, reserved)
+        return reserved
+
+    def release_hold(self, rid):
+        hold = self.completed_holds.pop(rid, None)
+        if hold is not None:
+            self.cache.dec_lock_ref(hold.node_id, hold.lock_params)
+            self.controller.prefetch_tokens_occupied -= hold.reserved_tokens
 
     def _discard(self, rid, op):
         if op.prepared is not None:
@@ -478,13 +516,15 @@ class TieredMooncakeRuntime:
             self.latencies[rid] = ((time.monotonic() - op.started) * 1000, 0)
         self._release(rid, op)
 
-    def _release(self, rid, op):
-        self.controller.prefetch_tokens_occupied -= op.full_tokens
+    def _release(self, rid, op, *, retained_tokens=0):
+        self.controller.prefetch_tokens_occupied += retained_tokens - op.full_tokens
         self.cache.dec_lock_ref(op.anchor, op.device_lock)
         self.cache.dec_host_lock_ref(op.anchor, op.host_lock)
         del self.pending[rid]
 
     def cancel(self, rid):
+        self.release_hold(rid)
+        self.cache._storage_prefetch_deferred_rids.discard(rid)
         op = self.pending.get(rid)
         if op is not None:
             op.cancelled = True
@@ -517,6 +557,8 @@ class TieredMooncakeRuntime:
             )
         for rid, op in list(self.pending.items()):
             self._discard(rid, op)
+        for rid in list(self.completed_holds):
+            self.release_hold(rid)
         self.sources.clear()
         self.loaded.clear()
         self.latencies.clear()

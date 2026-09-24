@@ -26,6 +26,8 @@ from sglang.benchmark.flat_memory_report import (
     project_cache_reports,
     resolve_metrics_mode,
 )
+from sglang.benchmark.native_io_metrics import sanitize_server_info
+from sglang.benchmark.tiered_cache_metrics import consume_tiered_cache_metadata, summarize_tiered_cache
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -70,12 +72,16 @@ def _serving_namespace():
         warnings=warnings,
         requests=requests,
         consume_native_usage=flat_metrics.consume_native_usage,
+        consume_tiered_cache_metadata=consume_tiered_cache_metadata,
+        summarize_tiered_cache=summarize_tiered_cache,
+        sanitize_server_info=sanitize_server_info,
         summarize_cache_usage=flat_metrics.summarize_cache_usage,
         summarize_flat_cache=flat_metrics.summarize_flat_cache,
         project_cache_reports=project_cache_reports,
         format_cache_reports=format_cache_reports,
         resolve_metrics_mode=resolve_metrics_mode,
         FlatMemoryIOWindow=flat_metrics.FlatMemoryIOWindow,
+        FLAT_DETAIL_FIELDS=flat_metrics.FLAT_DETAIL_FIELDS,
         get_auth_headers=lambda: {},
         get_request_headers=lambda: {},
         remove_prefix=lambda value, prefix: value.removeprefix(prefix),
@@ -216,6 +222,73 @@ class TestServingCacheReports(CustomTestCase):
                     )
         self.assertIsNone(ns["RequestFuncOutput"]().cached_tokens)
 
+    def test_tiered_summary_with_successful_and_failed_requests(self):
+        """Tiered summaries must survive numeric counters and exclude failed requests."""
+        output_type = _serving_namespace()["RequestFuncOutput"]
+        output = output_type(success=True)
+        meta = {
+            "prompt_tokens": 1024,
+            "cached_tokens": 768,
+            "cached_tokens_details": {
+                "device": 256,
+                "host": 128,
+                "storage": 384,
+                "cache_source_mode": "mooncake_tiered_gds",
+                "tiered_cache": {
+                    "device": 256,
+                    "host": 256,
+                    "l2_host": 128,
+                    "mooncake_dram": 128,
+                    "ssd": 256,
+                    "mixed": 128,
+                },
+            },
+        }
+        flat_metrics.consume_native_usage(output, meta)
+        consume_tiered_cache_metadata(output, meta)
+        outputs = [output, output_type(success=False, error="Connection refused")]
+        summary = summarize_tiered_cache(outputs)
+        self.assertEqual(summary["tiered_cache_status"], "ok")
+        self.assertEqual(summary["total_prompt_tokens"], 1024)
+        self.assertEqual(summary["total_cached_tokens"], 768)
+        self.assertEqual(summary["cache_hit_rate"], 0.75)
+        for tier in ("device", "host", "storage"):
+            self.assertEqual(summary[f"{tier}_hit_rate_pct"], 25.0)
+        self.assertEqual(summary["tiered_cached_tokens_mixed"], 128)
+
+        output.server_cached_tokens = None
+        summary = summarize_tiered_cache(outputs)
+        self.assertEqual(summary["tiered_cache_status"], "unavailable")
+        self.assertIsNone(summary["total_cached_tokens"])
+        self.assertIsNone(summary["cache_hit_rate"])
+
+    def test_legacy_metrics_parse_without_suppressing_valid_counters(self):
+        """Valid legacy metrics must not disappear behind an import-error warning."""
+        response = Mock(
+            text='master_successful_evictions_total 3\n'
+            'sglang:prefetch_bandwidth_sum{tp_rank="0"} 4\n'
+            'sglang:prefetch_bandwidth_sum{tp_rank="1"} 6\n'
+        )
+        patterns = {
+            "evictions": "master_successful_evictions_total",
+            "prefetch_sum": "sglang:prefetch_bandwidth_sum",
+        }
+        with patch.object(
+            flat_metrics.requests, "get", return_value=response
+        ), warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            self.assertEqual(
+                flat_metrics.fetch_legacy_metrics("server", 9006, patterns),
+                {"evictions": 3.0, "prefetch_sum": 10.0},
+            )
+            self.assertEqual(caught, [])
+            for value in ("NaN", "+Inf", "-1"):
+                with self.subTest(value=value):
+                    response.text = f"master_successful_evictions_total {value}\n"
+                    self.assertEqual(
+                        flat_metrics.fetch_legacy_metrics("server", 9006, patterns), {}
+                    )
+
     def _benchmark(self, *, mode, cache_report=False, request_error=False):
         ns = _serving_namespace()
         ns["args"] = _options(cache_report=cache_report)
@@ -234,8 +307,15 @@ class TestServingCacheReports(CustomTestCase):
             before=None,
             host_metrics={},
             storage_metrics={},
+            collect_host=False,
+            collect_mooncake=False,
+            host_result={},
+            mooncake_result={},
+            gds_result={},
         )
-        ns["NativeIOMeasurement"] = Mock(return_value=native)
+        native.__aenter__ = AsyncMock(return_value=native)
+        native.__aexit__ = AsyncMock(return_value=False)
+        ns["NativeIOWindow"] = Mock(return_value=native)
         hicache = MagicMock(enabled=False)
         hicache.__aenter__ = AsyncMock(return_value=hicache)
         hicache.__aexit__ = AsyncMock(return_value=False)

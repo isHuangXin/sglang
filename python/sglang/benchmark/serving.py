@@ -152,7 +152,7 @@ class RequestFuncOutput:
     error: str = ""
     output_len: int = 0
     start_time: float = 0.0
-    cached_tokens: int = 0
+    cached_tokens: Optional[int] = None
     cached_tokens_details: Optional[Dict[str, Any]] = None
     spec_accept_length: float = 0.0
     spec_cap_length: float = 0.0
@@ -313,16 +313,18 @@ async def async_request_trt_llm(
 
 
 def _extract_cache_from_sglext(data, output):
-    """Extract cache hit details from sglext in OAI-compatible responses."""
-    sglext = data.get("sglext") or {}
-    details = sglext.get("cached_tokens_details")
-    if details:
-        output.cached_tokens = (
-            (details.get("device") or 0)
-            + (details.get("host") or 0)
-            + (details.get("storage") or 0)
-        )
-        output.cached_tokens_details = details
+    """Capture cumulative usage, including OAI metadata-only chunks."""
+    usage = data.get("usage") or {}
+    meta = dict(usage)
+    prompt_details = usage.get("prompt_tokens_details") or {}
+    if "cached_tokens" not in meta and "cached_tokens" in prompt_details:
+        meta["cached_tokens"] = prompt_details["cached_tokens"]
+    for choice in data.get("choices") or []:
+        meta.update(choice.get("meta_info") or {})
+    meta.update(data.get("meta_info") or {})
+    meta.update(data.get("sglext") or {})
+    consume_native_usage(output, meta)
+    consume_tiered_cache_metadata(output, meta)
 
 
 # set ignore_eos True by default
@@ -360,6 +362,11 @@ async def async_request_openai_completions(
 
         # Merge in extra parameters - these will override defaults if present
         payload.update(request_func_input.extra_request_body)
+        if "sglang" in args.backend and payload["stream"]:
+            payload["stream_options"] = {
+                "include_usage": True,
+                **(payload.get("stream_options") or {}),
+            }
 
         # hack to accommodate different LoRA conventions between SGLang and vLLM.
         if request_func_input.lora_name:
@@ -386,7 +393,7 @@ async def async_request_openai_completions(
                 url=api_url, json=payload, headers=headers
             ) as response:
                 if response.status == 200:
-                    async for chunk_bytes in response.content:
+                    async for chunk_bytes in _response_chunks(response):
                         chunk_bytes = chunk_bytes.strip()
                         if not chunk_bytes:
                             continue
@@ -398,13 +405,14 @@ async def async_request_openai_completions(
                         else:
                             data = json.loads(chunk)
 
-                            if getattr(args, "cache_report", False):
-                                _extract_cache_from_sglext(data, output)
+                            _extract_cache_from_sglext(data, output)
+                            output_len = (data.get("usage") or {}).get(
+                                "completion_tokens", output_len
+                            )
+                            choices = data.get("choices") or []
 
-                            # NOTE: Some completion API might have a last
-                            # usage summary response without a token so we
-                            # want to check a token was generated
-                            if data["choices"][0]["text"]:
+                            # Usage-only chunks have no generated text.
+                            if choices and choices[0].get("text"):
                                 timestamp = time.perf_counter()
                                 # First token
                                 if ttft == 0.0:
@@ -518,6 +526,11 @@ async def async_request_openai_chat_completions(
         # Merge in extra parameters (tools, temperature, top_p, etc.)
         # These will override defaults if present
         payload.update(request_func_input.extra_request_body)
+        if "sglang" in args.backend and payload["stream"]:
+            payload["stream_options"] = {
+                "include_usage": True,
+                **(payload.get("stream_options") or {}),
+            }
 
         # hack to accommodate different LoRA conventions between SGLang and vLLM.
         if request_func_input.lora_name:
@@ -567,8 +580,7 @@ async def async_request_openai_chat_completions(
                         output.spec_cap_lens_histogram = (
                             _meta_info.get("spec_cap_lens_histogram", []) or []
                         )
-                        if getattr(args, "cache_report", False):
-                            _extract_cache_from_sglext(response_json, output)
+                        _extract_cache_from_sglext(response_json, output)
                     else:
                         # Streaming response
                         async for chunk_bytes in response.content:
@@ -588,8 +600,7 @@ async def async_request_openai_chat_completions(
                                     "completion_tokens", output_len
                                 )
 
-                                if getattr(args, "cache_report", False):
-                                    _extract_cache_from_sglext(data, output)
+                                _extract_cache_from_sglext(data, output)
 
                                 choices = data.get("choices") or []
                                 if not choices:
@@ -1033,6 +1044,14 @@ _BACKEND_API_PATHS = {
 _EMBEDDING_BACKENDS = frozenset(("sglang-embedding", "vllm-embedding"))
 
 _DEFAULT_SGLANG_FLUSH_CACHE_TIMEOUT = 60.0
+
+
+async def _response_chunks(response):
+    if args.disable_stream:
+        yield await response.read()
+    else:
+        async for chunk in response.content:
+            yield chunk
 
 
 def _fetch_cache_server_info(base_url):
@@ -1735,22 +1754,13 @@ async def benchmark(
     if pbar is not None:
         pbar.close()
 
-    server_info = None
+    server_info = _fetch_cache_server_info(base_url) if "sglang" in backend else None
     accept_length = None
-    try:
-        response = requests.get(
-            base_url + "/server_info", headers=get_request_headers(), timeout=15
-        )
-        response.raise_for_status()
-        server_info = response.json()
-        if "sglang" in backend:
-            info = server_info["decode"][0] if "decode" in server_info else server_info
-            states = info.get("internal_states")
-            if states:
-                accept_length = states[0].get("avg_spec_accept_length")
-    except Exception as exc:
-        # FLAT_MEMORY: Post-request telemetry failure must not discard completed outputs.
-        warnings.warn(f"Server information unavailable after benchmark: {exc}")
+    if server_info is not None and "sglang" in backend:
+        info = server_info["decode"][0] if "decode" in server_info else server_info
+        states = info.get("internal_states")
+        if states:
+            accept_length = states[0].get("avg_spec_accept_length")
 
     if server_info is None and native_io.collect_host:
         server_info = (native_io.after or native_io.before)["server_config"]
@@ -1792,6 +1802,10 @@ async def benchmark(
     }
 
     cache_usage = summarize_cache_usage(outputs)
+    gds_prefetch_latency = None
+    if tiered_mode:
+        gds_prefetch_latency = cache_usage["avg_storage_read_latency_ms"]
+        cache_usage["avg_storage_read_latency_ms"] = None
     flat_cache = summarize_flat_cache(outputs, cache_usage["total_prompt_tokens"])
     metrics_mode = resolve_metrics_mode(
         before=server_info_before,
@@ -2027,6 +2041,8 @@ async def benchmark(
         result["cache_usage"] = cache_usage
         if tiered_mode:
             result["tiered_cache_physical_sources"] = tiered_cache
+            result["gds_prefetch_latency_ms"] = gds_prefetch_latency
+            result["gds_prefetch_latency_scope"] = "query to all-TP GPU-ready; not SSD-to-Host latency"
     else:
         print(f"Error running benchmark for request rate: {request_rate}")
         print("-" * 30)

@@ -106,6 +106,7 @@ def cache_stub():
     cache.ongoing_prefetch = {}
     cache.ongoing_backup = {}
     cache.buffer_pipeline = None
+    cache.tiered_runtime = None
     cache.metrics_collector = None
     cache.dec_lock_ref = Mock()
     cache.dec_host_lock_ref = Mock()

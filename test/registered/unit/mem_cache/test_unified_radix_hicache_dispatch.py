@@ -1,11 +1,24 @@
+import copy
+import time
 import unittest
+from array import array
+from concurrent.futures import Future
 from queue import Queue
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import torch
-
-from sglang.srt.mem_cache.base_prefix_cache import IncLockRefResult
+from sglang.srt.environ import envs
+from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.managers.schedule_policy import PrefillAdder
+from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
+from sglang.srt.mem_cache.base_prefix_cache import (
+    EvictParams,
+    IncLockRefResult,
+    MatchPrefixParams,
+)
+from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+from sglang.srt.mem_cache.common import free_swa_out_of_window_slots
 from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer, SidecarPoolSpec
 from sglang.srt.mem_cache.hybrid_cache import hybrid_pool_assembler
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import PrefetchOperation
@@ -23,16 +36,29 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
     _SwaStrategy,
     register_stack_strategy,
 )
+from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
 from sglang.srt.mem_cache.unified_cache.components.full_component import FullComponent
 from sglang.srt.mem_cache.unified_cache.components.swa_component import SWAComponent
 from sglang.srt.mem_cache.unified_cache.storage_attachment import StorageAttachment
+from sglang.srt.mem_cache.unified_cache.tiered_mooncake_runtime import (
+    TieredMooncakeRuntime,
+    _LoadRequest,
+)
+from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
+    ExternalCacheHitMarker,
+    UnifiedCacheLinkerWrapper,
+)
 from sglang.srt.mem_cache.unified_cache.unified_tree_core import (
     UnifiedLRUList,
     UnifiedTreeCore,
     UnifiedTreeNode,
 )
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache, _OngoingPrefetch
+from sglang.srt.runtime_context import get_context
+from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -577,6 +603,273 @@ class TestNativePrefetchCapacity(CustomTestCase):
         cache.inc_host_lock_ref.assert_not_called()
         cache.cache_controller.prefetch.assert_not_called()
         cache.evict_host.assert_not_called()
+
+
+class TestTieredGDSSWAFrontier(CustomTestCase):
+    def _fixture(self):
+        pool = SWAKVPool(
+            size=64,
+            size_swa=64,
+            page_size=1,
+            dtype=torch.float32,
+            head_num=1,
+            head_dim=2,
+            swa_attention_layer_ids=[1],
+            full_attention_layer_ids=[0],
+            device="cpu",
+        )
+        allocator = SWATokenToKVPoolAllocator(
+            size=64,
+            size_swa=64,
+            page_size=1,
+            dtype=torch.float32,
+            device="cpu",
+            kvcache=pool,
+            need_sort=False,
+        )
+        rows = ReqToTokenPool(
+            size=2,
+            max_context_len=64,
+            device="cpu",
+            enable_memory_saver=False,
+        )
+        with envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.override("python"):
+            cache = UnifiedRadixCache(
+                CacheInitParams(
+                    disable=False,
+                    req_to_token_pool=rows,
+                    token_to_kv_pool_allocator=allocator,
+                    page_size=1,
+                    sliding_window_size=4,
+                    tree_components=(FULL, SWA),
+                )
+            )
+        req = Req("gds", "", array("q", range(29)), SamplingParams(max_new_tokens=1))
+        req.init_next_round_input(cache)
+        rows.alloc([req])
+        self._extend(cache, req, 8)
+        free_swa_out_of_window_slots(
+            req,
+            8,
+            sliding_window_size=4,
+            page_size=1,
+            req_to_token_pool=rows,
+            token_to_kv_pool_allocator=allocator,
+        )
+        cache.cache_unfinished_req(req, chunked=True)
+        self.assertEqual(req.kv.swa_evicted_seqlen, 4)
+        self.assertEqual(len(req.prefix_indices), 8)
+        return cache, req
+
+    def _extend(self, cache, req, tokens):
+        start = len(req.prefix_indices)
+        end = start + tokens
+        slots = cache.token_to_kv_pool_allocator.alloc(tokens)
+        self.assertIsNotNone(slots)
+        cache.req_to_token_pool.write((req.kv.req_pool_idx, slice(start, end)), slots)
+        req.set_extend_range(start, end)
+        req.kv.kv_allocated_len = req.kv.kv_committed_len = end
+
+    def _publish(self, cache, req, *, duplicate):
+        loads = UnifiedCacheLinkerWrapper(cache, None, configure_tree=False)
+        hit = ExternalCacheHitMarker(
+            prefix_key=RadixKey(req.origin_input_ids[:20]),
+            tail_hashes=[str(i) for i in range(8, 20)],
+            device_hit_len=8,
+        )
+
+        def prepare():
+            return loads.prepare_load(
+                _LoadRequest(
+                    rid=req.rid,
+                    prefix_indices=req.prefix_indices,
+                    last_node=req.last_node,
+                    kv=copy.copy(req.kv),
+                    priority=0,
+                ),
+                hit=hit,
+            )
+
+        prepared = prepare()
+        self.assertEqual(prepared.req.kv.swa_evicted_seqlen, 16)
+        self.assertEqual(req.kv.swa_evicted_seqlen, 4)
+        if duplicate:
+            loads.commit_prepared_load(prepare(), queue_io=False)
+        op = SimpleNamespace(
+            req=req,
+            prepared=prepared,
+            prefix_len=8,
+            full_tokens=12,
+            anchor=req.last_node,
+            started=time.monotonic(),
+            device_lock=cache.inc_lock_ref(req.last_node).to_dec_params(),
+            host_lock=cache.inc_host_lock_ref(req.last_node).to_dec_params(),
+        )
+        runtime = TieredMooncakeRuntime.__new__(TieredMooncakeRuntime)
+        runtime.cache, runtime.loads = cache, loads
+        runtime.controller = SimpleNamespace(
+            l2_transfer_engine=SimpleNamespace(device_to_host_stream=MagicMock()),
+            ack_write_queue=[],
+            prefetch_tokens_occupied=12,
+            prefetch_capacity_limit=12 if duplicate else 32,
+        )
+        runtime.pending = {req.rid: op}
+        runtime.completed_holds = {}
+        runtime.sources, runtime.loaded, runtime.latencies = {}, {}, {}
+        with patch.object(cache, "writing_check"), patch.object(
+            cache, "_execute_and_commit_kv_backup"
+        ):
+            runtime._commit(
+                req.rid, op, {PoolName.KV.value: [2] * 12, PoolName.SWA.value: [2] * 12}
+            )
+        return runtime, prepared
+
+    def _admit(self, cache, req):
+        cache._dec_req_lock(req)
+        req.init_next_round_input(cache)
+        lock = cache.inc_lock_ref(req.last_node)
+        req.swa_uuid_for_lock = lock.swa_uuid_for_lock
+        req.skip_lock_node_ids = lock.skip_lock_node_ids
+        cache.req_to_token_pool.write(
+            (req.kv.req_pool_idx, slice(0, len(req.prefix_indices))), req.prefix_indices
+        )
+
+    def _assert_released(self, cache, req, runtime):
+        runtime.release_hold(req.rid)
+        cache._dec_req_lock(req)
+        cache.req_to_token_pool.free(req)
+        cache.evict(EvictParams(num_tokens=64, swa_num_tokens=64))
+        allocator = cache.token_to_kv_pool_allocator
+        self.assertEqual(allocator.full_available_size(), 64)
+        self.assertEqual(allocator.swa_available_size(), 64)
+        self.assertFalse(runtime.pending)
+        self.assertFalse(runtime.completed_holds)
+        self.assertEqual(runtime.controller.prefetch_tokens_occupied, 0)
+
+    def test_duplicate_restore_then_shorter_chunk_recovers_swa(self):
+        """A farther duplicate restore must not mark the next computed chunk dead."""
+        cache, req = self._fixture()
+        runtime, prepared = self._publish(cache, req, duplicate=True)
+        self.assertFalse(any(prepared.adopted_ranges.values()))
+        self.assertFalse(runtime.completed_holds)
+        far_match = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(req.origin_input_ids[:20]), req=req)
+        )
+        full_hold = cache.inc_lock_ref(
+            far_match.last_device_node, (SWA,)
+        ).to_dec_params()
+        cache.evict(EvictParams(swa_num_tokens=4))
+        self._admit(cache, req)
+        self.assertEqual(len(req.prefix_indices), 8)
+        self._extend(cache, req, 4)
+        cache.cache_unfinished_req(req, chunked=True)
+        self.assertEqual(req.kv.cache_protected_len, 12)
+        self.assertEqual(len(req.prefix_indices), 12)
+        cache.dec_lock_ref(far_match.last_device_node, full_hold)
+        self._assert_released(cache, req, runtime)
+
+    def test_query_anchor_can_consume_admitted_full_capacity(self):
+        """An unallocated GDS query can pin all capacity promised to a chunk."""
+        override = get_context().override_server_args(enable_hierarchical_cache=True)
+        override.install()
+        self.addCleanup(override.restore)
+        cache, chunk = self._fixture()
+        self._extend(cache, chunk, 8)
+        cache.cache_unfinished_req(chunk, chunked=True)
+        self.assertEqual(chunk.kv.cache_protected_len, 16)
+        allocator = cache.token_to_kv_pool_allocator
+        waiting = Req(
+            "waiting", "", array("q", range(100, 153)), SamplingParams(max_new_tokens=1)
+        )
+        waiting.init_next_round_input(cache)
+        loads = UnifiedCacheLinkerWrapper(cache, None, configure_tree=False)
+        prepared = loads.prepare_load(
+            _LoadRequest(
+                rid=waiting.rid,
+                prefix_indices=waiting.prefix_indices,
+                last_node=waiting.last_node,
+                kv=copy.copy(waiting.kv),
+                priority=0,
+            ),
+            hit=ExternalCacheHitMarker(
+                prefix_key=RadixKey(waiting.origin_input_ids[:48]),
+                tail_hashes=[str(i) for i in range(48)],
+                device_hit_len=0,
+            ),
+        )
+        loads.commit_prepared_load(prepared, queue_io=False)
+        waiting.init_next_round_input(cache)
+        self.assertEqual(len(waiting.prefix_indices), 48)
+        self.assertEqual(allocator.full_available_size(), 0)
+        self.assertEqual(cache.full_evictable_size(), 48)
+
+        def adder():
+            return PrefillAdder(
+                page_size=1,
+                tree_cache=cache,
+                token_to_kv_pool_allocator=allocator,
+                running_batch=SimpleNamespace(reqs=[]),
+                new_token_ratio=1.0,
+                rem_input_tokens=4,
+                rem_chunk_tokens=4,
+            )
+
+        admitted = adder()
+        admitted.add_chunked_req(chunk)
+        self.assertEqual(admitted.can_run_list, [chunk])
+        runtime = TieredMooncakeRuntime.__new__(TieredMooncakeRuntime)
+        runtime.cache, runtime.closed = cache, False
+        runtime.controller = SimpleNamespace(
+            prefetch_capacity_limit=8, prefetch_tokens_occupied=0
+        )
+        runtime.query_worker = SimpleNamespace(submit=lambda *args: Future())
+        runtime.pending, runtime.completed_holds = {}, {}
+        runtime.sources, runtime.loaded, runtime.latencies = {}, {}, {}
+        cache.prefetch_threshold = 4
+        runtime.prefetch(waiting)
+        self.assertIn(waiting.rid, runtime.pending)
+        self.assertFalse(runtime.pending[waiting.rid].query.done())
+        self.assertEqual(runtime.full_reserved_tokens, 0)
+        self.assertEqual(runtime.controller.prefetch_tokens_occupied, 0)
+        self.assertEqual(cache.full_evictable_size(), 0)
+        cache.evict(EvictParams(num_tokens=4))
+        self.assertIsNone(allocator.alloc(4))
+        after_prefetch = adder()
+        after_prefetch.add_chunked_req(chunk)
+        self.assertEqual(after_prefetch.can_run_list, [])
+        runtime._discard(waiting.rid, runtime.pending[waiting.rid])
+        self.assertEqual(cache.full_evictable_size(), 48)
+        self._assert_released(cache, chunk, runtime)
+
+    def test_full_restore_preserves_request_eviction_and_cached_slots(self):
+        """Restored tree slots stay protected without overwriting real eviction progress."""
+        cache, req = self._fixture()
+        runtime, _ = self._publish(cache, req, duplicate=False)
+        self.assertEqual(req.kv.swa_evicted_seqlen, 4)
+        self._admit(cache, req)
+        self.assertEqual(req.kv.cache_protected_len, 20)
+        allocator = cache.token_to_kv_pool_allocator
+        cached_swa = allocator.translate_loc_from_full_to_swa(
+            req.prefix_indices
+        ).clone()
+        self._extend(cache, req, 8)
+        free_swa_out_of_window_slots(
+            req,
+            28,
+            sliding_window_size=4,
+            page_size=1,
+            req_to_token_pool=cache.req_to_token_pool,
+            token_to_kv_pool_allocator=allocator,
+        )
+        self.assertEqual(req.kv.swa_evicted_seqlen, 24)
+        self.assertTrue(
+            torch.equal(
+                allocator.translate_loc_from_full_to_swa(req.prefix_indices), cached_swa
+            )
+        )
+        cache.cache_unfinished_req(req, chunked=True)
+        self.assertEqual(req.kv.cache_protected_len, 28)
+        self._assert_released(cache, req, runtime)
 
 
 if __name__ == "__main__":

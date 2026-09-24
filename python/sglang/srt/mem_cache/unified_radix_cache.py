@@ -466,6 +466,8 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def _reset_full(self) -> None:
         """Full reset: destroy entire tree and all state."""
+        if self.cache_controller is not None:
+            self.cache_controller.reset()
         self.tree_core.reset()
         self.session_refs.reset()
 
@@ -486,7 +488,6 @@ class UnifiedRadixCache(BasePrefixCache):
             self.buffer_pipeline.reset()
 
         if self.cache_controller is not None:
-            self.cache_controller.reset()
             self.cache_controller.mem_pool_host.clear()
             self.enable_storage = self.cache_controller.enable_storage
 
@@ -2383,6 +2384,8 @@ class UnifiedRadixCache(BasePrefixCache):
         return reserved_tokens
 
     def release_prefetch_hold(self, req_id: str) -> None:
+        if self.tiered_runtime is not None:
+            self.tiered_runtime.release_hold(req_id)
         hold = self.completed_prefetch_holds.pop(req_id, None)
         if hold is None:
             return
@@ -2417,6 +2420,9 @@ class UnifiedRadixCache(BasePrefixCache):
             self._storage_prefetch_missed_rids.discard(req_id)
             return True
         return False
+
+    def defer_storage_prefetch(self, req_id: str) -> None:
+        self._storage_prefetch_deferred_rids.add(req_id)
 
     def pop_storage_prefetch_deferred(self, req_id: str) -> bool:
         """Consume a pressure-only retry marker, independent of miss retry pacing."""

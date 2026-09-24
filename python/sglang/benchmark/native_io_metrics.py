@@ -5,6 +5,7 @@ import os
 import time
 import uuid
 import warnings
+from copy import deepcopy
 
 import requests
 
@@ -460,18 +461,77 @@ def calculate_mooncake_io_metrics(
     return result
 
 
-def print_mooncake_io_metrics(metrics: dict) -> None:
+def combine_mooncake_gds_io_metrics(owner: dict, gds: dict) -> dict:
+    """Project disjoint read paths into native fields without summing peak rates."""
+    result = deepcopy(owner)
+    metadata = result.setdefault("mooncake_io_metadata", {})
+    fields = ("total_bytes", "ops", "errors", "bw_gbps", "peak_bw_gbps")
+    metadata["ssd_read_sources"] = {
+        "owner": {name: owner.get("ssd_read_" + name) for name in fields},
+        "consumer_cufile": {name: gds.get("gds_ssd_read_" + name) for name in fields},
+    }
+    try:
+        if owner.get("mooncake_io_status") != "ok" or gds.get("gds_io_status") != "ok":
+            raise ValueError("Owner and consumer GDS observations must both be valid")
+        first = metadata["ssd_before"]["window"]["start_ns"]
+        last = metadata["ssd_after"]["window"]["end_ns"]
+        gds_window = gds["gds_io_metadata"]
+        if not first <= gds_window["start_ns"] < gds_window["end_ns"] <= last:
+            raise ValueError("Owner window does not enclose the consumer GDS window")
+        seconds = (last - first) / 1e9
+        for field in ("total_bytes", "ops", "errors"):
+            left, right = owner["ssd_read_" + field], gds["gds_ssd_read_" + field]
+            if any(type(value) is not int or value < 0 for value in (left, right)):
+                raise ValueError("Invalid completed SSD read counters")
+            result["ssd_read_" + field] = left + right
+        result["ssd_read_bw_gbps"] = result["ssd_read_total_bytes"] / seconds / 1e9
+        owner_active = owner["ssd_read_total_bytes"] > 0
+        consumer_active = gds["gds_ssd_read_total_bytes"] > 0
+        if owner_active and consumer_active:
+            result["ssd_read_peak_bw_gbps"] = None
+            metadata["ssd_read_peak_status"] = "unavailable_unaligned_sources"
+        else:
+            result["ssd_read_peak_bw_gbps"] = (
+                gds["gds_ssd_read_peak_bw_gbps"] if consumer_active
+                else owner["ssd_read_peak_bw_gbps"]
+            )
+            metadata["ssd_read_peak_status"] = "ok_single_active_source"
+        metadata["ssd_read_scope"] = (
+            "owner read-CQE bytes plus consumer cuFile returned bytes / enclosing "
+            "same-host owner window; includes alignment, not physical device bandwidth"
+        )
+        metadata["ssd_read_ops_scope"] = (
+            "completed owner read CQEs plus returned cuFileRead calls, including "
+            "failures; heterogeneous I/O attempts, not unique KV objects"
+        )
+        metadata["ssd_read_window_seconds"] = seconds
+        metadata["gds_window"] = {
+            key: gds_window[key] for key in ("window_id", "start_ns", "end_ns", "bucket_ns")
+        }
+        metadata["ssd_scope"] = (
+            "reads include owner and consumer GDS completions; writes remain owner "
+            "datasync-successful bucket data, before metadata persistence"
+        )
+    except (KeyError, TypeError, ValueError) as error:
+        for field in fields:
+            result["ssd_read_" + field] = None
+        result["mooncake_io_status"] = "unavailable"
+        result["mooncake_io_error"] = f"Combined SSD read telemetry unavailable: {error}"
+        metadata["ssd_read_error"] = str(error)
+    return result
+
+
+def print_mooncake_io_metrics(metrics):
     print("Mooncake Storage I/O Statistics".center(62, "-"))
-    print("Storage DRAM is separate from GPU<->L2 Host copies; GB = 10^9 bytes.")
-    print("Owner SSD read counters exclude GDS (compat) reads in TP consumers.")
+    print("Storage DRAM is separate from GPU/L2 Host copies; GB = 10^9 bytes.")
     if metrics["mooncake_io_status"] != "ok":
         print("Native storage I/O unavailable: " + metrics["mooncake_io_error"])
     rows = [
         ("DRAM used (GB):", "mooncake_dram_used_bytes", 1e9),
         ("SSD used (GB, metadata):", "ssd_used_bytes", 1e9),
-        ("Total blocks stored (Mooncake keys):", "mooncake_total_keys", 1),
+        ("Mooncake keys:", "mooncake_total_keys", 1),
     ]
-    for medium, prefix in (("DRAM", "mooncake_dram"), ("Owner SSD", "ssd")):
+    for medium, prefix in (("DRAM", "mooncake_dram"), ("SSD", "ssd")):
         for direction in ("write", "read"):
             rows.append(
                 (
@@ -480,45 +540,32 @@ def print_mooncake_io_metrics(metrics: dict) -> None:
                     1,
                 )
             )
-            if prefix == "ssd":
+            if medium == "SSD":
                 rows.append(
                     (
-                        f"Owner SSD {direction} bandwidth peak (GB/s, 100 ms):",
+                        f"SSD {direction} peak (GB/s, 100 ms):",
                         f"ssd_{direction}_peak_bw_gbps",
                         1,
                     )
                 )
-            rows.extend(
-                [
-                    (f"{medium} {direction} ops:", f"{prefix}_{direction}_ops", 1),
-                    (
-                        f"{medium} {direction} total (GB):",
-                        f"{prefix}_{direction}_total_bytes",
-                        1e9,
-                    ),
-                    (
-                        f"{medium} {direction} errors:",
-                        f"{prefix}_{direction}_errors",
-                        1,
-                    ),
-                ]
+            for key in ("ops", "errors"):
+                rows.append(
+                    (f"{medium} {direction} {key}:", f"{prefix}_{direction}_{key}", 1)
+                )
+            rows.append(
+                (
+                    f"{medium} {direction} total (GB):",
+                    f"{prefix}_{direction}_total_bytes",
+                    1e9,
+                )
             )
     for label, key, divisor in rows:
         value = metrics.get(key)
-        shown = (
-            "N/A (unavailable)"
-            if value is None
-            else (
-                str(value)
-                if type(value) is int and divisor == 1
-                else f"{value / divisor:.4f}"
-            )
-        )
+        shown = "N/A (unavailable)" if value is None else f"{value / divisor:.4f}"
         print(f"{label:<48} {shown}")
     print(
-        "SSD writes/peak: datasync-successful bucket data, not buffered-write or device physical peak."
+        "SSD write completion is bucket datasync, not full metadata persistence or device physical peak."
     )
-
 
 def validate_gds_io_window(snapshot, window_id, active):
     if not isinstance(snapshot, dict) or not isinstance(snapshot.get("ranks"), list):
@@ -916,9 +963,15 @@ class NativeIOWindow:
                 self.mooncake_result.setdefault("mooncake_io_metadata", {})[
                     "capacity_error"
                 ] = str(error)
+        if self.collect_mooncake and self.collect_gds and exc_type is None:
+            self.mooncake_result = combine_mooncake_gds_io_metrics(
+                self.mooncake_result, self.gds_result
+            )
         return False
 
     def print_metrics(self):
+        if self.collect_mooncake:
+            print_mooncake_io_metrics(self.mooncake_result)
         if self.collect_host:
             print("HiCache L2 Host I/O Statistics".center(62, "-"))
             if self.host_result["hicache_io_status"] == "ok":
@@ -927,22 +980,13 @@ class NativeIOWindow:
                     value = self.host_result[f"dram_{direction}_bw_gbps"]
                     batches = self.host_result[f"hicache_io_{direction}_batches"]
                     byte_count = self.host_result[f"hicache_io_{direction}_bytes"]
-                    print(
-                        f"L2 Host DRAM {direction} bandwidth (GB/s): {value:.4f}"
-                        + (" (no I/O)" if not batches else "")
-                    )
-                    print(
-                        f"L2 Host {direction} rank-batches: {batches}; total (GB): {byte_count / 1e9:.4f}"
-                    )
-                value = self.host_result["mean_l2_kv_readback_ms"]
+                    shown = "N/A" if value is None else f"{value:.4f}"
+                    print(f"L2 Host {direction}: {shown} GB/s, {byte_count} bytes, {batches} rank-batches")
                 print(
-                    f"Mean all-layer H2D rank-batch time (ms): {value if value is not None else 'N/A (no readbacks)'}"
+                    "Mean all-layer H2D rank-batch time: "
+                    f"{self.host_result['mean_l2_kv_readback_ms'] if self.host_result['mean_l2_kv_readback_ms'] is not None else 'N/A'} ms; not an additive TTFT component."
                 )
             else:
-                print(
-                    f"Native HiCache I/O metrics unavailable: {self.host_result['hicache_io_error']}"
-                )
-        if self.collect_mooncake:
-            print_mooncake_io_metrics(self.mooncake_result)
-        if self.collect_gds:
+                print(f"Native HiCache I/O metrics unavailable: {self.host_result['hicache_io_error']}")
+        if self.collect_gds and not self.collect_mooncake:
             print_gds_io_metrics(self.gds_result)

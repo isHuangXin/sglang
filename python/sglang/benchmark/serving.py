@@ -55,7 +55,13 @@ from sglang.benchmark.flat_memory_metrics import (
     summarize_flat_cache,
     summarize_flat_io,
 )
-from sglang.benchmark.flat_memory_report import format_flat_memory_report
+from sglang.benchmark.flat_memory_report import (
+    REPORT_FIELD_NAMES,
+    REPORT_METADATA_FIELDS,
+    format_cache_reports,
+    project_cache_reports,
+    resolve_metrics_mode,
+)
 from sglang.benchmark.hicache_io_metrics import (
     HiCacheIOCollector,
     format_hicache_io_report,
@@ -1563,6 +1569,17 @@ async def benchmark(
         owner_metrics_url=vars(args).get("mooncake_owner_metrics_url"),
         headers=get_request_headers(),
     )
+    # FLAT_MEMORY: Retain mode evidence if the server becomes unavailable after replay.
+    server_info_before = None
+    if args.cache_report or flat_io.enabled or hicache_io.enabled:
+        try:
+            response = requests.get(
+                base_url + "/server_info", headers=get_request_headers(), timeout=15
+            )
+            response.raise_for_status()
+            server_info_before = response.json()
+        except Exception as exc:
+            warnings.warn(f"Server information unavailable before benchmark: {exc}")
     tasks: List[asyncio.Task] = []
     pbar_total = len(input_requests)
     if (
@@ -1691,6 +1708,45 @@ async def benchmark(
         plot_throughput=args.plot_throughput,
     )
 
+    # FLAT_MEMORY: One projection supplies console and JSON; raw evidence stays separate.
+    cache_usage = summarize_cache_usage(outputs)
+    flat_cache = summarize_flat_cache(outputs, cache_usage["total_prompt_tokens"])
+    flat_mode = flat_io.enabled or any(
+        output.flat_dram is not None for output in outputs
+    )
+    cache_evidence = {
+        "errors": [output.error for output in outputs],
+        "server_prompt_tokens": [output.server_prompt_tokens for output in outputs],
+        "server_cached_tokens": [output.server_cached_tokens for output in outputs],
+        "cached_tokens_details": [output.cached_tokens_details for output in outputs],
+    }
+    report_mode = resolve_metrics_mode(
+        before=server_info_before,
+        after=server_info,
+        details=[output.cached_tokens_details for output in outputs if output.success],
+    )
+    cache_report = project_cache_reports(
+        cache_evidence | cache_usage | flat_cache | flat_io.result, mode=report_mode
+    )
+    legacy_metrics = {
+        "mooncake_eviction": {},
+        "kvcache_bandwidth": {},
+        "flat_memory": {},
+    }
+    if not flat_mode:
+        if getattr(args, "mooncake_master_host", None):
+            legacy_metrics["mooncake_eviction"] = fetch_mooncake_eviction_metrics(
+                args.mooncake_master_host, getattr(args, "mooncake_metrics_port", 9003)
+            )
+        if getattr(args, "prefill_metrics_host", None):
+            host, port = args.prefill_metrics_host, getattr(
+                args, "prefill_metrics_port", 30000
+            )
+            legacy_metrics["kvcache_bandwidth"] = fetch_sglang_bandwidth_metrics(
+                host, port
+            )
+            legacy_metrics["flat_memory"] = fetch_flat_memory_metrics(host, port)
+
     print("\n{s:{c}^{n}}".format(s=" Serving Benchmark Result ", n=50, c="="))
     print("{:<40} {:<10}".format("Backend:", backend))
     print(
@@ -1759,6 +1815,28 @@ async def benchmark(
     print("{:<40} {:<10.2f}".format("Concurrency:", metrics.concurrency))
     if accept_length:
         print("{:<40} {:<10.2f}".format("Accept length:", accept_length))
+    if args.cache_report or flat_mode or hicache_io.enabled:
+        print(format_cache_reports(cache_report))
+        if cache_report["metrics_mode"] == "flat":
+            print("Mooncake Storage I/O Statistics".center(64, "-"))
+            print("  Storage I/O status: not_applicable")
+            print("  -- : Flat uses its own DRAM/SSD backend, not Mooncake Store.")
+            print("HiCache L2 Host I/O Statistics".center(64, "-"))
+            print("  L2 Host I/O status: not_applicable")
+            print("  -- : Flat does not construct a HiCache Host payload pool.")
+    if any(legacy_metrics.values()):
+        print(
+            "Legacy lifetime/proxy telemetry (not native Flat I/O-window measurements):"
+        )
+        print(json.dumps(legacy_metrics, default=str))
+    if hicache_io.enabled:
+        print(format_hicache_io_report(hicache_io.result))
+        storage_latency = cache_usage["avg_storage_read_latency_ms"]
+        storage_text = "N/A" if storage_latency is None else f"{storage_latency:.3f}"
+        print(f"{'Legacy Storage --> Host Latency (ms):':<44} {storage_text}")
+        print(
+            "Legacy Storage latency retains its request aggregation; it is not SSD-only."
+        )
     print("{s:{c}^{n}}".format(s="End-to-End Latency", n=50, c="-"))
     print(
         "{:<40} {:<10.2f}".format("Mean E2E Latency (ms):", metrics.mean_e2e_latency_ms)
@@ -1801,105 +1879,7 @@ async def benchmark(
         print("{:<40} {:<10.2f}".format("P95 ITL (ms):", metrics.p95_itl_ms))
         print("{:<40} {:<10.2f}".format("P99 ITL (ms):", metrics.p99_itl_ms))
         print("{:<40} {:<10.2f}".format("Max ITL (ms):", metrics.max_itl_ms))
-    if args.cache_report:
-        total_prompt_tokens = 0
-        total_cached = 0
-        total_device = total_host = total_storage = 0
-        storage_backend_name = None
-        has_details = False
-        for o in outputs:
-            if not o.success:
-                continue
-            total_prompt_tokens += (
-                o.server_prompt_tokens
-                if o.server_prompt_tokens is not None
-                else o.prompt_len
-            )
-            total_cached += o.cached_tokens
-            if o.cached_tokens_details:
-                has_details = True
-                total_device += o.cached_tokens_details.get("device") or 0
-                total_host += o.cached_tokens_details.get("host") or 0
-                s = o.cached_tokens_details.get("storage") or 0
-                if s:
-                    total_storage += s
-                    storage_backend_name = o.cached_tokens_details.get(
-                        "storage_backend"
-                    )
-        hit_rate = (
-            total_cached / total_prompt_tokens * 100 if total_prompt_tokens > 0 else 0.0
-        )
-
-        print("{s:{c}^{n}}".format(s="Cache Hit Details", n=50, c="-"))
-        print("{:<40} {:<10}".format("Total prompt tokens:", total_prompt_tokens))
-        print("{:<40} {:<10}".format("Total cached tokens:", total_cached))
-        if has_details and total_cached > 0:
-            print("{:<40} {:<10}".format("  Device:", total_device))
-            print("{:<40} {:<10}".format("  Host:", total_host))
-            if total_storage > 0:
-                label = (
-                    f"  Storage ({storage_backend_name}):"
-                    if storage_backend_name
-                    else "  Storage:"
-                )
-                print("{:<40} {:<10}".format(label, total_storage))
-        print("{:<40} {:.1f}%".format("Cache hit rate:", hit_rate))
-        if has_details and total_cached > 0:
-            device_pct = total_device / total_cached * 100
-            host_pct = total_host / total_cached * 100
-            print("{:<40} {:.1f}%".format("  Device:", device_pct))
-            print("{:<40} {:.1f}%".format("  Host:", host_pct))
-            if total_storage > 0:
-                storage_pct = total_storage / total_cached * 100
-                label = (
-                    f"  Storage ({storage_backend_name}):"
-                    if storage_backend_name
-                    else "  Storage:"
-                )
-                print("{:<40} {:.1f}%".format(label, storage_pct))
     print("=" * 50)
-
-    cache_usage = summarize_cache_usage(outputs)
-    flat_cache = summarize_flat_cache(outputs, cache_usage["total_prompt_tokens"])
-    flat_mode = flat_io.enabled or any(
-        output.flat_dram is not None for output in outputs
-    )
-    legacy_metrics = {
-        "mooncake_eviction": {},
-        "kvcache_bandwidth": {},
-        "flat_memory": {},
-    }
-    if not flat_mode:
-        if getattr(args, "mooncake_master_host", None):
-            legacy_metrics["mooncake_eviction"] = fetch_mooncake_eviction_metrics(
-                args.mooncake_master_host, getattr(args, "mooncake_metrics_port", 9003)
-            )
-        if getattr(args, "prefill_metrics_host", None):
-            host, port = args.prefill_metrics_host, getattr(
-                args, "prefill_metrics_port", 30000
-            )
-            legacy_metrics["kvcache_bandwidth"] = fetch_sglang_bandwidth_metrics(
-                host, port
-            )
-            legacy_metrics["flat_memory"] = fetch_flat_memory_metrics(host, port)
-    if flat_mode:
-        # FLAT_MEMORY: Human-readable tiers accompany the complete native snapshots.
-        print(format_flat_memory_report(cache_usage | flat_cache | flat_io.result))
-        print("Flat cache and completed/durable I/O (unavailable values are null):")
-        print(json.dumps(flat_cache | flat_io.result, default=str))
-    elif any(legacy_metrics.values()):
-        print(
-            "Legacy lifetime/proxy telemetry (not native Flat I/O-window measurements):"
-        )
-        print(json.dumps(legacy_metrics, default=str))
-    if hicache_io.enabled:
-        print(format_hicache_io_report(hicache_io.result))
-        storage_latency = cache_usage["avg_storage_read_latency_ms"]
-        storage_text = "N/A" if storage_latency is None else f"{storage_latency:.3f}"
-        print(f"{'Legacy Storage --> Host Latency (ms):':<44} {storage_text}")
-        print(
-            "Legacy Storage latency retains its request aggregation; it is not SSD-only."
-        )
 
     if (
         metrics.median_ttft_ms is not None
@@ -1960,8 +1940,9 @@ async def benchmark(
             "max_output_tokens_per_s": metrics.max_output_tokens_per_s,
             "max_concurrent_requests": metrics.max_concurrent_requests,
         }
-        # FLAT_MEMORY: Preserve the old JSON contract, separate from upstream cache_report.
+        # FLAT_MEMORY: Native tier aliases differ from Flat media; keep raw aggregates.
         result.update(cache_usage)
+        result["cache_report_raw"] = cache_usage | flat_cache
         result.update(legacy_metrics)
         result["legacy_metrics_semantics"] = "lifetime/proxy; not benchmark-window I/O"
         if flat_mode:
@@ -1969,17 +1950,9 @@ async def benchmark(
             result.update(flat_io.result)
         if hicache_io.enabled:
             result.update(hicache_io.result)
-
-        if args.cache_report:
-            result["cache_report"] = {
-                "total_prompt_tokens": total_prompt_tokens,
-                "total_cached_tokens": total_cached,
-                "cache_hit_rate_pct": round(hit_rate, 2),
-                "device_cached_tokens": total_device if has_details else None,
-                "host_cached_tokens": total_host if has_details else None,
-                "storage_cached_tokens": (total_storage if total_storage > 0 else None),
-                "storage_backend": storage_backend_name,
-            }
+        result.update(
+            {name: cache_report[name] for name in (*REPORT_FIELD_NAMES, *REPORT_METADATA_FIELDS)}
+        )
     else:
         print(f"Error running benchmark for request rate: {request_rate}")
         print("-" * 30)

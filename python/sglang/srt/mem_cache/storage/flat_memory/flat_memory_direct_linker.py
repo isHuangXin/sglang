@@ -118,6 +118,7 @@ class FlatMemoryDirectLinker(UnifiedCacheLinker):
         tp_size: int,
         device: torch.device | str,
         manager: Any = None,
+        rank_replicated: bool = False,
     ):
         if config.get("gds_mode", "compat") != "compat":
             raise ValueError("Flat direct linker requires gds_mode=compat")
@@ -132,6 +133,13 @@ class FlatMemoryDirectLinker(UnifiedCacheLinker):
         self.page_size = pool_group.page_size
         self.num_layers = pool_group.num_layers
         self.tp_rank, self.tp_size = tp_rank, tp_size
+        # A rank-replicated model (MLA, or DeepSeek-V4's compressed MLA) holds
+        # byte-identical cache data on every TP rank, so one shared copy is
+        # correct. Rank 0 publishes it; the others resolve it. Without this the
+        # same block is stored tp_size times, costing both capacity and write
+        # bandwidth.
+        self.rank_replicated = bool(rank_replicated)
+        self.publisher = not self.rank_replicated or tp_rank == 0
         self._config = dict(config)
         self._closed = False
         self._owns_manager = manager is None
@@ -145,10 +153,28 @@ class FlatMemoryDirectLinker(UnifiedCacheLinker):
                 if self.device.index is not None
                 else torch.cuda.current_device()
             )
-            # FLAT_MEMORY: Replicated MLA still has a private store on every TP rank.
-            native_config.ssd_path = os.path.join(
-                native_config.ssd_path, f"tp_rank_{tp_rank}"
-            )
+            if self.rank_replicated:
+                # One backing file for the node: every rank opens the same
+                # gpu_file_pool.bin and reads at the offset the shared index
+                # hands it. Offsets never overlap because a single allocator,
+                # on the publishing rank, hands them all out.
+                native_config.shared_index_name = (
+                    f"/flat_memory_index_{model_namespace[:16]}_tp{tp_size}"
+                )
+                native_config.shared_index_publisher = tp_rank == 0
+                os.environ["FLAT_MEMORY_DRAM_SHM_NAME"] = (
+                    f"/flat_memory_dram_{model_namespace[:16]}_tp{tp_size}"
+                )
+                if tp_rank == 0:
+                    os.environ["FLAT_MEMORY_DRAM_SHM_CREATE"] = "1"
+                else:
+                    os.environ.pop("FLAT_MEMORY_DRAM_SHM_CREATE", None)
+            else:
+                # Per-rank stores stay per-rank: an MHA or GQA rank holds only
+                # its own heads, so sharing would hand it another rank's shard.
+                native_config.ssd_path = os.path.join(
+                    native_config.ssd_path, f"tp_rank_{tp_rank}"
+                )
             self._manager_factory = lambda: FlatMemoryManager(native_config)
             manager = self._manager_factory()
         else:
@@ -160,6 +186,7 @@ class FlatMemoryDirectLinker(UnifiedCacheLinker):
             tp_rank=tp_rank,
             tp_size=tp_size,
             max_io_bytes=int(config.get("gds_max_io_bytes", 16 * 1024 * 1024)),
+            rank_replicated=self.rank_replicated,
         )
         self.transfer = GPUTransfer(
             layout=self.layout,
@@ -167,6 +194,7 @@ class FlatMemoryDirectLinker(UnifiedCacheLinker):
             device=self.device,
             staging_bytes=int(config.get("gpu_stage_bytes", 128 * 1024 * 1024)),
             batch_pages=int(config.get("gpu_batch_pages", 128)),
+            publisher=self.publisher,
         )
         self.backup_wait_seconds = float(config.get("backup_wait_seconds", 10.0))
         self.drain_timeout = float(config.get("drain_timeout", 30.0))

@@ -69,6 +69,28 @@ class PayloadFragment(msgspec.Struct, frozen=True):
     padded_length: int
 
 
+# Pools whose bytes are identical on every TP rank of a rank-replicated model,
+# mirroring the suffix table in mooncake_store.py: Mooncake keys exactly these
+# without a rank. MAMBA is deliberately absent, because its conv and temporal
+# state stay per-rank even on a rank-replicated model. SWA, DRAFT and DRAFT_SWA
+# depend on the host pool's class rather than the model's, so they are left
+# per-rank here instead of guessed at -- the cost is that they do not dedup,
+# which is strictly safer than two ranks resolving each other's shard.
+RANK_REPLICATED_POOLS = frozenset(
+    {
+        PoolName.KV,
+        PoolName.INDEXER,
+        PoolName.DRAFT_INDEXER,
+        PoolName.DEEPSEEK_V4_C4,
+        PoolName.DEEPSEEK_V4_C4_INDEXER,
+        PoolName.DEEPSEEK_V4_C128,
+        PoolName.DEEPSEEK_V4_C4_STATE,
+        PoolName.DEEPSEEK_V4_C4_INDEXER_STATE,
+        PoolName.DEEPSEEK_V4_C128_STATE,
+    }
+)
+
+
 class PayloadLayout:
     def __init__(
         self,
@@ -78,6 +100,7 @@ class PayloadLayout:
         tp_rank: int,
         tp_size: int,
         max_io_bytes: int,
+        rank_replicated: bool = False,
     ):
         if not model_namespace:
             raise ValueError("Flat GPU storage requires a model/config namespace")
@@ -87,6 +110,8 @@ class PayloadLayout:
             raise ValueError("gds_max_io_bytes must be a positive multiple of 4096")
         self.pool_group = pool_group
         self.max_io_bytes = max_io_bytes
+        self.tp_rank = tp_rank
+        self.rank_replicated = rank_replicated
         self.specs: dict[PoolName, tuple[FragmentSpec, ...]] = {}
         identity = []
         for entry in pool_group.entries:
@@ -137,15 +162,21 @@ class PayloadLayout:
                     buffers,
                 )
             )
+        # Buffer shapes and strides are identical on every rank, so tp_rank is
+        # the only thing in this descriptor that tells ranks apart. Keeping it
+        # is what makes each rank's keys private. It is dropped only when the
+        # model is rank-replicated, and then _pool_scope puts the rank back for
+        # the pools that still need it.
         descriptor = {
             "version": FORMAT_VERSION,
             "model": model_namespace,
-            "tp_rank": tp_rank,
             "tp_size": tp_size,
             "page_size": pool_group.page_size,
             "fragment_bytes": max_io_bytes,
             "pools": identity,
         }
+        if not rank_replicated:
+            descriptor["tp_rank"] = tp_rank
         digest = hashlib.sha256(
             json.dumps(descriptor, sort_keys=True, separators=(",", ":")).encode()
         ).hexdigest()
@@ -168,9 +199,20 @@ class PayloadLayout:
             for spec in self.specs[name]
         ]
 
+    def _pool_scope(self, name: PoolName) -> str:
+        """Empty for a pool every rank stores identically, else this rank's id.
+
+        With dedup off the rank already lives in the namespace, so this adds
+        nothing and the keys are byte-for-byte what they were.
+        """
+        if not self.rank_replicated:
+            return ""
+        return "" if name in RANK_REPLICATED_POOLS else f":r{self.tp_rank}"
+
     def _key(self, *, name: PoolName, page_key: str, spec: FragmentSpec) -> str:
         return (
-            f"{self.namespace}:{name}:c{spec.component}:b{spec.buffer}:"
+            f"{self.namespace}{self._pool_scope(name)}:{name}:"
+            f"c{spec.component}:b{spec.buffer}:"
             f"f{spec.part}:n{spec.length}:{page_key}"
         )
 
@@ -269,8 +311,15 @@ class GPUTransfer:
         device: torch.device,
         staging_bytes: int,
         batch_pages: int = 128,
+        publisher: bool = True,
     ):
         self.layout = layout
+        # A non-publishing rank of a rank-replicated model stores nothing: the
+        # publisher's copy is byte-identical and every rank resolves it through
+        # the shared index. This is the same division of labour SGLang applies
+        # to Mooncake through backup_skip, which the flat path never reached
+        # because it does not run under the hicache controller.
+        self.publisher = publisher
         self.manager = manager
         self.device = torch.device(device)
         if self.device.type == "cuda" and self.device.index is None:
@@ -360,6 +409,12 @@ class GPUTransfer:
         on_source_consumed: Callable[[], None] | None = None,
     ) -> None:
         self.raise_if_unsafe()
+        if not self.publisher:
+            # The caller still has to be told its source pages are free, or it
+            # would hold them waiting for a write that is never coming.
+            if on_source_consumed is not None:
+                on_source_consumed()
+            return
         with self._context(), self._stream_context():
             self._write_transfers(transfers, on_source_consumed=on_source_consumed)
 

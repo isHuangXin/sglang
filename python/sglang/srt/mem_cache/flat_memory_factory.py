@@ -104,6 +104,15 @@ def create_flat_memory_cache(ctx):
     namespace = hashlib.sha256(
         json.dumps(model_identity, sort_keys=True, default=str).encode()
     ).hexdigest()
+    # Same predicate cache_controller.py uses to set backup_skip: a pool of
+    # either class holds byte-identical data on every TP rank, so one shared
+    # copy is correct and the other ranks only need to resolve it. The flat
+    # path never reached backup_skip because it does not run under the hicache
+    # controller, so the decision is made here instead.
+    from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+    from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
+
+    rank_replicated = isinstance(pool, (MLATokenToKVPool, DeepSeekV4TokenToKVPool))
     linker = FlatMemoryDirectLinker(
         pool_group=group,
         config=config,
@@ -111,6 +120,7 @@ def create_flat_memory_cache(ctx):
         tp_rank=ctx.tp_rank,
         tp_size=ctx.tp_size,
         device=cache.device,
+        rank_replicated=rank_replicated,
     )
     try:
         runtime = FlatMemoryCache(

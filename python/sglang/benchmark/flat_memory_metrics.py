@@ -227,7 +227,7 @@ def _flat_window_schema_version(window: object) -> int:
         raise ValueError("Missing or invalid Flat I/O window")
     # FLAT_MEMORY: Unversioned native windows contain SSD completion buckets only.
     version = window.get("schema_version", 1)
-    if type(version) is not int or version not in (1, 2):
+    if type(version) is not int or version not in (1, 2, 3):
         raise ValueError(f"Unsupported Flat I/O window schema version: {version!r}")
     return version
 
@@ -254,12 +254,14 @@ def _validate_flat_window(snapshot, window_id, active, expected_tp_size=None):
         if not start or (active and end != 0) or (not active and end <= start):
             raise ValueError("Invalid Flat window boundaries")
         boundaries.add((start, end))
-        counters = _WINDOW_COUNTERS + (_DRAM_WINDOW_COUNTERS if version == 2 else ())
+        counters = _WINDOW_COUNTERS + (_DRAM_WINDOW_COUNTERS if version >= 2 else ())
         for name in counters:
             value = _flat_counter(window.get(name))
             if (active or name == "io_errors") and value:
                 raise ValueError("Nonempty begin window or Flat I/O errors")
-        if not isinstance(window.get("buckets"), list) or (active and window["buckets"]):
+        if not isinstance(window.get("buckets"), list) or (
+            active and window["buckets"]
+        ):
             raise ValueError("Invalid Flat I/O buckets")
         for name in ("pending_backups", "pending_prefetches"):
             if _flat_counter(rank[name]):
@@ -291,7 +293,7 @@ def _flat_bucket_peaks(
         "read_bytes": "read_completed_bytes",
         "write_bytes": "durable_write_bytes",
     }
-    if schema_version == 2:
+    if schema_version >= 2:
         fields.update(
             dram_read_bytes="dram_read_completed_bytes",
             dram_write_bytes="dram_write_completed_bytes",
@@ -322,7 +324,215 @@ def _flat_bucket_peaks(
     }
 
 
-def summarize_flat_io(before, after, window_id, expected_tp_size=None):
+# FLAT_MEMORY: Schema v3 consumes bounded chunks but keeps whole-window counters.
+_BUCKET_COUNTERS = {
+    "read_bytes": "read_completed_bytes",
+    "write_bytes": "durable_write_bytes",
+    "dram_read_bytes": "dram_read_completed_bytes",
+    "dram_write_bytes": "dram_write_completed_bytes",
+}
+_BUCKET_NS = 100_000_000
+
+
+def _flat_bucket_chunk(ranks, begin, end):
+    rank_bytes = [dict.fromkeys(_BUCKET_COUNTERS, 0) for _ in ranks]
+    buckets = {}
+    for tp_rank, rank in ranks.items():
+        seen = set()
+        for bucket in rank["io_window"]["buckets"]:
+            if not isinstance(bucket, dict):
+                raise ValueError("Invalid Flat I/O bucket")
+            index = _flat_counter(bucket.get("index"))
+            if index in seen or not begin <= index < end:
+                raise ValueError("Duplicate or out-of-chunk Flat bucket index")
+            seen.add(index)
+            merged = buckets.setdefault(
+                index, {name: [0] * len(ranks) for name in _BUCKET_COUNTERS}
+            )
+            for name in _BUCKET_COUNTERS:
+                value = _flat_counter(bucket.get(name))
+                rank_bytes[tp_rank][name] += value
+                merged[name][tp_rank] = value
+    return rank_bytes, buckets
+
+
+class FlatIOBucketAccumulator:
+    """Merge TP-aligned chunks; retain only totals and one peak witness per metric."""
+
+    def __init__(self, before, window_id, expected_tp_size=None):
+        self.first, (self.start_ns, _) = _validate_flat_window(
+            before, window_id, True, expected_tp_size
+        )
+        if _flat_window_schema_version(self.first[0]["io_window"]) != 3:
+            raise ValueError("Incremental Flat I/O collection requires schema v3")
+        for rank in self.first.values():
+            if (
+                rank["io_window"].get("bucket_begin"),
+                rank["io_window"].get("bucket_end"),
+            ) != (0, 0):
+                raise ValueError("Nonempty initial Flat bucket cursor")
+        self.window_id = window_id
+        self.next_bucket = self.collections = self.end_ns = 0
+        self.rank_bytes = [dict.fromkeys(_BUCKET_COUNTERS, 0) for _ in self.first]
+        self.peak_buckets = {
+            name: {"index": None, "rank_bytes": [0] * len(self.first)}
+            for name in _BUCKET_COUNTERS
+        }
+
+    def _validate_chunk(self, snapshot, final):
+        ranks = _flat_rank_map(snapshot, len(self.first))
+        boundaries = set()
+        for tp_rank, rank in ranks.items():
+            prior = self.first[tp_rank]
+            window = rank.get("io_window")
+            if any(rank[name] != prior[name] for name in ("pid", "gpu_id", "gds_mode")):
+                raise ValueError("Flat TP identity changed during collection")
+            if (
+                _flat_window_schema_version(window) != 3
+                or window.get("window_id") != self.window_id
+                or window.get("enabled") is not True
+                or window.get("active") is not (not final)
+                or window.get("aborted") is not False
+                or window.get("overflowed") is not False
+                or window.get("bucket_ns") != _BUCKET_NS
+                or window.get("start_ns") != self.start_ns
+            ):
+                raise ValueError("Invalid incremental Flat I/O window")
+            for name in _WINDOW_COUNTERS + _DRAM_WINDOW_COUNTERS:
+                _flat_counter(window.get(name))
+            if window["io_errors"] or rank["flat_io_errors"] != prior["flat_io_errors"]:
+                raise ValueError("Flat pipeline reported I/O errors")
+            begin, end, end_ns = (
+                _flat_counter(window.get(name))
+                for name in ("bucket_begin", "bucket_end", "end_ns")
+            )
+            if (
+                begin != self.next_bucket
+                or end < begin
+                or not isinstance(window.get("buckets"), list)
+            ):
+                raise ValueError("Gap or duplicate in Flat bucket collection")
+            if final:
+                if (
+                    end_ns <= self.start_ns
+                    or end != (end_ns - self.start_ns) // _BUCKET_NS + 1
+                ):
+                    raise ValueError("Incomplete final Flat bucket boundary")
+            elif end_ns:
+                raise ValueError("Active Flat collection has an end timestamp")
+            boundaries.add((begin, end, end_ns))
+        if len(boundaries) != 1:
+            raise ValueError("Flat collection boundaries differ across TP ranks")
+        return ranks, next(iter(boundaries))
+
+    def add(self, snapshot, *, final=False):
+        if self.end_ns:
+            raise ValueError("Flat bucket collection already ended")
+        ranks, (begin, end, end_ns) = self._validate_chunk(snapshot, final)
+        chunk_bytes, buckets = _flat_bucket_chunk(ranks, begin, end)
+        totals = [
+            {name: prior[name] + chunk[name] for name in _BUCKET_COUNTERS}
+            for prior, chunk in zip(self.rank_bytes, chunk_bytes)
+        ]
+        for tp_rank, rank in ranks.items():
+            for name, counter in _BUCKET_COUNTERS.items():
+                recorded = rank["io_window"][counter]
+                if totals[tp_rank][name] > recorded or (
+                    final and totals[tp_rank][name] != recorded
+                ):
+                    raise ValueError(
+                        "Collected Flat buckets do not match cumulative bytes"
+                    )
+        for index, bucket in buckets.items():
+            for name, values in bucket.items():
+                if sum(values) > sum(self.peak_buckets[name]["rank_bytes"]):
+                    self.peak_buckets[name] = {"index": index, "rank_bytes": values}
+        self.rank_bytes = totals
+        self.next_bucket, self.end_ns = end, end_ns
+        self.collections += 1
+
+    def summary(self):
+        if not self.end_ns:
+            raise ValueError("Flat bucket collection is not complete")
+        return {
+            "window_id": self.window_id,
+            "start_ns": self.start_ns,
+            "end_ns": self.end_ns,
+            "bucket_ns": _BUCKET_NS,
+            "bucket_end": self.next_bucket,
+            "collections": self.collections,
+            "rank_bytes": self.rank_bytes,
+            "peak_buckets": self.peak_buckets,
+        }
+
+
+def _flat_streamed_peaks(ranks, summary):
+    window = ranks[0]["io_window"]
+    end = (window["end_ns"] - window["start_ns"]) // _BUCKET_NS + 1
+    if not isinstance(summary, dict) or any(
+        summary.get(name) != window[name]
+        for name in ("window_id", "start_ns", "end_ns", "bucket_ns")
+    ):
+        raise ValueError("Missing or mismatched Flat bucket summary")
+    if _flat_counter(summary.get("bucket_end")) != end or not _flat_counter(
+        summary.get("collections")
+    ):
+        raise ValueError("Incomplete Flat bucket summary")
+    rank_bytes = summary.get("rank_bytes")
+    if not isinstance(rank_bytes, list) or len(rank_bytes) != len(ranks):
+        raise ValueError("Incomplete Flat bucket summary ranks")
+    ranges = {
+        (
+            _flat_counter(rank["io_window"].get("bucket_begin")),
+            _flat_counter(rank["io_window"].get("bucket_end")),
+        )
+        for rank in ranks.values()
+    }
+    if len(ranges) != 1 or next(iter(ranges))[1] != end:
+        raise ValueError("Invalid final Flat chunk boundary")
+    begin, _ = next(iter(ranges))
+    if begin > end:
+        raise ValueError("Invalid final Flat chunk range")
+    tail_bytes, tail = _flat_bucket_chunk(ranks, begin, end)
+    for tp_rank, rank in ranks.items():
+        if not isinstance(rank_bytes[tp_rank], dict):
+            raise ValueError("Invalid Flat bucket summary rank")
+        for name, counter in _BUCKET_COUNTERS.items():
+            value = _flat_counter(rank_bytes[tp_rank].get(name))
+            if value != rank["io_window"][counter] or tail_bytes[tp_rank][name] > value:
+                raise ValueError("Flat bucket summary disagrees with cumulative bytes")
+    witnesses = summary.get("peak_buckets")
+    if not isinstance(witnesses, dict) or set(witnesses) != set(_BUCKET_COUNTERS):
+        raise ValueError("Missing Flat peak bucket witnesses")
+    peaks = {}
+    for name, witness in witnesses.items():
+        if not isinstance(witness, dict):
+            raise ValueError("Invalid Flat peak bucket witness")
+        values = witness.get("rank_bytes")
+        if not isinstance(values, list) or len(values) != len(ranks):
+            raise ValueError("Invalid Flat peak rank bytes")
+        total = sum(_flat_counter(value) for value in values)
+        if any(value > rank_bytes[rank][name] for rank, value in enumerate(values)):
+            raise ValueError("Flat peak exceeds cumulative bytes")
+        if total * end < sum(rank[name] for rank in rank_bytes):
+            raise ValueError(
+                "Flat peak is smaller than the whole-window bucket average"
+            )
+        if total:
+            index = _flat_counter(witness.get("index"))
+            if index >= end:
+                raise ValueError("Flat peak index is outside the window")
+        elif witness.get("index") is not None:
+            raise ValueError("Nonempty Flat peak index for zero bytes")
+        if total < max((sum(bucket[name]) for bucket in tail.values()), default=0):
+            raise ValueError("Flat peak is smaller than the final chunk")
+        peaks[name] = total / 0.1 / 1e9
+    return peaks
+
+
+def summarize_flat_io(
+    before, after, window_id, expected_tp_size=None, *, bucket_summary=None
+):
     first, (start, _) = _validate_flat_window(before, window_id, True, expected_tp_size)
     last, (end_start, end) = _validate_flat_window(after, window_id, False, len(first))
     if start != end_start:
@@ -348,8 +558,12 @@ def summarize_flat_io(before, after, window_id, expected_tp_size=None):
             deltas[name] += _flat_counter(delta)
         for name in totals:
             totals[name] += rank["io_window"][name]
-    peaks = _flat_bucket_peaks(
-        last, duration_ns=end - start, schema_version=schema_version
+    peaks = (
+        _flat_streamed_peaks(last, bucket_summary)
+        if schema_version == 3
+        else _flat_bucket_peaks(
+            last, duration_ns=end - start, schema_version=schema_version
+        )
     )
     return {
         "flat_io_window_seconds": seconds,
@@ -381,6 +595,9 @@ class FlatMemoryIOWindow:
         self.expected_tp_size = expected_tp_size
         self.window_id = str(uuid.uuid4())
         self.begin_attempted = self.ready = False
+        self._accumulator = self._collector = self._collection_error = None
+        self._stop_collection = asyncio.Event()
+        self._collection_interval = 10.0
         self.result = dict.fromkeys(_IO_RESULT_FIELDS)
         self.result.update(
             flat_io_status="unavailable",
@@ -404,8 +621,42 @@ class FlatMemoryIOWindow:
                 + ("/flat_memory/io_window" if action else "/server_info"),
                 **kwargs,
             ) as response:
-                response.raise_for_status()
+                if response.status >= 400:
+                    body = (await response.text())[:4096]
+                    try:
+                        response.raise_for_status()
+                    except aiohttp.ClientResponseError as exc:
+                        raise aiohttp.ClientResponseError(
+                            exc.request_info,
+                            exc.history,
+                            status=exc.status,
+                            message=f"{exc.message}: {body}",
+                            headers=exc.headers,
+                        ) from exc
                 return await response.json()
+
+    async def _collect_periodically(self):
+        try:
+            while not self._stop_collection.is_set():
+                try:
+                    await asyncio.wait_for(
+                        self._stop_collection.wait(), timeout=self._collection_interval
+                    )
+                    return
+                except asyncio.TimeoutError:
+                    pass
+                if not self._stop_collection.is_set():
+                    self._accumulator.add(await self._request("collect"))
+        except Exception as exc:
+            self._collection_error = exc
+            self._unavailable(exc)
+
+    async def _stop_collector(self):
+        self._stop_collection.set()
+        if self._collector is not None:
+            # FLAT_MEMORY: Finish any in-flight control request before end/abort.
+            await self._collector
+            self._collector = None
 
     async def _wait_idle(self):
         timeout = float(
@@ -461,6 +712,11 @@ class FlatMemoryIOWindow:
                 _validate_flat_window(
                     before, self.window_id, True, self.expected_tp_size
                 )
+                if _flat_window_schema_version(before["ranks"][0]["io_window"]) == 3:
+                    self._accumulator = FlatIOBucketAccumulator(
+                        before, self.window_id, self.expected_tp_size
+                    )
+                    self._collector = asyncio.create_task(self._collect_periodically())
                 self.ready = True
             except Exception as exc:
                 self._unavailable(exc)
@@ -473,16 +729,24 @@ class FlatMemoryIOWindow:
 
     async def __aexit__(self, exc_type, exc, tb):
         try:
-            if self.ready and exc_type is None:
+            await self._stop_collector()
+            if self.ready and exc_type is None and self._collection_error is None:
                 try:
                     await self._wait_idle()
                     after = await self._request("end")
-                    self.result["flat_io_metadata"]["after"] = after
+                    metadata = self.result["flat_io_metadata"]
+                    metadata["after"] = after
+                    bucket_summary = None
+                    if self._accumulator is not None:
+                        self._accumulator.add(after, final=True)
+                        bucket_summary = self._accumulator.summary()
+                        metadata["bucket_summary"] = bucket_summary
                     metrics = summarize_flat_io(
-                        self.result["flat_io_metadata"]["before"],
+                        metadata["before"],
                         after,
                         self.window_id,
                         self.expected_tp_size,
+                        bucket_summary=bucket_summary,
                     )
                     self.result.update(metrics, flat_io_status="ok", flat_io_error=None)
                     self.begin_attempted = False

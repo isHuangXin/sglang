@@ -14,11 +14,12 @@ class FlatIOManager(Protocol):
     def end_io_window(
         self, window_id: str, end_ns: int, abort: bool = False
     ) -> bool: ...
+    def collect_io_window(self, window_id: str, cutoff_ns: int) -> dict: ...
 
 
 def validate_flat_window_request(action: str, window_id: str) -> None:
     if (
-        action not in ("begin", "end", "abort")
+        action not in ("begin", "collect", "end", "abort")
         or not isinstance(window_id, str)
         or not 1 <= len(window_id) <= 128
     ):
@@ -76,13 +77,23 @@ def _control_window(
     window_id: str,
     idle: bool,
     drain: Callable[[], bool],
-) -> str | None:
+) -> tuple[str | None, dict | None]:
     state = {"tp_rank": tp_rank, "tp_size": tp_size, "pid": os.getpid(), "error": None}
     try:
         validate_flat_window_request(action, window_id)
         current = manager.get_io_window()
         _validate_owner(action, window_id, current)
-        state["current"] = current
+        if action == "collect" and (
+            not current["active"] or current.get("schema_version", 1) < 3
+        ):
+            raise ValueError(
+                "Incremental collection requires an active schema v3 window"
+            )
+        # FLAT_MEMORY: Ownership consensus must not duplicate pending bucket payloads.
+        state["current"] = {
+            key: current.get(key)
+            for key in ("window_id", "active", "start_ns", "bucket_begin")
+        }
         needs_idle = (
             action == "begin"
             and not current["active"]
@@ -98,23 +109,27 @@ def _control_window(
     try:
         validate_flat_rank_snapshots(states, tp_size=tp_size)
     except ValueError as exc:
-        return str(exc)
+        return str(exc), None
     error = _errors(states)
     if error:
-        return error
+        return error, None
     if action != "begin" or any(item["current"]["active"] for item in states):
         owners = {
             (
                 item["current"]["window_id"],
                 item["current"]["active"],
                 item["current"].get("start_ns"),
+                item["current"].get("bucket_begin") if action != "abort" else None,
             )
             for item in states
         }
         if len(owners) != 1:
-            return "Flat I/O window ownership differs across TP ranks"
+            return (
+                "Flat I/O window ownership or collection cursor differs across TP ranks",
+                None,
+            )
     if len({item["needs_drain"] for item in states}) != 1:
-        return "Flat I/O drain state differs across TP ranks"
+        return "Flat I/O drain state differs across TP ranks", None
     if states[0]["needs_drain"]:
         # FLAT_MEMORY: Validate globally before drain, which may itself use TP collectives.
         drained = {"tp_rank": tp_rank, "error": None}
@@ -125,7 +140,7 @@ def _control_window(
             drained["error"] = str(exc)
         error = _errors(gather(drained))
         if error:
-            return error
+            return error, None
 
     clock = {"tp_rank": tp_rank, "error": None}
     try:
@@ -135,17 +150,23 @@ def _control_window(
     clocks = gather(clock)
     error = _errors(clocks)
     if error:
-        return error
+        return error, None
     boundary = next(item["ns"] for item in clocks if item["tp_rank"] == 0)
     result = {"tp_rank": tp_rank, "error": None}
+    collected = None
     try:
-        accepted = (
-            manager.start_io_window(window_id, boundary)
-            if action == "begin"
-            else manager.end_io_window(window_id, boundary, abort=action == "abort")
-        )
-        if accepted is False:
-            raise RuntimeError("Flat I/O window operation was rejected")
+        if action == "collect":
+            collected = manager.collect_io_window(window_id, boundary)
+        else:
+            accepted = (
+                manager.start_io_window(window_id, boundary)
+                if action == "begin"
+                else manager.end_io_window(window_id, boundary, abort=action == "abort")
+            )
+            if accepted is False:
+                raise RuntimeError("Flat I/O window operation was rejected")
+            if action == "end" and current.get("schema_version", 1) >= 3:
+                collected = manager.collect_io_window(window_id, boundary)
     except Exception as exc:
         result["error"] = str(exc)
     error = _errors(gather(result))
@@ -166,7 +187,7 @@ def _control_window(
         rollback_error = _errors(gather(rollback))
         if rollback_error:
             error += "; " + rollback_error
-    return error
+    return error, collected
 
 
 def collect_flat_memory_state(
@@ -187,9 +208,9 @@ def collect_flat_memory_state(
     metrics and ownership counters; this function adds stable rank/window fields.
     ``idle`` covers requests, and ``drain`` waits for owned I/O without cancelling it.
     """
-    error = None
+    error, collected = None, None
     if action is not None:
-        error = _control_window(
+        error, collected = _control_window(
             manager=manager,
             tp_rank=tp_rank,
             tp_size=tp_size,
@@ -202,7 +223,9 @@ def collect_flat_memory_state(
     local = {}
     try:
         local.update(snapshot())
-        local["io_window"] = manager.get_io_window()
+        local["io_window"] = (
+            collected if collected is not None else manager.get_io_window()
+        )
     except Exception as exc:
         local["error"] = str(exc)
     # FLAT_MEMORY: Backend statistics cannot override the process owning this reply.
@@ -243,13 +266,20 @@ def flat_io_window_response(
         window = rank.get("io_window")
         if not isinstance(window, Mapping) or window.get("window_id") != window_id:
             raise ValueError("Flat I/O response belongs to a different window")
-        if window.get("active") != (action == "begin"):
+        if window.get("active") != (action in ("begin", "collect")):
             raise ValueError("Flat I/O window did not reach the requested boundary")
-        if action != "abort" and (
-            not window.get("enabled")
-            or window.get("aborted")
-            or window.get("overflowed")
-            or window.get("io_errors")
-        ):
-            raise ValueError("Flat I/O window measurements are invalid")
+        if action != "abort":
+            if window.get("overflowed"):
+                raise ValueError(
+                    "Flat I/O window overflowed: uncollected bucket buffer exhausted; "
+                    "check incremental collection and rebuild older native extensions"
+                )
+            if (
+                not window.get("enabled")
+                or window.get("aborted")
+                or window.get("io_errors")
+            ):
+                raise ValueError(
+                    "Flat I/O window measurements are disabled, aborted or have I/O errors"
+                )
     return {"tp_size": flat["tp_size"], "ranks": flat["ranks"]}

@@ -5,11 +5,13 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Annotated
+from unittest.mock import Mock
 
 from fastapi import Body, FastAPI
 from fastapi.responses import ORJSONResponse
 from fastapi.testclient import TestClient
 from sglang.srt.managers.flat_memory_io_window import (
+    collect_flat_memory_state,
     flat_io_window_response,
     validate_flat_window_request,
 )
@@ -40,7 +42,8 @@ class TestFlatMemoryIOHTTP(CustomTestCase):
                                 "io_window": {
                                     "window_id": request["flat_io_window_id"],
                                     "enabled": True,
-                                    "active": request["flat_io_action"] == "begin",
+                                    "active": request["flat_io_action"]
+                                    in ("begin", "collect"),
                                     "aborted": False,
                                     "overflowed": False,
                                     "io_errors": 0,
@@ -85,17 +88,18 @@ class TestFlatMemoryIOHTTP(CustomTestCase):
 
     def test_json_body_reaches_window_control(self):
         """Body fields must not be mistaken for a required query parameter named obj."""
-        for action in ("begin", "end"):
+        for action in ("begin", "collect", "end"):
             response = self.client.post(
                 "/flat_memory/io_window",
                 json={"action": action, "window_id": "test-owned-window"},
             )
             self.assertEqual(response.status_code, 200, response.text)
             self.assertEqual(
-                response.json()["ranks"][0]["io_window"]["active"], action == "begin"
+                response.json()["ranks"][0]["io_window"]["active"],
+                action in ("begin", "collect"),
             )
         self.assertEqual(
-            [call["flat_io_action"] for call in self.calls], ["begin", "end"]
+            [call["flat_io_action"] for call in self.calls], ["begin", "collect", "end"]
         )
         operation = self.app.openapi()["paths"]["/flat_memory/io_window"]["post"]
         self.assertIn("application/json", operation["requestBody"]["content"])
@@ -109,6 +113,48 @@ class TestFlatMemoryIOHTTP(CustomTestCase):
         )
         self.assertEqual(response.status_code, 400, response.text)
         self.assertEqual(self.calls, [])
+
+    def test_collect_does_not_require_idle_or_drain(self):
+        """Live telemetry must not drain requests, and must return the consumed chunk."""
+        current = {
+            "schema_version": 3,
+            "window_id": "owned",
+            "active": True,
+            "enabled": True,
+            "aborted": False,
+            "overflowed": False,
+            "io_errors": 0,
+            "start_ns": 1,
+            "end_ns": 0,
+            "bucket_begin": 0,
+            "bucket_end": 0,
+        }
+        chunk = {
+            **current,
+            "bucket_end": 10,
+            "buckets": [{"index": 1, "read_bytes": 42}],
+        }
+        manager = SimpleNamespace(
+            get_io_window=Mock(return_value=current),
+            io_clock_ns=Mock(return_value=1_000_000_001),
+            collect_io_window=Mock(return_value=chunk),
+        )
+        drain = Mock(side_effect=AssertionError("collection must not drain"))
+        state = collect_flat_memory_state(
+            manager=manager,
+            tp_rank=0,
+            tp_size=1,
+            gather=lambda value: [value],
+            snapshot=lambda: {"pending_backups": 1, "pending_prefetches": 2},
+            idle=False,
+            drain=drain,
+            action="collect",
+            window_id="owned",
+        )
+        response = flat_io_window_response([state], action="collect", window_id="owned")
+        self.assertEqual(response["ranks"][0]["io_window"], chunk)
+        manager.collect_io_window.assert_called_once_with("owned", 1_000_000_001)
+        drain.assert_not_called()
 
 
 if __name__ == "__main__":

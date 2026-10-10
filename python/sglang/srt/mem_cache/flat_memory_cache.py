@@ -9,6 +9,7 @@ import logging
 import math
 import time
 from concurrent.futures import Future
+from functools import wraps
 from typing import TYPE_CHECKING, Any
 
 import msgspec
@@ -31,6 +32,69 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.radix_cache import RadixKey
 
 logger = logging.getLogger(__name__)
+
+# FLAT_MEMORY: These are observed residence categories, not exclusive physical causes.
+_SCHEDULER_GATES = (
+    "engine_paused",
+    "prefill_cadence",
+    "min_free_slots",
+    "request_slots",
+    "lora",
+    "admission_token_budget",
+    "other_admission",
+    "admission_tail",
+    "test_gate",
+)
+_RESTORE_GATES = (
+    "restore_prefill_pass_budget",
+    "restore_prefill_request_limit",
+    "restore_full_pool_capacity",
+    "restore_full_decode_headroom",
+    "restore_swa_restore_and_chunk_capacity",
+    "restore_swa_decode_headroom",
+    "restore_peer_veto",
+    "restore_other",
+)
+_PREPARE_GATES = (
+    "existing_lease",
+    "chunked_prefill",
+    "candidate_queue",
+) + _RESTORE_GATES
+_WAIT_BUCKETS = (
+    (
+        "unknown",
+        "query_pending",
+        "read_pending",
+        "ready_admission",
+    )
+    + _SCHEDULER_GATES
+    + _PREPARE_GATES
+)
+_CONTROL_NAMES = (
+    "scheduler",
+    "poll",
+    "prepare_admission",
+    "finish_admission",
+    "refresh_stale_queries",
+    "rematch",
+    "reduce",
+    "reduce_collective",
+    "gather",
+)
+
+
+def _timed_control(method):
+    name = method.__name__.lstrip("_")
+
+    @wraps(method)
+    def timed(self, *args, **kwargs):
+        started = time.monotonic()
+        try:
+            return method(self, *args, **kwargs)
+        finally:
+            self.record_control_time(name, time.monotonic() - started)
+
+    return timed
 
 
 def request_storage_namespace(key: RadixKey) -> str:
@@ -77,6 +141,11 @@ class _Prefetch(msgspec.Struct, kw_only=True):
     allocation_wait_eligible: bool = False
     allocation_plan_attempts: int = 0
     plan_rejection_recorded: bool = False
+    wait_bucket: str = "unknown"
+    wait_since: float = 0.0
+    wait_seconds: dict[str, float] = msgspec.field(default_factory=dict)
+    pre_prepare_seconds: dict[str, float] | None = None
+    wait_finalized: bool = False
 
 
 class FlatMemoryCache:
@@ -108,6 +177,9 @@ class FlatMemoryCache:
         self._admission_candidate: str | None = None
         self._admission_states: list[_Prefetch] = []
         self._last_metrics_log = 0.0
+        self._control_seconds = dict.fromkeys(_CONTROL_NAMES, 0.0)
+        self._control_calls = dict.fromkeys(_CONTROL_NAMES, 0)
+        self._revalidated_requests = 0
         threshold_override = envs.SGLANG_PREFETCH_THRESHOLD.get()
         self.prefetch_threshold = int(
             config.get("prefetch_threshold", 256)
@@ -148,6 +220,85 @@ class FlatMemoryCache:
                 req, page_size=self.cache.page_size, bytes_per_page=None
             )
 
+    def begin_scheduler_pass(self) -> None:
+        # FLAT_MEMORY: Close prior observations before making new scheduling decisions.
+        now = time.monotonic()
+        for state in self.prefetches.values():
+            if state.admitted or state.cancelled or state.wait_finalized:
+                continue
+            bucket = (
+                f"{state.phase}_pending"
+                if state.phase in ("query", "read")
+                else "unknown"
+            )
+            self._set_wait(state, bucket, now=now)
+
+    def observe_scheduler_gate(self, reason: str, requests=None) -> None:
+        # FLAT_MEMORY: Query/read ownership outranks gates; admission_tail must not
+        # erase a specific prepare gate. Other observed gates replace one another.
+        if reason not in _SCHEDULER_GATES:
+            reason = "other_admission"
+        states = (
+            self.prefetches.values()
+            if requests is None
+            else (self.prefetches.get(req.rid) for req in requests)
+        )
+        now = time.monotonic()
+        for state in states:
+            if (
+                state is None
+                or state.admitted
+                or state.cancelled
+                or state.wait_finalized
+                or state.phase in ("query", "read")
+                or (reason == "admission_tail" and state.wait_bucket in _PREPARE_GATES)
+            ):
+                continue
+            self._set_wait(state, reason, now=now)
+
+    def record_control_time(self, name: str, elapsed_seconds: float) -> None:
+        # FLAT_MEMORY: Rank-local inclusive times overlap; never sum parent and child.
+        self._control_seconds[name] = self._control_seconds.get(name, 0.0) + max(
+            0.0, elapsed_seconds
+        )
+        self._control_calls[name] = self._control_calls.get(name, 0) + 1
+
+    def _set_wait(self, state: _Prefetch, bucket: str, *, now=None) -> None:
+        if state.wait_finalized:
+            return
+        now = max(state.wait_since, time.monotonic() if now is None else now)
+        state.wait_seconds[state.wait_bucket] = state.wait_seconds.get(
+            state.wait_bucket, 0.0
+        ) + (now - state.wait_since)
+        state.wait_since, state.wait_bucket = now, bucket
+
+    def _publish_wait(self, state: _Prefetch, *, scope: str, seconds: dict) -> None:
+        # FLAT_MEMORY: Overlapping request windows are not additive serving cost.
+        self._diagnose(
+            state,
+            **{f"{scope}_total_ms": (state.wait_since - state.started) * 1000},
+            **{
+                f"{scope}_{bucket}_ms": seconds.get(bucket, 0.0) * 1000
+                for bucket in _WAIT_BUCKETS
+            },
+        )
+
+    def _freeze_pre_prepare(self, state: _Prefetch) -> None:
+        if state.pre_prepare_seconds is None and not state.wait_finalized:
+            self._set_wait(state, "unknown", now=state.lease_started)
+            state.pre_prepare_seconds = state.wait_seconds.copy()
+            self._publish_wait(
+                state, scope="pre_prepare", seconds=state.pre_prepare_seconds
+            )
+
+    def _finalize_wait(self, state: _Prefetch, outcome: str, *, now=None) -> None:
+        if state.wait_finalized:
+            return
+        self._set_wait(state, state.wait_bucket, now=now)
+        state.wait_finalized = True
+        self._publish_wait(state, scope="wait", seconds=state.wait_seconds)
+        self._diagnose(state, wait_outcome=outcome, wait_finalized=1)
+
     def order_ready_requests(self, requests: list) -> list:
         # FLAT_MEMORY: A ready lease gets the first real admission attempt.
         ordered = (
@@ -180,33 +331,53 @@ class FlatMemoryCache:
             namespace + value
             for value in self.tree_linker._tail_hashes(key, result, device_hit_len)
         ]
+        started = time.monotonic()
         state = _Prefetch(
             req=req,
             key=key,
             result=result,
             tail_hashes=tail_hashes,
-            started=time.monotonic(),
+            started=started,
+            wait_since=started,
             swa_evicted_before=req.kv.swa_evicted_seqlen if req.kv is not None else 0,
             original_device_tokens=device_hit_len,
             query_start=device_hit_len,
             queried_endpoint=device_hit_len,
         )
         self.prefetches[req.rid] = state
-        self._diagnose(state, original_device_tokens=device_hit_len)
+        # FLAT_MEMORY: The ledger describes the latest match episode, not all reentries.
+        # Legacy request counters survive retraction; only this ledger starts anew.
+        stats = req.flat_prefetch_stats
+        episode = stats.get("flat_restore_wait_episode", 0) + 1
+        for name in tuple(stats):
+            if name.startswith(("flat_restore_wait_", "flat_restore_pre_prepare_")):
+                del stats[name]
+        self._diagnose(
+            state,
+            original_device_tokens=device_hit_len,
+            wait_episode=episode,
+            wait_schema_version=1,
+            wait_outcome="open",
+            wait_finalized=0,
+        )
         if (
             not tail_hashes
             or len(tail_hashes) * self.cache.page_size < self.prefetch_threshold
         ):
             state.phase = "ready"
+            self._set_wait(state, "ready_admission")
             return result
         transfers = self._lookup_transfers(tail_hashes)
         if not transfers:
             state.phase, state.bypass = "ready", True
+            self._set_wait(state, "ready_admission")
             return result
         # FLAT_MEMORY: Metadata probes never retain an evictable device anchor.
+        self._set_wait(state, "query_pending")
         try:
             state.future = self.cache_linker.submit_lookup(req.rid, transfers)
         except BaseException:
+            self._finalize_wait(state, "lookup_failed")
             self.prefetches.pop(req.rid)
             raise
         return result
@@ -222,11 +393,18 @@ class FlatMemoryCache:
             transfers.append(transfer)
         return transfers
 
+    @_timed_control
     def _reduce(self, values: list[int], op) -> list[int]:
         tensor = torch.tensor(values, dtype=torch.int, device="cpu")
-        self.cache._all_reduce_attn_groups(tensor, op)
+        started = time.monotonic()
+        try:
+            self.cache._all_reduce_attn_groups(tensor, op)
+        finally:
+            # FLAT_MEMORY: Includes waiting for peers, not just transport execution.
+            self.record_control_time("reduce_collective", time.monotonic() - started)
         return tensor.tolist()
 
+    @_timed_control
     def poll(self) -> None:
         self._poll_offloads()
         self.cache_linker.poll_queries()
@@ -294,6 +472,7 @@ class FlatMemoryCache:
         state.query_generation = self.cache_linker.get_lookup_generation(state.req.rid)
         state.queried_endpoint = state.query_start + pages * self.cache.page_size
         state.phase = "allocate" if pages else "ready"
+        self._set_wait(state, "unknown" if pages else "ready_admission")
         self._diagnose(
             state,
             queried_endpoint=state.queried_endpoint,
@@ -308,6 +487,7 @@ class FlatMemoryCache:
             swa_tokens=lease.swa_reservation if active else 0,
         )
 
+    @_timed_control
     def prepare_admission(
         self, requests: list, adder, *, has_chunked_req: bool
     ) -> list:
@@ -320,9 +500,14 @@ class FlatMemoryCache:
         self._admission_candidate = None
         for state in self._admission_states:
             state.admission_attempted = False
+            if state.phase == "ready":
+                self._set_wait(state, "ready_admission")
         self._refresh_stale_queries(self._admission_states)
         lease = self.prefetches.get(self._lease_rid)
         if lease is not None:
+            for state in self._admission_states:
+                if state.phase == "allocate":
+                    self._set_wait(state, "existing_lease")
             if lease.phase == "ready":
                 self._revalidate_lease(lease, adder)
         elif not has_chunked_req:
@@ -331,11 +516,20 @@ class FlatMemoryCache:
             )
             if candidate is not None:
                 self._admission_candidate = candidate.req.rid
+                for state in self._admission_states:
+                    if state is not candidate and state.phase == "allocate":
+                        self._set_wait(state, "candidate_queue")
                 if self._select_restore(candidate, adder):
                     # FLAT_MEMORY: Private allocation may evict another unleased ready hit.
                     for state in self._admission_states:
                         if self._is_unleased(state) and state.phase == "ready":
                             self._revalidate_unleased(state)
+                            if state.phase == "allocate":
+                                self._set_wait(state, "candidate_queue")
+        else:
+            for state in self._admission_states:
+                if state.phase == "allocate":
+                    self._set_wait(state, "chunked_prefill")
         self.carry_reservation(adder)
         return self.order_ready_requests(requests)
 
@@ -356,6 +550,7 @@ class FlatMemoryCache:
             and not state.lease_started
         )
 
+    @_timed_control
     def _refresh_stale_queries(self, states: list[_Prefetch]) -> None:
         if not states:
             return
@@ -388,6 +583,7 @@ class FlatMemoryCache:
         device_tokens = len(result.device_indices)
         if device_tokens >= state.queried_endpoint:
             state.phase = "ready"
+            self._set_wait(state, "ready_admission")
             if state.queried_endpoint > state.query_start:
                 self._diagnose(state, reason="device_covers_restore")
             return
@@ -414,6 +610,7 @@ class FlatMemoryCache:
         else:
             # FLAT_MEMORY: Receipt coordinates stay fixed; selection slices its hashes.
             state.phase = "allocate"
+            self._set_wait(state, "unknown")
             self._diagnose(state, reason="receipt_reuse")
         if was_ready and not state.bypass:
             state.device_cover_reactivations += 1
@@ -437,7 +634,9 @@ class FlatMemoryCache:
         )[0]
         return not exhausted
 
+    @_timed_control
     def _rematch(self, state: _Prefetch) -> MatchResult:
+        self._revalidated_requests += 1
         # FLAT_MEMORY: A metadata-only query's original node/indices may be evicted.
         result = self.cache.match_prefix(MatchPrefixParams(key=state.key))
         size = [len(result.device_indices)]
@@ -465,6 +664,7 @@ class FlatMemoryCache:
         ]
         if not tail_hashes:
             state.phase = "ready"
+            self._set_wait(state, "ready_admission")
             state.query_start = state.queried_endpoint = query_start
             state.tail_hashes = []
             self.cache_linker.release_lookup(state.req.rid)
@@ -476,7 +676,12 @@ class FlatMemoryCache:
             return True
         if not self._can_refresh(state, reason=reason):
             return False
-        future = self.cache_linker.refresh_lookup(state.req.rid, transfers)
+        self._set_wait(state, "query_pending")
+        try:
+            future = self.cache_linker.refresh_lookup(state.req.rid, transfers)
+        except BaseException:
+            self._finalize_wait(state, "lookup_failed")
+            raise
         state.future = future
         state.query_start = state.queried_endpoint = query_start
         state.tail_hashes = tail_hashes
@@ -526,6 +731,7 @@ class FlatMemoryCache:
         can_restore, never_fits, wait_eligible = self._sync_plan(plan)
         state.allocation_wait_eligible = wait_eligible
         if not can_restore:
+            self._observe_plan_gate(state, plan)
             self._record_plan_rejection(state, plan)
             self._release_hold(state)
             self.restore_deferrals += 1
@@ -547,6 +753,7 @@ class FlatMemoryCache:
         state.read_endpoint = state.queried_endpoint
         state.loaded_tokens = state.read_endpoint - device_tokens
         state.lease_started = time.monotonic()
+        self._freeze_pre_prepare(state)
         self._lease_rid = state.req.rid
         self._diagnose(
             state,
@@ -577,6 +784,11 @@ class FlatMemoryCache:
             bool(never_fits),
             bool(wait_eligible and not never_fits),
         )
+
+    def _observe_plan_gate(self, state: _Prefetch, plan) -> None:
+        # FLAT_MEMORY: The first rejection snapshot cannot explain a later peer veto.
+        bucket = "restore_peer_veto" if plan.can_restore else f"restore_{plan.reason}"
+        self._set_wait(state, bucket if bucket in _RESTORE_GATES else "restore_other")
 
     def _record_plan_rejection(self, state: _Prefetch, plan) -> None:
         if state.plan_rejection_recorded:
@@ -642,7 +854,9 @@ class FlatMemoryCache:
             self._fallback(state, "ready_never_fits")
         elif can_restore:
             state.full_reservation, state.swa_reservation = self._sync_reservation(plan)
+            self._set_wait(state, "ready_admission")
         else:
+            self._observe_plan_gate(state, plan)
             self._diagnose(state, reason=plan.reason or "ready_headroom")
 
     def _prepare(self, state: _Prefetch, *, keys: list[str]) -> None:
@@ -693,6 +907,7 @@ class FlatMemoryCache:
             return
         # FLAT_MEMORY: A dispatch failure must not make possibly active DMA evictable.
         state.phase = "read"
+        self._set_wait(state, "read_pending")
         self.cache_linker.start_preparing_loads()
 
     def _poll_reads(self, states: list[_Prefetch]) -> None:
@@ -750,6 +965,7 @@ class FlatMemoryCache:
         self._release_hold(state)
         state.hold_node, state.hold_params = node, hold
         state.ready_started = time.monotonic()
+        self._set_wait(state, "ready_admission", now=state.ready_started)
         state.req.storage_read_tokens = state.loaded_tokens
         state.req.storage_read_latency_ms = (state.ready_started - state.started) * 1000
         self._diagnose(
@@ -814,6 +1030,7 @@ class FlatMemoryCache:
                 self._handoff(state)
         self.carry_reservation(adder)
 
+    @_timed_control
     def finish_admission(self, adder, *, can_progress: bool) -> None:
         states = self._admission_states
         if states:
@@ -883,6 +1100,7 @@ class FlatMemoryCache:
             for name in ("flat_dram", "flat_ssd", "flat_mixed"):
                 req.flat_prefetch_stats[name] = 0 if reused == 0 else None
         now = time.monotonic()
+        self._finalize_wait(state, "admitted", now=now)
         self._diagnose(
             state,
             admission_endpoint=len(req.prefix_indices),
@@ -933,6 +1151,7 @@ class FlatMemoryCache:
             self._lease_rid = None
         state.full_reservation = state.swa_reservation = 0
         state.phase, state.bypass = "ready", True
+        self._set_wait(state, "ready_admission")
         state.revoke_reason = reason
         self.tree_linker.hit_markers.pop(state.req.rid, None)
         self.cache_linker.release_lookup(state.req.rid)
@@ -953,6 +1172,7 @@ class FlatMemoryCache:
             self.arrivals.pop(rid, None)
             return
         state.cancelled = True
+        self._finalize_wait(state, "cancelled")
         self._finish_allocation_wait(state, "cancelled")
         if state.phase != "read":
             self._forget(state)
@@ -965,6 +1185,7 @@ class FlatMemoryCache:
     def _forget(self, state: _Prefetch, *, keep_arrival: bool = False) -> None:
         if state.prepared is not None or state.phase == "read":
             raise RuntimeError("Flat cannot forget a restore before I/O drain")
+        self._finalize_wait(state, "cancelled" if state.cancelled else "forgotten")
         self._release_hold(state)
         self.cache_linker.forget_request(state.req.rid)
         self.tree_linker.hit_markers.pop(state.req.rid, None)
@@ -1095,12 +1316,22 @@ class FlatMemoryCache:
             flat_restore_deferrals=self.restore_deferrals,
             flat_restore_ready_dropped_tokens=self.ready_dropped_tokens,
             flat_restore_admission_dropped_tokens=self.admission_dropped_tokens,
+            flat_restore_revalidated_requests=self._revalidated_requests,
             application_host_staging_bytes=0,
             host_pool_bytes=0,
             gds_mode="compat",
         )
+        result.update(
+            (f"flat_restore_control_{name}_seconds", seconds)
+            for name, seconds in self._control_seconds.items()
+        )
+        result.update(
+            (f"flat_restore_control_{name}_calls", calls)
+            for name, calls in self._control_calls.items()
+        )
         return result
 
+    @_timed_control
     def gather(self, value) -> list:
         if self.cache.tp_world_size == 1:
             return [value]

@@ -1826,6 +1826,10 @@ class Scheduler(
             recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
             if self._engine_paused:
+                if self.flat_memory_cache is not None:
+                    self.flat_memory_cache.observe_scheduler_gate(
+                        "engine_paused", self.waiting_queue
+                    )
                 continue
 
             # Get the next batch to run
@@ -1870,6 +1874,10 @@ class Scheduler(
             recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
             if self._engine_paused:
+                if self.flat_memory_cache is not None:
+                    self.flat_memory_cache.observe_scheduler_gate(
+                        "engine_paused", self.waiting_queue
+                    )
                 continue
 
             # Get the next batch to run
@@ -3370,6 +3378,10 @@ class Scheduler(
     def get_next_batch_to_run(
         self, running_batch: ScheduleBatch, last_batch: Optional[ScheduleBatch]
     ) -> NextBatchPlan:
+        flat_schedule_started = None
+        if self.flat_memory_cache is not None:
+            flat_schedule_started = time.perf_counter()
+            self.flat_memory_cache.begin_scheduler_pass()
         self.process_pending_chunked_abort()
 
         if self.enable_fpm:
@@ -3459,6 +3471,10 @@ class Scheduler(
         if self.dllm_config is not None:
             new_batch = self.get_new_batch_dllm(running_batch)
         elif self._should_defer_prefill():
+            if self.flat_memory_cache is not None:
+                self.flat_memory_cache.observe_scheduler_gate(
+                    "prefill_cadence", self.waiting_queue
+                )
             new_batch = None
         else:
             prefill_plan = self.get_new_batch_prefill(running_batch)
@@ -3514,6 +3530,11 @@ class Scheduler(
             if self.enable_fpm:
                 ret.fpm_start_time = self._fpm_batch_t0
 
+        if flat_schedule_started is not None:
+            # FLAT_MEMORY: Completed selection wall time includes nested Flat control work.
+            self.flat_memory_cache.record_control_time(
+                "scheduler", time.perf_counter() - flat_schedule_started
+            )
         return NextBatchPlan(batch_to_run=ret, running_batch=running_batch)
 
     def get_num_allocatable_reqs(
@@ -3604,6 +3625,10 @@ class Scheduler(
                 ),
             )
         ):
+            if self.flat_memory_cache is not None:
+                self.flat_memory_cache.observe_scheduler_gate(
+                    "min_free_slots", self.waiting_queue
+                )
             return None, running_batch
 
         # Ignore the check if self.chunked_req is not None.
@@ -3617,6 +3642,10 @@ class Scheduler(
             and not self.enable_priority_preemption
         ):
             running_batch.batch_is_full = True
+            if self.flat_memory_cache is not None:
+                self.flat_memory_cache.observe_scheduler_gate(
+                    "request_slots", self.waiting_queue
+                )
             return None, running_batch
 
         # Get priority queue
@@ -3630,6 +3659,10 @@ class Scheduler(
             # If we are testing retraction and the running batch size exceeds
             # TEST_RETRACT_NO_PREFILL_BS, we skip the prefill to keep the requests
             # in the waiting queue.
+            if self.flat_memory_cache is not None:
+                self.flat_memory_cache.observe_scheduler_gate(
+                    "test_gate", self.waiting_queue
+                )
             return None, running_batch
 
         # Determine chunked_prefill_size for this batch
@@ -3700,8 +3733,10 @@ class Scheduler(
         if mamba_allocator is not None:
             mamba_allocator.alloc_group_begin(len(self.waiting_queue))
         # Get requests from the waiting queue to a new prefill batch
-        for req in self.waiting_queue:
+        for req_index, req in enumerate(self.waiting_queue):
             if self.enable_lora and not self._can_schedule_lora_req(req, running_loras):
+                if self.flat_memory_cache is not None:
+                    self.flat_memory_cache.observe_scheduler_gate("lora", (req,))
                 continue
 
             running_bs = len(running_batch.reqs)
@@ -3725,6 +3760,10 @@ class Scheduler(
                     not self.enable_priority_preemption
                     or not adder.preempt_to_schedule(req)
                 ):
+                    if self.flat_memory_cache is not None:
+                        self.flat_memory_cache.observe_scheduler_gate(
+                            "request_slots", self.waiting_queue[req_index:]
+                        )
                     break
 
             if self.flat_memory_cache is not None:
@@ -3798,6 +3837,17 @@ class Scheduler(
                 # pre-existing from a session). Session-held slots have their own
                 # lifecycle and freeing them here causes double-free.
                 added = len(adder.can_run_list) > 0 and req is adder.can_run_list[-1]
+                if self.flat_memory_cache is not None:
+                    if not added:
+                        self.flat_memory_cache.observe_scheduler_gate(
+                            "admission_token_budget"
+                            if res == AddReqResult.NO_TOKEN
+                            else "other_admission",
+                            (req,),
+                        )
+                    self.flat_memory_cache.observe_scheduler_gate(
+                        "admission_tail", self.waiting_queue[req_index + 1 :]
+                    )
                 if not added:
                     # init_next_round_input() may stage deferred Mamba COW/clear
                     # metadata before add_one_req() rejects the request.

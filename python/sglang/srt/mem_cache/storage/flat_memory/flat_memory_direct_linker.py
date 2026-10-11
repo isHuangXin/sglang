@@ -107,6 +107,20 @@ class LayerLoadCounter:
             self.producer_index = self.consumer_index = -1
 
 
+def _shm_free_bytes() -> int | None:
+    """Free bytes on /dev/shm, or None when it cannot be determined.
+
+    The shared DRAM pool lives in tmpfs, so a budget that exceeds /dev/shm
+    fails at ftruncate after eight ranks have already loaded the model. Checking
+    here turns that into one clear message before any of that work.
+    """
+    try:
+        stats = os.statvfs("/dev/shm")
+    except OSError:
+        return None
+    return stats.f_bavail * stats.f_frsize
+
+
 class FlatMemoryDirectLinker(UnifiedCacheLinker):
     def __init__(
         self,
@@ -154,6 +168,23 @@ class FlatMemoryDirectLinker(UnifiedCacheLinker):
                 else torch.cuda.current_device()
             )
             if self.rank_replicated:
+                # The budgets arrive divided by tp_size, because each rank used
+                # to own a private pool. There is now one pool for the node, so
+                # it takes the whole node budget -- otherwise dedup would remove
+                # the duplication and shrink the pool by the same factor,
+                # leaving the usable capacity exactly where it started.
+                native_config.dram_capacity_gb *= tp_size
+                native_config.ssd_capacity_gb *= tp_size
+                shm_bytes = int(native_config.dram_capacity_gb * 1024**3)
+                free_shm = _shm_free_bytes()
+                if free_shm is not None and shm_bytes > free_shm:
+                    raise ValueError(
+                        "Flat shared DRAM pool needs "
+                        f"{shm_bytes / 1024**3:.1f} GiB but /dev/shm has only "
+                        f"{free_shm / 1024**3:.1f} GiB free. The shared pool is a "
+                        "tmpfs segment, so lower FLAT_DRAM_BYTES to at most "
+                        f"{int(free_shm / 1024**3)} GiB or raise the tmpfs size."
+                    )
                 # One backing file for the node: every rank opens the same
                 # gpu_file_pool.bin and reads at the offset the shared index
                 # hands it. Offsets never overlap because a single allocator,

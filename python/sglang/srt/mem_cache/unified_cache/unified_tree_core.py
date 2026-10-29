@@ -139,6 +139,8 @@ class UnifiedTreeNode:
         # Anchor NodeId of an in-flight H->D load-back reading this node's
         # host slots; such host copies must not be reclaimed until the ack.
         self.load_back_pending_id: Optional[int] = None
+        # FLAT_MEMORY: Telemetry covers all pools and both host write policies.
+        self.restore_load_pending_ids: set[int] = set()
 
     def component(self, component_type: ComponentType) -> ComponentData:
         return self.component_data[component_type]
@@ -1171,6 +1173,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         new_node.creation_time = child.creation_time
         # Split fragments stay on the anchor's root path for the ack's walk.
         new_node.load_back_pending_id = child.load_back_pending_id
+        new_node.restore_load_pending_ids = child.restore_load_pending_ids.copy()
 
         self._for_each_component_lru(child, UnifiedLRUList.remove_node)
 

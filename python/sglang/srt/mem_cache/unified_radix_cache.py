@@ -87,6 +87,11 @@ from sglang.srt.observability.metrics_collector import (
     StorageMetrics,
     StorageMetricsCollector,
 )
+from sglang.srt.observability.storage_restore import (
+    HostRestoreTracker,
+    RestoreSource,
+    merge_restore_sources,
+)
 from sglang.srt.runtime_context import (
     get_memory,
     get_model,
@@ -281,6 +286,9 @@ class UnifiedRadixCache(BasePrefixCache):
             "l3_sum_rate_main_weighted": 0.0,
         }
 
+        # FLAT_MEMORY: Only scalar evidence is retained beyond request admission.
+        self.storage_restore_tracker = HostRestoreTracker()
+        self._restore_load_nodes: dict[int, set[int]] = {}
         self.reset()
         logger.info(
             f"Init Unified Radix Cache. Components: {self.tree_components}. "
@@ -367,6 +375,8 @@ class UnifiedRadixCache(BasePrefixCache):
         # FLAT_MEMORY: Quiesce DMA/storage before destroying the pages they still own.
         if self.cache_controller is not None:
             self.cache_controller.reset()
+        self.storage_restore_tracker.reset()
+        self._restore_load_nodes.clear()
         self.tree_core.reset()
         self.session_refs.reset()
 
@@ -545,6 +555,10 @@ class UnifiedRadixCache(BasePrefixCache):
         assert not result.cache_actions
         if self.linker is not None and params.req is not None:
             result = self.linker.match(params.key, params.req, result)
+        if params.req is not None:
+            self._watch_storage_restore(
+                rid=params.req.rid, node_id=result.last_device_node
+            )
         return result
 
     def is_chunk_cache(self) -> bool:
@@ -1448,6 +1462,120 @@ class UnifiedRadixCache(BasePrefixCache):
             for node_id in publish_node_ids:
                 self.write_backup_storage(node_id)
 
+    # FLAT_MEMORY: Host timing ends at the existing all-layer/all-TP ACK, not insertion.
+    def begin_storage_restore(self, req: Req) -> None:
+        timing = req.storage_restore_timing
+        if self.flat_memory is not None or timing.reason is not None:
+            return
+        if self.host_memory_mode == "buffer_only":
+            timing.unsupported("buffer_only_restore_not_instrumented")
+        elif req.session is not None:
+            timing.unsupported("session_restore_not_instrumented")
+        elif self.linker is not None or not isinstance(self.tree_core, UnifiedTreeCore):
+            timing.unsupported("unsupported_host_restore_implementation")
+        elif self.cache_controller is not None and self.enable_storage:
+            self.storage_restore_tracker.register(
+                rid=req.rid, episode=timing.active, page_size=self.page_size
+            )
+
+    def _restore_path(self, node_id: NodeId):
+        node = self.tree_core.node_by_id(node_id)
+        path = []
+        while node.parent is not None:
+            path.append(node)
+            node = node.parent
+        start = 0
+        for node in reversed(path):
+            end = start + len(node.key)
+            yield node, start, end
+            start = end
+
+    def _watch_storage_restore(self, *, rid: str, node_id: NodeId) -> None:
+        if rid not in self.storage_restore_tracker.requests:
+            return
+        for node, start, end in self._restore_path(node_id):
+            for dependency in node.restore_load_pending_ids:
+                self.storage_restore_tracker.watch(
+                    rid=rid,
+                    dependency=dependency,
+                    start=start,
+                    end=end,
+                    values=tuple(
+                        node.component_data[ct].value for ct in self.tree_components
+                    ),
+                )
+
+    def _track_storage_restore_load(self, *, node_id, req, kv_xfer, comp_xfers) -> None:
+        if (
+            not isinstance(self.tree_core, UnifiedTreeCore)
+            or self.host_memory_mode != "cache"
+        ):
+            return
+        nodes = {
+            nid
+            for transfers in ([kv_xfer], *comp_xfers.values())
+            for transfer in transfers
+            for nid in transfer.nodes_to_load or ()
+        }
+        episode = (
+            self.storage_restore_tracker.requests.get(req.rid)
+            if req is not None
+            else None
+        )
+        pages = {}
+        for node, start, end in self._restore_path(node_id):
+            if node.id not in nodes:
+                continue
+            node.restore_load_pending_ids.add(node_id)
+            for offset in range(start, end, self.page_size):
+                pages[offset] = (
+                    episode.storage_pages.get(offset, RestoreSource(1, True))
+                    if episode is not None
+                    else RestoreSource()
+                )
+        self._restore_load_nodes[node_id] = nodes
+        self.storage_restore_tracker.queued(
+            dependency=node_id,
+            pages=pages,
+            required_pages=(
+                episode.source_required_pages if episode is not None else set()
+            ),
+        )
+        if req is not None:
+            self._watch_storage_restore(rid=req.rid, node_id=node_id)
+
+    def _finish_storage_restore_load(
+        self, *, node_ids: list[int], ready_ns: int
+    ) -> None:
+        self.storage_restore_tracker.ready(dependencies=node_ids, ready_ns=ready_ns)
+        for dependency in node_ids:
+            seen = set()
+            for node_id in self._restore_load_nodes.pop(dependency, ()):
+                node = self.tree_core.try_node_by_id(node_id)
+                while node is not None and node.id not in seen:
+                    seen.add(node.id)
+                    node.restore_load_pending_ids.discard(dependency)
+                    node = node.parent
+
+    def adopt_storage_restores(self, requests: list[Req]) -> None:
+        for req in requests:
+            self._watch_storage_restore(rid=req.rid, node_id=req.last_node)
+            if req.rid in self.storage_restore_tracker.requests:
+                values_by_page = {
+                    offset: tuple(
+                        node.component_data[ct].value for ct in self.tree_components
+                    )
+                    for node, start, end in self._restore_path(req.last_node)
+                    for offset in range(
+                        start, min(end, len(req.prefix_indices)), self.page_size
+                    )
+                }
+                self.storage_restore_tracker.adopt(
+                    rid=req.rid,
+                    prefix_tokens=len(req.prefix_indices),
+                    values_by_page=values_by_page,
+                )
+
     def load_back(
         self,
         node_id: NodeId,
@@ -1548,6 +1676,9 @@ class UnifiedRadixCache(BasePrefixCache):
             node_id,
             self.inc_lock_ref(node_id).to_dec_params(),
             host_anchor_params,
+        )
+        self._track_storage_restore_load(
+            node_id=node_id, req=req, kv_xfer=kv_xfer, comp_xfers=comp_xfers
         )
 
         return True
@@ -1726,6 +1857,9 @@ class UnifiedRadixCache(BasePrefixCache):
         ).page_aligned(self.page_size)
         prefetch_length = len(prefetch_key)
         stats = self._prefetch_outcome_stats
+        episode = self.storage_restore_tracker.requests.get(req_id)
+        if episode is not None and prefetch_length > 0:
+            episode.outcome = "miss"
         if prefetch_length > 0:
             stats["attempts"] += 1
         if prefetch_length < self.prefetch_threshold:
@@ -1812,6 +1946,8 @@ class UnifiedRadixCache(BasePrefixCache):
             extra_pools=aux_xfers or None,
         )
         stats["issued"] += 1
+        operation.restore_episode = episode
+        operation.restore_storage_start = len(matched_prefix_tokens or [])
         # Snapshots for the L3 miss accounting at the query outcome (the
         # hit/revoke drains): requested span and total prompt length.
         operation.stats_requested_tokens = prefetch_length
@@ -1986,6 +2122,7 @@ class UnifiedRadixCache(BasePrefixCache):
         self.cache_controller.prefetch_tokens_occupied -= len(prefetch_key)
 
         self.prefetch_loaded_tokens_by_reqid[req_id] = loaded_from_storage
+        self._record_storage_restore_source(operation, insert_result)
         logger.info(
             "HiCache prefetch %s req=%s completed=%d matched=%d loaded=%d occupied=%d",
             "dropped" if insert_result.host_insert_dropped else "success",
@@ -1998,6 +2135,42 @@ class UnifiedRadixCache(BasePrefixCache):
         if self.enable_storage_metrics and self.storage_metrics_collector is not None:
             self.storage_metrics_collector.log_prefetched_tokens(loaded_from_storage)
         return
+
+    def _record_storage_restore_source(self, operation, insert_result) -> None:
+        episode = operation.restore_episode
+        if episode is None or episode.status != "pending":
+            return
+        if insert_result.host_insert_dropped:
+            episode.outcome = "discarded"
+            return
+        valid_pages = operation.completed_tokens // self.page_size
+        if valid_pages == 0 and operation.error:
+            episode.outcome = "failed"
+        elif valid_pages:
+            episode.outcome = "discarded"
+        first_page = insert_result.prefix_len // self.page_size
+        sidecar = operation.restore_sidecar_source
+        episode.source_requires_full_restore |= any(
+            transfer.indices_from_pool != PoolName.KV
+            for transfer in operation.pool_transfers or ()
+        )
+        if episode.source_requires_full_restore:
+            episode.source_required_pages.update(
+                range(
+                    operation.restore_storage_start,
+                    operation.restore_storage_start + operation.completed_tokens,
+                    self.page_size,
+                )
+            )
+        for index in range(first_page, valid_pages):
+            source = (
+                operation.restore_source_pages[index]
+                if index < len(operation.restore_source_pages)
+                else RestoreSource()
+            )
+            episode.storage_pages[
+                operation.restore_storage_start + index * self.page_size
+            ] = merge_restore_sources((source, sidecar))
 
     def _check_hybrid_prefetch_result(
         self,
@@ -2049,6 +2222,10 @@ class UnifiedRadixCache(BasePrefixCache):
             for transfer, count in zip(pool_transfers, pool_hit_pages)
         )
         if pool_transfers and not all_succeeded:
+            if operation.restore_episode is not None:
+                operation.restore_episode.outcome = (
+                    "failed" if operation.error else "discarded"
+                )
             # Drop the KV beliefs from the first page any pool failed to serve;
             # the next insert then re-writes that span through one FULL check,
             # restoring the missing aux pages.
@@ -2138,6 +2315,7 @@ class UnifiedRadixCache(BasePrefixCache):
 
     @rank_consensus(same_params=True)
     def release_aborted_request(self, rid: str) -> None:
+        self.storage_restore_tracker.cancel(rid=rid)
         if self.linker is not None:
             self.linker.release_request(rid)
         self.prefetch_loaded_tokens_by_reqid.pop(rid, None)
@@ -2247,6 +2425,8 @@ class UnifiedRadixCache(BasePrefixCache):
             anchor_lock_params,
             comp_xfers,
         ) = info
+        if operation.restore_episode is not None and operation.error:
+            operation.restore_episode.outcome = "failed"
         self._invalidate_absent_from_hit_query(operation)
         if self.buffer_pipeline is not None:
             self.buffer_pipeline.pop_prefix_ctx(req_id)
@@ -2306,7 +2486,7 @@ class UnifiedRadixCache(BasePrefixCache):
             (buffer mode parks and retries; cache mode revokes)."""
             req_id = operation.request_id
             info = self.ongoing_prefetch.get(req_id)
-            if info is None:
+            if info is None or info.operation is not operation:
                 return True  # aborted/cleaned; nothing to retry
             if operation.is_terminated():
                 self.revoke_pending_prefetch(req_id)
@@ -2377,7 +2557,7 @@ class UnifiedRadixCache(BasePrefixCache):
             for operation in _drain_queue(cc.prefetch_hit_queue, n_storage_hit):
                 req_id = operation.request_id
                 info = self.ongoing_prefetch.get(req_id)
-                if info is None:
+                if info is None or info.operation is not operation:
                     # Request already aborted/cleaned up; still flush the
                     # query's absent-hash feedback.
                     self._invalidate_absent_from_hit_query(operation)
@@ -2405,18 +2585,28 @@ class UnifiedRadixCache(BasePrefixCache):
         def _drain_ack_prefetch():
             for ack in _drain_queue(cc.ack_prefetch_queue, n_ack_prefetch):
                 operation = ack.operation
+                current = self.ongoing_prefetch.get(operation.request_id)
+                owns_request = current is not None and current.operation is operation
                 if ack.completed_tokens is not None:
-                    if operation.request_id in self.ongoing_prefetch:
+                    if owns_request:
                         assert operation.completed_tokens <= ack.completed_tokens
                         operation.completed_tokens = ack.completed_tokens
+                        valid_pages = ack.completed_tokens // self.page_size
+                        if ack.source_page_start < valid_pages:
+                            operation.restore_source_pages[
+                                ack.source_page_start : valid_pages
+                            ] = (ack.source_pages or [])[
+                                : valid_pages - ack.source_page_start
+                            ]
                 if ack.pool_hits is not None:
-                    if operation.request_id in self.ongoing_prefetch:
+                    if owns_request:
                         operation.pool_storage_result.update_extra_pool_hit_pages(
                             ack.pool_hits
                         )
+                        operation.restore_sidecar_source = ack.sidecar_source
                         operation.pool_transfers_done = True
                 if ack.completed_req:
-                    if operation.request_id in self.ongoing_prefetch:
+                    if owns_request:
                         # check_prefetch_progress() is not called for this rid yet.
                         # Let us insert the prefetch result into the radix tree.
                         self._handle_prefetch_result(operation)
@@ -2755,6 +2945,9 @@ class UnifiedRadixCache(BasePrefixCache):
         while finish_count > 0:
             ack = cc.ack_load_queue.pop(0)
             ack.finish_event.synchronize()
+            self._finish_storage_restore_load(
+                node_ids=ack.node_ids, ready_ns=time.monotonic_ns()
+            )
             for ack_id in ack.node_ids:
                 if (
                     self.buffer_pipeline is not None

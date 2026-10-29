@@ -28,6 +28,10 @@ from sglang.srt.observability.flat_memory_metrics import (
     native_mooncake_bandwidth,
 )
 from sglang.srt.observability.metrics_collector import StorageMetrics
+from sglang.srt.observability.storage_restore import (
+    RestoreSource,
+    group_restore_sources,
+)
 
 DEFAULT_LOCAL_BUFFER_SIZE = 16 * 1024 * 1024  # 16 MB
 SETUP_TIMEOUT = 600  # 10min
@@ -903,7 +907,9 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         final_pages = restorable[-1] if restorable else 0
         return PoolTransferResult(final_pages, hit_count, restorable)
 
-    def _batch_io_v2(self, transfers: List[PoolTransfer], is_set: bool):
+    def _batch_io_v2(
+        self, transfers: List[PoolTransfer], is_set: bool, extra_info=None
+    ):
         # Unified v2 I/O path: each PoolTransfer can expand to one or more
         # storage objects per logical page, but API still reports page-level result.
         results: dict = {}
@@ -945,9 +951,22 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                     for i, res in zip(missing_idx, put_results):
                         io_results[i] = res
             else:
+                source_masks = []
                 io_results = self._get_batch_zero_copy_impl(
-                    key_strs, ptr_list, element_size_list
+                    key_strs,
+                    ptr_list,
+                    element_size_list,
+                    source_masks=(
+                        source_masks
+                        if extra_info is not None
+                        and extra_info.restore_sources is not None
+                        else None
+                    ),
                 )
+                if extra_info is not None and extra_info.restore_sources is not None:
+                    extra_info.restore_sources.pools[transfer.name] = (
+                        group_restore_sources(source_masks, key_multiplier)
+                    )
             results[transfer.name] = self._batch_postprocess(
                 io_results, is_set_operate=is_set, key_multiplier=key_multiplier
             )
@@ -958,7 +977,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         transfers: List[PoolTransfer],
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> dict:
-        return self._batch_io_v2(transfers, is_set=False)
+        return self._batch_io_v2(transfers, is_set=False, extra_info=extra_info)
 
     def batch_set_v2(
         self,
@@ -1076,8 +1095,11 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         host_indices: torch.Tensor,
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> List[bool]:
+        source_batch = extra_info.restore_sources if extra_info is not None else None
         if self.mem_pool_host.kv_buffer is None:
             # DeepSeek V4's KV anchor is logical only; v2 side pools carry data.
+            if source_batch is not None:
+                source_batch.pools[PoolName.KV] = [RestoreSource(0, True)] * len(keys)
             return [True] * len(keys)
 
         # Apply config prefix if available.
@@ -1086,10 +1108,18 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         key_strs, buffer_ptrs, buffer_sizes = self._batch_preprocess(keys, host_indices)
 
         start_time = time.perf_counter()
+        source_masks = []
         get_results = self._get_batch_zero_copy_impl(
-            key_strs, buffer_ptrs, buffer_sizes
+            key_strs,
+            buffer_ptrs,
+            buffer_sizes,
+            source_masks=source_masks if source_batch is not None else None,
         )
         end_time = time.perf_counter()
+        if source_batch is not None:
+            source_batch.pools[PoolName.KV] = group_restore_sources(
+                source_masks, len(key_strs) // len(keys)
+            )
 
         if self.enable_storage_metrics:
             self.prefetch_pgs.append(len(keys))
@@ -1360,15 +1390,40 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         return results
 
     def _get_batch_zero_copy_impl(
-        self, key_strs: List[str], buffer_ptrs: List[Any], buffer_sizes: List[Any]
+        self,
+        key_strs: List[str],
+        buffer_ptrs: List[Any],
+        buffer_sizes: List[Any],
+        *,
+        source_masks: Optional[List[int]] = None,
     ) -> List[int]:
         started = time.perf_counter_ns()
-        if self._uses_multi_buffer(buffer_ptrs):
-            results = self.store.batch_get_into_multi_buffers(
-                key_strs, buffer_ptrs, buffer_sizes
+        multi_buffer = self._uses_multi_buffer(buffer_ptrs)
+        source_get = None
+        if source_masks is not None:
+            # FLAT_MEMORY: This native method is genuinely optional on older binaries.
+            try:
+                source_get = (
+                    self.store.batch_get_into_multi_buffers_with_sources
+                    if multi_buffer
+                    else self.store.batch_get_into_with_sources
+                )
+            except AttributeError:
+                pass
+        if source_get is not None:
+            results, masks = source_get(key_strs, buffer_ptrs, buffer_sizes)
+            source_masks.extend(
+                masks if len(masks) == len(key_strs) else [0] * len(key_strs)
             )
         else:
-            results = self.store.batch_get_into(key_strs, buffer_ptrs, buffer_sizes)
+            read = (
+                self.store.batch_get_into_multi_buffers
+                if multi_buffer
+                else self.store.batch_get_into
+            )
+            results = read(key_strs, buffer_ptrs, buffer_sizes)
+            if source_masks is not None:
+                source_masks.extend([0] * len(key_strs))
         self._client_io_stats.record(
             operation="read",
             completed_bytes=sum(value for value in results if value > 0),

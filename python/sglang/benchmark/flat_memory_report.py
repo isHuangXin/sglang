@@ -1,10 +1,72 @@
 """FLAT_MEMORY: Pure report projection; loadable by path without SGLang."""
 
+import importlib.util
 import math
 from collections.abc import Mapping
 from copy import deepcopy
+from pathlib import Path
 
 REPORT_SCHEMA_VERSION = 1
+
+# FLAT_MEMORY: File loading keeps experiment postprocessing independent of SGLang/torch.
+_restore_spec = importlib.util.spec_from_file_location(
+    "storage_restore_report_offline", Path(__file__).with_name("storage_restore_report.py")
+)
+_restore_contract = importlib.util.module_from_spec(_restore_spec)
+_restore_spec.loader.exec_module(_restore_contract)
+STORAGE_RESTORE_EXPORT_FIELDS = (
+    *_restore_contract.FIELDS.values(),
+    _restore_contract.REPORT_KEY,
+    _restore_contract.RECORDS_KEY,
+    "storage_restore_timing_validation",
+)
+
+
+def project_storage_restore_report(
+    result: Mapping, *, expected_tp_size=None, expected_requests=None
+) -> dict:
+    """Validate the separate restore report while retaining its original raw proof."""
+    records = result.get(_restore_contract.RECORDS_KEY)
+    reported = result.get(_restore_contract.REPORT_KEY)
+    validation = {
+        "status": "valid", "reason": None,
+        "expected_tp_size": expected_tp_size, "expected_requests": expected_requests,
+    }
+    try:
+        report = _restore_contract.validate_restore_report(
+            reported, records, expected_tp_size=expected_tp_size,
+            expected_requests=expected_requests,
+        )
+    except ValueError as exc:
+        validation.update(status="unavailable", reason=str(exc))
+        report = _restore_contract.summarize_restore_records(
+            records, expected_tp_size=expected_tp_size, expected_requests=expected_requests,
+        )
+    # FLAT_MEMORY: Retain a disagreeing producer report so collectors can reject it independently.
+    return {
+        _restore_contract.RECORDS_KEY: deepcopy(records),
+        _restore_contract.REPORT_KEY: deepcopy(
+            result[_restore_contract.REPORT_KEY] if _restore_contract.REPORT_KEY in result else report
+        ),
+        "storage_restore_timing_validation": validation,
+        **{name: field["value"] if validation["status"] == "valid" else None
+           for name, field in report["fields"].items()},
+    }
+
+
+def format_storage_restore_report(report: Mapping) -> str:
+    """Render validated request-restore timing without relabeling legacy Flat means."""
+    lines = [
+        "Storage Restore to Observed All-TP GPU Ready".center(64, "-"),
+        f"  Scope: {report['scope']}",
+        f"  Sample: {report['sample_unit']}; TP size: {report['tp_size']}",
+    ]
+    for name in _restore_contract.FIELDS.values():
+        field = report["fields"][name]
+        text = (f"{field['value']:.6g}" if field["status"] == "measured"
+                else f"N/A ({field['reason']})")
+        lines.append(f"  {name}: {text} ms (samples: {field['sample_count']})")
+    return "\n".join(lines)
 
 
 def _field(name, group, label, unit, applicability="flat", aliases=()):
@@ -412,12 +474,15 @@ def format_cache_reports(report: Mapping) -> str:
     ]
     for group, title in (
         ("cache", "Cache Hit Statistics"),
-        ("prefetch", "Flat Prefetch Arrival-to-All-TP-GPU-Ready"),
+        ("prefetch", "Legacy Flat Prefetch Worker Elapsed Time"),
         ("io", "Flat Completed/Durable I/O Window"),
     ):
         lines.append(f"{title:-^50}")
         if group == "cache":
             lines.append("  Hit-rate denominator: all successful server prompt tokens.")
+        if group == "prefetch":
+            lines.append("  Legacy operation means: TP-max worker elapsed, not scheduler-to-GPU-ready.")
+            lines.append("  flat_restore_ready_ms is a separate cache-match diagnostic.")
         if group == "io":
             lines.append(f"  Flat I/O status: {report['flat_io_status']}")
         for field in REPORT_FIELDS:

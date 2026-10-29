@@ -2977,6 +2977,23 @@ class Scheduler(
             self.handle_generate_request(tokenized_req)
 
     def _prefetch_kvcache(self, req: Req):
+        # FLAT_MEMORY: The common start precedes matching, hashing and backend dispatch.
+        req.storage_restore_timing.begin(tp_size=self.ps.tp_size)
+        if (
+            self.ps.pp_size != 1
+            or self.ps.dp_size != 1
+            or self.ps.attn_cp_size != 1
+            or self.ps.attn_dcp_size != 1
+            or get_parallel().nnodes != 1
+            or self.disaggregation_mode != DisaggregationMode.NULL
+        ):
+            req.storage_restore_timing.unsupported(
+                "unsupported_parallel_or_disaggregated_mode"
+            )
+        if isinstance(self.tree_cache, UnifiedRadixCache):
+            self.tree_cache.begin_storage_restore(req)
+        elif self.enable_hicache_storage:
+            req.storage_restore_timing.unsupported("unsupported_cache_implementation")
         if self.flat_memory_cache is not None:
             self.flat_memory_cache.register_request(req)
             req.init_next_round_input(self.tree_cache, cow_mamba=False)
@@ -3027,6 +3044,9 @@ class Scheduler(
                     extra_key=req.extra_key,
                     cache_salt=req.cache_salt,
                 )
+
+        else:
+            req.storage_restore_timing.close("not_applicable")
 
     def _retry_missed_storage_prefetches(self):
         """Re-issue the availability check for queued requests whose prefetch
@@ -3880,6 +3900,8 @@ class Scheduler(
 
         if self.flat_memory_cache is not None:
             self.flat_memory_cache.on_admitted(can_run_list)
+        elif isinstance(self.tree_cache, UnifiedRadixCache):
+            self.tree_cache.adopt_storage_restores(can_run_list)
         can_run_set = set(can_run_list)
         self.waiting_queue = [x for x in self.waiting_queue if x not in can_run_set]
         if adder.preempt_list:

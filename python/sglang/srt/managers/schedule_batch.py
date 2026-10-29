@@ -143,6 +143,7 @@ from sglang.srt.observability.req_time_stats import (
     DPControllerReqTimeStats,
     SchedulerReqTimeStats,
 )
+from sglang.srt.observability.storage_restore import StorageRestoreTiming
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.utils import flatten_nested_list
@@ -1207,6 +1208,7 @@ class Req(ReqDllmMixin):
             False  # Track if breakdown was already computed
         )
         # FLAT_MEMORY: None denotes unavailable metadata, including older PD peers.
+        self.storage_restore_timing = StorageRestoreTiming()
         self.flat_storage_backend = False
         self.flat_prefetch_stats = dict.fromkeys(
             (*FLAT_CACHE_FIELDS, *FLAT_PREFETCH_FIELDS), None
@@ -1781,6 +1783,7 @@ class Req(ReqDllmMixin):
         # Increment retraction count before resetting other state. We should not reset this
         # since we are tracking the total number of retractions for each request.
         self.retraction_count += 1
+        self.storage_restore_timing.retract()
 
         self.prefix_indices = torch.empty((0,), dtype=torch.int64)
         self.routed_experts = None
@@ -1961,6 +1964,7 @@ class Req(ReqDllmMixin):
         self.return_logprob = False
         self.logprob_start_len = -1
         self.to_finish = FINISH_ABORT(error_msg, status_code, err_type)
+        self.storage_restore_timing.close("cancelled")
 
     def update_reasoning_tokens(self, token_id, think_end_ids):
         if self._is_reasoning_over:

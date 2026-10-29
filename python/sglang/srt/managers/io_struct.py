@@ -1385,7 +1385,8 @@ TokenIdsLogprobIndices = Optional[List[Optional[List[Optional[List[int]]]]]]
 HiddenStateChunk = List[Optional[Union[float, List[float]]]]
 OutputHiddenStates = Optional[List[Optional[List[HiddenStateChunk]]]]
 # FLAT_MEMORY: Missing telemetry is null, not a measured zero.
-CachedTokensDetails = Dict[str, Union[int, float, str, None]]
+# FLAT_MEMORY: Versioned restore evidence is nested alongside legacy scalar fields.
+CachedTokensDetails = Dict[str, Union[int, float, str, dict, None]]
 # Serialized form of BaseFinishReason.to_json() — all values are primitives.
 FinishReasonDict = Dict[str, Optional[Union[str, int, List[int]]]]
 

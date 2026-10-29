@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Any, List, Optional, Set
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.observability.storage_restore import RestoreSourceBatch
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.pool_host import HostKVCache
@@ -44,6 +45,8 @@ class HiCacheStorageConfig:
 class HiCacheStorageExtraInfo:
     prefix_keys: Optional[List[str]] = None
     extra_info: Optional[dict] = None
+    # FLAT_MEMORY: Filled only by this GET, never by metadata queries or global counters.
+    restore_sources: Optional[RestoreSourceBatch] = None
 
 
 @dataclass(frozen=True)

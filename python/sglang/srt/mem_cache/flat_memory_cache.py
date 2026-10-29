@@ -26,6 +26,7 @@ from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
     UnifiedCacheLinkerWrapper,
 )
 from sglang.srt.observability.flat_memory_metrics import initialize_flat_request
+from sglang.srt.observability.storage_restore import RestoreEpisode, RestoreSource
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -108,6 +109,8 @@ class _Prefetch(msgspec.Struct, kw_only=True):
     key: Any
     result: Any
     tail_hashes: list[str]
+    restore_episode: RestoreEpisode | None = None
+    restore_source: RestoreSource = RestoreSource()
     future: Future | None = None
     prepared: PreparedLinkerLoad | None = None
     phase: str = "query"
@@ -337,6 +340,7 @@ class FlatMemoryCache:
             key=key,
             result=result,
             tail_hashes=tail_hashes,
+            restore_episode=req.storage_restore_timing.active,
             started=started,
             wait_since=started,
             swa_evicted_before=req.kv.swa_evicted_seqlen if req.kv is not None else 0,
@@ -367,6 +371,8 @@ class FlatMemoryCache:
             state.phase = "ready"
             self._set_wait(state, "ready_admission")
             return result
+        if state.restore_episode is not None:
+            state.restore_episode.outcome = "miss"
         transfers = self._lookup_transfers(tail_hashes)
         if not transfers:
             state.phase, state.bypass = "ready", True
@@ -377,6 +383,8 @@ class FlatMemoryCache:
         try:
             state.future = self.cache_linker.submit_lookup(req.rid, transfers)
         except BaseException:
+            if state.restore_episode is not None:
+                state.restore_episode.close("failed")
             self._finalize_wait(state, "lookup_failed")
             self.prefetches.pop(req.rid)
             raise
@@ -680,6 +688,8 @@ class FlatMemoryCache:
         try:
             future = self.cache_linker.refresh_lookup(state.req.rid, transfers)
         except BaseException:
+            if state.restore_episode is not None:
+                state.restore_episode.close("failed")
             self._finalize_wait(state, "lookup_failed")
             raise
         state.future = future
@@ -949,7 +959,13 @@ class FlatMemoryCache:
                         "Flat read failed; recomputing request %s", state.req.rid
                     )
             else:
+                ready_ns = time.monotonic_ns()
                 self._commit(state)
+                if state.restore_episode is not None:
+                    state.restore_episode.restored_tokens = state.loaded_tokens
+                    state.restore_episode.observe_ready(
+                        ready_ns=ready_ns, endpoint="flat_all_tp_ready"
+                    )
                 self._record_read_metrics(state)
                 state.phase = "ready"
             self.cache_linker.forget_request(state.req.rid)
@@ -978,8 +994,18 @@ class FlatMemoryCache:
     def _record_read_metrics(self, state: _Prefetch) -> None:
         result = self.cache_linker.take_load_result(state.req.rid)
         counts = [result.dram_pages, result.ssd_pages, result.mixed_pages]
-        minima = self._reduce(counts, torch.distributed.ReduceOp.MIN)
-        maxima = self._reduce(counts, torch.distributed.ReduceOp.MAX)
+        # FLAT_MEMORY: Source validity rides existing TP reductions, independently of timing.
+        valid = int(
+            (result.dram_pages + result.ssd_pages) * self.cache.page_size
+            == state.loaded_tokens
+            and 0 <= result.mixed_pages <= result.ssd_pages
+        )
+        minima = self._reduce([*counts, valid], torch.distributed.ReduceOp.MIN)
+        maxima = self._reduce([*counts, valid], torch.distributed.ReduceOp.MAX)
+        state.restore_source = RestoreSource(
+            int(bool(maxima[0] or maxima[2])) | (int(bool(maxima[1])) << 1),
+            bool(minima[3]),
+        )
         elapsed_us = self._reduce(
             [int(result.elapsed_seconds * 1_000_000)], torch.distributed.ReduceOp.MAX
         )[0]
@@ -1095,6 +1121,11 @@ class FlatMemoryCache:
         reused = self._reused_tokens(state)
         req.storage_hit_length = reused
         dropped = state.loaded_tokens - reused
+        if state.restore_episode is not None:
+            state.restore_episode.adopt(
+                tokens=reused,
+                source=state.restore_source if not dropped else RestoreSource(),
+            )
         self.admission_dropped_tokens += dropped
         if dropped:
             for name in ("flat_dram", "flat_ssd", "flat_mixed"):
@@ -1134,6 +1165,12 @@ class FlatMemoryCache:
             self._fallback(state, "lease_expired")
 
     def _fallback(self, state: _Prefetch, reason: str, *, count: bool = True) -> None:
+        if state.restore_episode is not None:
+            state.restore_episode.close(
+                "cancelled"
+                if state.cancelled
+                else "failed" if "failed" in reason else "discarded"
+            )
         if state.phase == "read":
             # FLAT_MEMORY: Revocation is logical until all-rank I/O completion.
             state.revoke_reason = reason
@@ -1172,6 +1209,8 @@ class FlatMemoryCache:
             self.arrivals.pop(rid, None)
             return
         state.cancelled = True
+        if state.restore_episode is not None:
+            state.restore_episode.close("cancelled")
         self._finalize_wait(state, "cancelled")
         self._finish_allocation_wait(state, "cancelled")
         if state.phase != "read":

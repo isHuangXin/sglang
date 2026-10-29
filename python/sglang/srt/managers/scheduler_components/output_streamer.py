@@ -93,6 +93,7 @@ class SchedulerOutputStreamer:
         """
         # FLAT_MEMORY: A measured cold request still has useful zero-valued details.
         flat_details = flat_cached_tokens_details(req)
+        details = None
         if (
             req.cached_tokens_device > 0
             or req.cached_tokens_host > 0
@@ -110,15 +111,17 @@ class SchedulerOutputStreamer:
             if self.enable_hicache_storage():
                 details["storage_backend"] = self._get_storage_backend_type()
             details.update(flat_details)
-            return details
-
-        if req.cached_tokens > 0:
-            return {
+        elif req.cached_tokens > 0:
+            details = {
                 "device": req.cached_tokens,
                 "host": 0,
             }
 
-        return None
+        # FLAT_MEMORY: Add timing after the legacy fallback has chosen its token counts.
+        timing = req.storage_restore_timing.payload(final=req.finished())
+        if timing is not None:
+            details = {**(details or {}), "storage_restore_timing": timing}
+        return details
 
     def stream_output(
         self,

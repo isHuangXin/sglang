@@ -59,12 +59,18 @@ from sglang.benchmark.flat_memory_report import (
     REPORT_FIELD_NAMES,
     REPORT_METADATA_FIELDS,
     format_cache_reports,
+    format_storage_restore_report,
     project_cache_reports,
     resolve_metrics_mode,
 )
 from sglang.benchmark.hicache_io_metrics import (
     HiCacheIOCollector,
     format_hicache_io_report,
+)
+from sglang.benchmark.storage_restore_report import (
+    RECORDS_KEY,
+    REPORT_KEY,
+    summarize_restore_records,
 )
 from sglang.benchmark.utils import (
     get_tokenizer,
@@ -160,6 +166,9 @@ class RequestFuncOutput:
     flat_prefetch_dram_ops: Optional[int] = None
     flat_prefetch_ssd_ms: Optional[float] = None
     flat_prefetch_ssd_ops: Optional[int] = None
+    # FLAT_MEMORY: Server identity and the final cumulative restore snapshot.
+    server_request_id: str = ""
+    storage_restore_timing: Optional[Dict[str, Any]] = None
 
     @staticmethod
     def init_new(request_func_input: RequestFuncInput):
@@ -1711,6 +1720,19 @@ async def benchmark(
     # FLAT_MEMORY: One projection supplies console and JSON; raw evidence stays separate.
     cache_usage = summarize_cache_usage(outputs)
     flat_cache = summarize_flat_cache(outputs, cache_usage["total_prompt_tokens"])
+    restore_records = [
+        {
+            "request_id": output.server_request_id,
+            "success": output.success,
+            "timing": output.storage_restore_timing,
+        }
+        for output in outputs
+    ]
+    restore_report = summarize_restore_records(
+        restore_records,
+        expected_tp_size=flat_io.expected_tp_size,
+        expected_requests=len(outputs),
+    )
     flat_mode = flat_io.enabled or any(
         output.flat_dram is not None for output in outputs
     )
@@ -1817,6 +1839,7 @@ async def benchmark(
         print("{:<40} {:<10.2f}".format("Accept length:", accept_length))
     if args.cache_report or flat_mode or hicache_io.enabled:
         print(format_cache_reports(cache_report))
+        print(format_storage_restore_report(restore_report))
         if cache_report["metrics_mode"] == "flat":
             print("Mooncake Storage I/O Statistics".center(64, "-"))
             print("  Storage I/O status: not_applicable")
@@ -1881,6 +1904,7 @@ async def benchmark(
         print("{:<40} {:<10.2f}".format("Max ITL (ms):", metrics.max_itl_ms))
     print("=" * 50)
 
+    result = {"completed": metrics.completed}
     if (
         metrics.median_ttft_ms is not None
         and metrics.mean_itl_ms is not None
@@ -1957,6 +1981,13 @@ async def benchmark(
         print(f"Error running benchmark for request rate: {request_rate}")
         print("-" * 30)
 
+    # FLAT_MEMORY: Raw restore proof is mandatory even without --output-details.
+    result.update({
+        RECORDS_KEY: restore_records,
+        REPORT_KEY: restore_report,
+        "expected_requests": len(outputs),
+    })
+
     # Determine output file name
     if args.output_file:
         output_file_name = args.output_file
@@ -1982,6 +2013,8 @@ async def benchmark(
         "itls": [output.itl for output in outputs],
         "generated_texts": [output.generated_text for output in outputs],
         "errors": [output.error for output in outputs],
+        "successes": [output.success for output in outputs],
+        "server_request_ids": [output.server_request_id for output in outputs],
         "cached_tokens_device": [
             (o.cached_tokens_details or {}).get("device") for o in outputs
         ],

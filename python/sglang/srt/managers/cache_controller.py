@@ -21,10 +21,10 @@ import time
 from collections import deque
 from concurrent.futures import Future, TimeoutError as FutureTimeoutError
 from contextlib import contextmanager
-from dataclasses import dataclass
 from queue import Empty, Queue
 from typing import TYPE_CHECKING, Callable, List, NamedTuple, Optional
 
+import msgspec
 import torch
 
 from sglang.srt.environ import envs
@@ -48,6 +48,12 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.mem_cache.l2_transfer import L2Transfer, L2TransferEngine
 from sglang.srt.mem_cache.l2_transfer_metrics import l2_transfer_num_bytes
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
+from sglang.srt.observability.storage_restore import (
+    RestoreSource,
+    RestoreSourceBatch,
+    pack_restore_sources,
+    unpack_restore_sources,
+)
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import get_device_module
 
@@ -196,8 +202,7 @@ class HiCacheAck(NamedTuple):
     num_bytes: Optional[int] = 0
 
 
-@dataclass
-class PrefetchAck:
+class PrefetchAck(msgspec.Struct):
     """ACK for prefetch operation.
 
     A sequence of PrefetchAck is sent to the scheduler thread via ack_prefetch_queue,
@@ -220,6 +225,10 @@ class PrefetchAck:
     # Number of hits in extra pools.
     pool_hits: Optional[dict[str, int]] = None
     completed_req: Optional[bool] = None
+    # FLAT_MEMORY: Fixed batch shape preserves ordered collective calls on failures.
+    source_pages: Optional[list[RestoreSource]] = None
+    source_page_start: int = 0
+    sidecar_source: RestoreSource = RestoreSource()
 
 
 class _OrderedPrefetchAckQueue(Queue):
@@ -279,6 +288,12 @@ class StorageOperation:
         # Prefetch-outcome accounting, set at enqueue by the tree cache.
         self.stats_requested_tokens = 0
         self.stats_total_tokens = 0
+        # FLAT_MEMORY: Worker snapshots travel in ordered ACKs; scheduler owns reductions.
+        self.restore_batch_sources: list[RestoreSource] = []
+        self.restore_source_pages: list[RestoreSource] = []
+        self.restore_sidecar_source = RestoreSource(0, True)
+        self.restore_episode = None
+        self.restore_storage_start = 0
 
         self.id = StorageOperation.counter
         StorageOperation.counter += 1
@@ -1245,6 +1260,9 @@ class HiCacheController:
         all_success = True
         completed_pages = 0
         for i in range(0, len(operation.hash_value), self.storage_batch_size):
+            source_pages = [RestoreSource()] * min(
+                self.storage_batch_size, len(operation.hash_value) - i
+            )
             # When an error is occurred, we should keep looping and produce the same number of
             # PrefetchAck as other ranks do, because prefetch_sync_thread (i.e. consumer of
             # prefetch_sync_queue) perform reduce on the results.  This is so tricky.
@@ -1272,10 +1290,13 @@ class HiCacheController:
                 if prefix_keys and len(prefix_keys) > 0:
                     prefix_keys += batch_hashes
                 completed_pages += hit_pages
+                source_pages = operation.restore_batch_sources
             ack = PrefetchAck(
                 rid=operation.request_id,
                 completed_tokens=completed_pages * self.page_size,
                 operation=operation,
+                source_pages=source_pages,
+                source_page_start=i,
             )
             self.prefetch_sync_queue.put(ack)
         return completed_pages
@@ -1295,6 +1316,13 @@ class HiCacheController:
 
         Here, "batch" means a single unit of L3 read, not a "batch" in model forward.
         """
+        # FLAT_MEMORY: Missing adapter support remains unknown, including required pools.
+        extra_info.restore_sources = RestoreSourceBatch(
+            {
+                pool: [RestoreSource()] * len(batch_hashes)
+                for pool in (PoolName.KV, *(t.name for t in kv_derived_transfers))
+            }
+        )
         # Read from KV pool.
         kv_hits = self.page_get_func(
             operation, batch_hashes, batch_host_indices, extra_info
@@ -1312,10 +1340,13 @@ class HiCacheController:
                 for transfer in kv_derived_transfers
             ]
             sidecar_results = self.storage_backend.batch_get_v2(
-                current_kv_derived_transfers
+                current_kv_derived_transfers, extra_info
             )
             sidecar_hits = count_pool_hits(sidecar_results)
 
+        operation.restore_batch_sources = extra_info.restore_sources.pages(
+            count=len(batch_hashes)
+        )
         # Clamp to minimal number of hits.
         return min([kv_hits, *sidecar_hits.values()])
 
@@ -1363,12 +1394,18 @@ class HiCacheController:
         expected = (
             len(operation.hash_value) + self.storage_batch_size - 1
         ) // self.storage_batch_size
-        for _ in range(expected - len(kv_acks)):
+        for index in range(len(kv_acks), expected):
+            page_start = index * self.storage_batch_size
             acks.append(
                 PrefetchAck(
                     rid=operation.request_id,
                     operation=operation,
                     completed_tokens=completed,
+                    source_page_start=page_start,
+                    source_pages=[RestoreSource()]
+                    * min(
+                        self.storage_batch_size, len(operation.hash_value) - page_start
+                    ),
                 )
             )
         if operation.pool_transfers is not None and not any(
@@ -1593,11 +1630,14 @@ class HiCacheController:
         if ack.completed_tokens is not None:
             # Determine the minimal successful prefix of tokens.
             completed_tokens_tensor = torch.tensor(
-                ack.completed_tokens, dtype=torch.int
+                [ack.completed_tokens, *pack_restore_sources(ack.source_pages or [])],
+                dtype=torch.int,
             )
             self._all_reduce(
                 completed_tokens_tensor,
                 torch.distributed.ReduceOp.MIN,
                 self.prefetch_completion_sync_groups,
             )
-            ack.completed_tokens = completed_tokens_tensor.item()
+            reduced = completed_tokens_tensor.tolist()
+            ack.completed_tokens = reduced[0]
+            ack.source_pages = unpack_restore_sources(reduced[1:])

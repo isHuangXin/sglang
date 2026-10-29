@@ -14,6 +14,7 @@ from sglang.srt.observability.hicache_io import (
     gather_hicache_io,
     snapshot_unified_hicache,
 )
+from sglang.srt.observability.storage_restore import HostRestoreTracker
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -49,6 +50,8 @@ def cache_stub():
         mem_pool_host=Mock(),
     )
     cache.ongoing_load_back = {}
+    cache.storage_restore_tracker = HostRestoreTracker()
+    cache._restore_load_nodes = {}
     cache.ongoing_write_through = {}
     cache.ongoing_prefetch = {}
     cache.ongoing_backup = {}

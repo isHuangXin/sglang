@@ -7,6 +7,7 @@ import re
 import time
 import uuid
 import warnings
+from copy import deepcopy
 
 import aiohttp
 import requests
@@ -70,6 +71,13 @@ def _flat_optional_sum(outputs, name, integer=True):
 
 def consume_native_usage(output, meta):
     # FLAT_MEMORY: Native SSE usage is cumulative, including metadata-only chunks.
+    if "id" in meta:
+        output.server_request_id = meta["id"] if isinstance(meta["id"], str) else ""
+    details = meta.get("cached_tokens_details")
+    if isinstance(details, dict) and "storage_restore_timing" in details:
+        timing = details["storage_restore_timing"]
+        # FLAT_MEMORY: Replace snapshots, never sum SSE chunks; omitted timing stays unchanged.
+        output.storage_restore_timing = deepcopy(timing) if isinstance(timing, dict) else None
     for wire, field in (
         ("prompt_tokens", "server_prompt_tokens"),
         ("completion_tokens", "server_completion_tokens"),

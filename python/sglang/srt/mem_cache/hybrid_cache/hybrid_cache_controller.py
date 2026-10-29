@@ -34,6 +34,13 @@ from sglang.srt.mem_cache.l2_transfer import L2Transfer
 from sglang.srt.mem_cache.pool_host import HostPoolGroup, PoolEntry
 from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
 from sglang.srt.mem_cache.storage_config import load_storage_extra_config
+from sglang.srt.observability.storage_restore import (
+    RestoreSource,
+    RestoreSourceBatch,
+    merge_restore_sources,
+    pack_restore_sources,
+    unpack_restore_sources,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
@@ -603,6 +610,7 @@ class HybridCacheController(BaseHiCacheController):
         # (IO failure, timeout, TP mismatch), skip extra IO entirely to avoid
         # data misalignment.
         pool_hits: dict[str, int] = {}
+        sidecar_source = RestoreSource()
         if not operation.is_terminated() and kv_completed_pages == len(
             operation.hash_value
         ):
@@ -617,8 +625,21 @@ class HybridCacheController(BaseHiCacheController):
                 transfers_nonkv, operation.hash_value, kv_completed_pages
             )
             self._resolve_sidecar_nonkv_derived_pool_transfers(operation)
-            results = self.storage_backend.batch_get_v2(transfers_nonkv)
+            sources = RestoreSourceBatch(
+                {
+                    transfer.name: [RestoreSource()] * len(transfer.keys)
+                    for transfer in transfers_nonkv
+                }
+            )
+            results = self.storage_backend.batch_get_v2(
+                transfers_nonkv, HiCacheStorageExtraInfo(restore_sources=sources)
+            )
             pool_hits = count_pool_hits(results)
+            sidecar_source = merge_restore_sources(
+                source
+                for name, pages in sources.pools.items()
+                for source in pages[: pool_hits.get(name, 0)]
+            )
         # Emit PrefetchAck to prefetch_sync_queue, even the operation has been canceled by the
         # scheduler thread.  The prefetch sync thread expects the same number of PrefetchAck objects
         # to perform all_reduce.
@@ -627,6 +648,7 @@ class HybridCacheController(BaseHiCacheController):
                 rid=operation.request_id,
                 operation=operation,
                 pool_hits=pool_hits,
+                sidecar_source=sidecar_source,
             )
         )
         return
@@ -850,7 +872,10 @@ class HybridCacheController(BaseHiCacheController):
             # "for ... in PoolName" ensures the same order across all ranks.
             # On prefetch failure, pool_hits may be empty dict.
             packed = torch.tensor(
-                [ack.pool_hits.get(pool.value, 0) for pool in PoolName],
+                [
+                    *[ack.pool_hits.get(pool.value, 0) for pool in PoolName],
+                    *pack_restore_sources([ack.sidecar_source]),
+                ],
                 dtype=torch.int,
             )
             self._all_reduce(
@@ -860,3 +885,6 @@ class HybridCacheController(BaseHiCacheController):
             )
             for i, pool in enumerate(PoolName):
                 ack.pool_hits[pool.value] = packed[i].item()
+            ack.sidecar_source = unpack_restore_sources(
+                packed[len(PoolName) :].tolist()
+            )[0]

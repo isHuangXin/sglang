@@ -78,11 +78,14 @@ class PayloadLayout:
         tp_rank: int,
         tp_size: int,
         max_io_bytes: int,
+        rank_replicated: bool = False,
     ):
         if not model_namespace:
             raise ValueError("Flat GPU storage requires a model/config namespace")
-        if tp_size not in (1, 4, 8) or not 0 <= tp_rank < tp_size:
+        if tp_size not in (1, 4, 8):
             raise ValueError("Flat GPU storage supports TP1, TP4 and TP8")
+        if not 0 <= tp_rank < tp_size:
+            raise ValueError(f"Flat GPU tp_rank {tp_rank} is outside TP{tp_size}")
         if max_io_bytes < ALIGNMENT or max_io_bytes % ALIGNMENT:
             raise ValueError("gds_max_io_bytes must be a positive multiple of 4096")
         self.pool_group = pool_group
@@ -140,12 +143,18 @@ class PayloadLayout:
         descriptor = {
             "version": FORMAT_VERSION,
             "model": model_namespace,
-            "tp_rank": tp_rank,
             "tp_size": tp_size,
             "page_size": pool_group.page_size,
             "fragment_bytes": max_io_bytes,
             "pools": identity,
         }
+        # FLAT_MEMORY: rank_replicated pools hold byte-identical KV on every
+        # rank, so the namespace drops tp_rank and all ranks address one copy.
+        # Head-sharded pools must keep it: a shared namespace would make eight
+        # different shards collide on the same key. tp_size stays either way so
+        # a TP4 and a TP8 run never share keys.
+        if not rank_replicated:
+            descriptor["tp_rank"] = tp_rank
         digest = hashlib.sha256(
             json.dumps(descriptor, sort_keys=True, separators=(",", ":")).encode()
         ).hexdigest()

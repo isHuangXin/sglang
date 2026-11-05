@@ -38,6 +38,8 @@ _IO_RESULT_FIELDS = (
     "flat_io_window_seconds",
     "flat_dram_read_bw_gbps",
     "flat_dram_write_bw_gbps",
+    "flat_dram_read_active_bw_gbps",
+    "flat_dram_write_active_bw_gbps",
     "flat_dram_read_peak_bw_gbps",
     "flat_dram_write_peak_bw_gbps",
     "flat_ssd_read_bw_gbps",
@@ -538,6 +540,42 @@ def _flat_streamed_peaks(ranks, summary):
     return peaks
 
 
+def _flat_transfer_spans(first, last):
+    """Sum each rank's DRAM transfer time, the divisor behind its own GB/s ratio.
+
+    Returns None when no rank can supply it, so the caller reports the metric as
+    unavailable rather than falling back to the wall clock, which measures duty
+    cycle instead of transfer rate.
+    """
+    spans = dict.fromkeys(("dram_read_ns", "dram_write_ns"), 0)
+    for tp_rank, rank in last.items():
+        prior = first[tp_rank]["bandwidth"]
+        for name in spans:
+            direction = name[: -len("_ns")]
+            if name in rank["bandwidth"]:
+                delta = _flat_counter(rank["bandwidth"][name]) - _flat_counter(
+                    prior[name]
+                )
+                spans[name] += _flat_counter(delta)
+                continue
+            # FLAT_MEMORY: Runs collected before the native ns export carry only the
+            # ratio, which GetBandwidthReport computes as bytes/ns over the same
+            # accumulators, so the span divides back out. The begin snapshot is
+            # validated all-zero, making the end ratio span exactly this window.
+            ratio = rank["bandwidth"].get(f"{direction}_bw_gbps")
+            if ratio is None:
+                return None
+            if type(ratio) is not float or ratio < 0:
+                raise ValueError(f"Invalid Flat bandwidth ratio: {ratio!r}")
+            if _flat_counter(prior[f"{direction}_total_bytes"]):
+                return None
+            byte_count = _flat_counter(rank["bandwidth"][f"{direction}_total_bytes"])
+            if byte_count and not ratio:
+                return None
+            spans[name] += round(byte_count / ratio) if ratio else 0
+    return spans
+
+
 def summarize_flat_io(
     before, after, window_id, expected_tp_size=None, *, bucket_summary=None
 ):
@@ -553,6 +591,7 @@ def summarize_flat_io(
     deltas = dict.fromkeys(
         ("dram_read_total_bytes", "dram_write_total_bytes", "ssd_write_count"), 0
     )
+    spans = _flat_transfer_spans(first, last)
     for tp_rank, rank in last.items():
         prior = first[tp_rank]
         if any(rank[name] != prior[name] for name in ("pid", "gpu_id", "gds_mode")):
@@ -573,10 +612,23 @@ def summarize_flat_io(
             last, duration_ns=end - start, schema_version=schema_version
         )
     )
+    # Nanoseconds and decimal GB cancel in bytes/ns == GB/s, matching the divisor
+    # hicache_io_metrics.py uses for its L2 rows. The spans come from host clocks
+    # around each transfer, not CUDA events, and a mixed-tier ReadGPU batch times
+    # its SSD transfer inside the DRAM span, so the read ratio is a lower bound.
+    active = {
+        f"flat_dram_{direction}_active_bw_gbps": (
+            deltas[f"dram_{direction}_total_bytes"] / spans[f"dram_{direction}_ns"]
+            if spans and spans[f"dram_{direction}_ns"]
+            else None
+        )
+        for direction in ("read", "write")
+    }
     return {
         "flat_io_window_seconds": seconds,
         "flat_dram_read_bw_gbps": deltas["dram_read_total_bytes"] / seconds / 1e9,
         "flat_dram_write_bw_gbps": deltas["dram_write_total_bytes"] / seconds / 1e9,
+        **active,
         "flat_dram_read_peak_bw_gbps": peaks.get("dram_read_bytes"),
         "flat_dram_write_peak_bw_gbps": peaks.get("dram_write_bytes"),
         "flat_ssd_read_bw_gbps": totals["read_completed_bytes"] / seconds / 1e9,

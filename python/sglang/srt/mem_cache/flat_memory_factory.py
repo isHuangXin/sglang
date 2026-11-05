@@ -111,6 +111,12 @@ def create_flat_memory_cache(ctx):
         tp_rank=ctx.tp_rank,
         tp_size=ctx.tp_size,
         device=cache.device,
+        # FLAT_MEMORY: Shared-store mode needs the owner rank to finish creating
+        # the node's shm objects before the peers attach, and the shm names to
+        # separate concurrent servers. The HTTP port is unique per live server on
+        # the node, equal on every rank, and never None (nccl_port can be).
+        barrier=cache._barrier_attn_groups,
+        shm_token=str(ctx.server_args.port),
     )
     try:
         runtime = FlatMemoryCache(

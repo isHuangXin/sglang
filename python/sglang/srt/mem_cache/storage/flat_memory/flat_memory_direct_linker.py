@@ -27,6 +27,9 @@ from sglang.srt.mem_cache.storage.flat_memory.payload import (
     PageRecord,
     PayloadLayout,
 )
+from sglang.srt.mem_cache.storage.flat_memory.shared_segments import (
+    FlatSharedSegments,
+)
 from sglang.srt.mem_cache.storage.flat_memory.ssd_executor import SSDReadExecutor
 from sglang.srt.mem_cache.unified_cache.unified_cache_linker import UnifiedCacheLinker
 
@@ -48,6 +51,9 @@ class FlatLoadResult(msgspec.Struct, frozen=True):
 class _Offload(msgspec.Struct, eq=False):
     future: Future
     source_consumed: Future
+    # FLAT_MEMORY: Non-owner stand-in for the owner's in-flight write; resolved
+    # when the pair retires, which the MIN all_reduce gates on the owner.
+    pending: Future | None = None
 
 
 class _LookupQuery(msgspec.Struct, eq=False):
@@ -118,6 +124,8 @@ class FlatMemoryDirectLinker(UnifiedCacheLinker):
         tp_size: int,
         device: torch.device | str,
         manager: Any = None,
+        barrier: Any = None,
+        shm_token: str = "",
     ):
         if config.get("gds_mode", "compat") != "compat":
             raise ValueError("Flat direct linker requires gds_mode=compat")
@@ -132,9 +140,18 @@ class FlatMemoryDirectLinker(UnifiedCacheLinker):
         self.page_size = pool_group.page_size
         self.num_layers = pool_group.num_layers
         self.tp_rank, self.tp_size = tp_rank, tp_size
+        # FLAT_MEMORY: Rank-replicated pools (MLA latent KV) hold byte-identical
+        # bytes on all ranks, so the node keeps one copy: rank 0 owns and writes
+        # the DRAM segment and the SSD pool, the others attach and read. Head
+        # sharded pools stay fully private per rank.
+        self.shared_store = bool(pool_group.rank_replicated) and tp_size > 1
+        self.offload_owner = not self.shared_store or tp_rank == 0
         self._config = dict(config)
         self._closed = False
+        self._barrier = barrier
         self._owns_manager = manager is None
+        self._segments: FlatSharedSegments | None = None
+        self._native_config = None
         if manager is None:
             from flat_memory_system.manager import FlatMemoryConfig, FlatMemoryManager
 
@@ -145,12 +162,36 @@ class FlatMemoryDirectLinker(UnifiedCacheLinker):
                 if self.device.index is not None
                 else torch.cuda.current_device()
             )
-            # FLAT_MEMORY: Replicated MLA still has a private store on every TP rank.
-            native_config.ssd_path = os.path.join(
-                native_config.ssd_path, f"tp_rank_{tp_rank}"
-            )
+            if self.shared_store:
+                # One node, one store: all ranks address the same gpu_file_pool.bin
+                # and the same DRAM segment, so the node's budget is usable in
+                # full instead of being split eight ways.
+                native_config.dram_shared = True
+                native_config.store_owner = tp_rank == 0
+                # Under memfd every rank maps the same pages, so they all share
+                # the owner's segment identity (0) and a GVA means the same
+                # thing everywhere. Under rdma a peer must distinguish the
+                # owner's segment from its own, so the GVA's 12-bit node field
+                # names one process: node_index * 16 + tp_rank.
+                if native_config.dram_share_mode == "rdma":
+                    native_config.segment_id = tp_rank
+                self._segments = FlatSharedSegments(
+                    token=f"flat_mem_{model_namespace[:16]}_tp{tp_size}_{shm_token}",
+                    peers=tp_size - 1,
+                    dram_bytes=int(native_config.dram_capacity_gb * 1024**3),
+                    owner=native_config.store_owner,
+                    share_dram=native_config.dram_share_mode == "memfd",
+                )
+                native_config.dram_fd = self._segments.dram_fd
+                native_config.index_fd = self._segments.index_fd
+            else:
+                # FLAT_MEMORY: Head-sharded pools keep a private store per rank.
+                native_config.ssd_path = os.path.join(
+                    native_config.ssd_path, f"tp_rank_{tp_rank}"
+                )
+            self._native_config = native_config
             self._manager_factory = lambda: FlatMemoryManager(native_config)
-            manager = self._manager_factory()
+            manager = self._create_manager()
         else:
             self._manager_factory = None
         self.manager = manager
@@ -160,6 +201,7 @@ class FlatMemoryDirectLinker(UnifiedCacheLinker):
             tp_rank=tp_rank,
             tp_size=tp_size,
             max_io_bytes=int(config.get("gds_max_io_bytes", 16 * 1024 * 1024)),
+            rank_replicated=self.shared_store,
         )
         self.transfer = GPUTransfer(
             layout=self.layout,
@@ -203,6 +245,47 @@ class FlatMemoryDirectLinker(UnifiedCacheLinker):
         self._last_capacity_warning = float("-inf")
         self._unsafe_error: FlatUnsafeIOError | None = None
         self._lock = threading.RLock()
+
+    def _create_manager(self):
+        # The owner must have formatted the shared index, mapped the DRAM segment
+        # and preallocated the pool file before any peer attaches to them, and
+        # must not tear them down while a peer is still mapped. Barriering here
+        # is what orders that; the native side never spins waiting (it would need
+        # the GIL released, and a crashed rank would hang the rest).
+        if not self.shared_store or self._barrier is None:
+            return self._manager_factory()
+        rdma_shared = self._native_config.dram_share_mode == "rdma"
+        if self.offload_owner:
+            manager = self._manager_factory()
+            payload = ""
+            if rdma_shared:
+                # Both are only knowable after the owner started its transfer
+                # engine and allocated the segment, so they travel with the
+                # fds rather than through the config the peers were built from.
+                payload = f"{manager.rdma_local_name()}|{manager.dram_segment_base()}"
+            self._barrier()
+            # Accepting after the barrier means every peer is already waiting to
+            # connect, so the handover cannot outrun the listener.
+            self._segments.distribute(payload)
+            return manager
+        self._barrier()
+        self._segments.attach()
+        self._native_config.dram_fd = self._segments.dram_fd
+        self._native_config.index_fd = self._segments.index_fd
+        if rdma_shared:
+            name, _, base = self._segments.payload.partition("|")
+            if not name or not base:
+                raise RuntimeError(
+                    "Flat RDMA-shared DRAM handover carried no owner engine "
+                    f"name and base address, got {self._segments.payload!r}"
+                )
+            self._native_config.owner_segment_id = 0
+            self._native_config.owner_dram_size = int(
+                self._native_config.dram_capacity_gb * 1024**3
+            )
+            self._native_config.owner_rdma_name = name
+            self._native_config.owner_dram_base = int(base)
+        return self._manager_factory()
 
     @property
     def storage(self):
@@ -579,6 +662,28 @@ class FlatMemoryDirectLinker(UnifiedCacheLinker):
         if not expanded:
             return False
         coverage = self.layout.coverage(expanded)
+        if not self.offload_owner:
+            # The owner writes the node's single copy, but a non-owner must still
+            # retire a complete _Offload pair: num_source_safe_offloads() and
+            # num_completed_offloads() feed a MIN all_reduce, so a rank with no
+            # pair would hold the commit at zero forever, never release
+            # inc_lock_ref, and exhaust the KV pool. Nothing read the source
+            # pages, so they are trivially safe to reuse.
+            written = Future()
+            written.set_result(FlatWriteResult(success=True))
+            consumed = Future()
+            consumed.set_result(None)
+            # The keys carry no rank in shared mode, so this coverage names the
+            # exact records the owner is about to write. Registering it keeps
+            # lookup_probe()'s pending_coverage and the query dependency retry
+            # identical to the owner's, which is what stops a peer from settling
+            # a query before the owner's bytes land.
+            pending = Future()
+            pending.add_done_callback(self._offload_finished)
+            with self._lock:
+                self._offloads.append(_Offload(written, consumed, pending))
+                self._offload_coverage[pending] = coverage
+            return True
         ready_event = self._ready_event()
         with self._lock:
             source_consumed = Future()
@@ -685,7 +790,13 @@ class FlatMemoryDirectLinker(UnifiedCacheLinker):
         with self._lock:
             if not self._offloads or not self._offloads[0].future.done():
                 raise RuntimeError("No Flat offload has completed")
-            result = self._offloads.popleft().future.result()
+            offload = self._offloads.popleft()
+            # A pop is gated by the MIN all_reduce in _poll_offloads, so reaching
+            # here means the owner's write for this pair is already durable: the
+            # peer's stand-in retires now and releases the queries waiting on it.
+            if offload.pending is not None and not offload.pending.done():
+                offload.pending.set_result(None)
+            result = offload.future.result()
             return (
                 FlatWriteResult(success=result) if isinstance(result, bool) else result
             )
@@ -771,15 +882,35 @@ class FlatMemoryDirectLinker(UnifiedCacheLinker):
         if self._owns_manager:
             self.transfer.manager = None
             self.manager = None
+        # Closing the fds after the manager has dropped its mappings lets the
+        # kernel reclaim the segment once every rank has done the same.
+        if self._segments is not None:
+            self._segments.close()
 
     def clear(self) -> None:
         self.reset()
         if self._manager_factory is None:
             raise RuntimeError("An injected Flat manager cannot be recreated")
+        # The fds survive this, so the segment is never recreated and no second
+        # handover is needed. The barriers still order it: every rank must drop
+        # its mapping before the owner wipes the index, and none may rebuild
+        # against the table until the owner has finished wiping it.
+        shared = self.shared_store and self._barrier is not None
+        if shared:
+            self._barrier()
         self.manager.close()
         self.transfer.manager = None
         self.manager = None
-        self.manager = self._manager_factory()
+        if shared:
+            # An RDMA-shared owner's segment does not survive the manager it
+            # belongs to, so the handover has to happen again against the
+            # rebuilt one's address. A no-op under memfd.
+            self._segments.rearm()
+        if shared and self.offload_owner:
+            self._segments.reformat_index()
+        # _create_manager re-barriers so the owner formats the wiped index
+        # before any peer binds to it.
+        self.manager = self._create_manager()
         self.transfer.manager = self.manager
 
     def get_prefetch_stats(self, rid: str) -> dict | None:

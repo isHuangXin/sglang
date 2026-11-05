@@ -59,7 +59,12 @@ v0.5.19 默认使用 `UnifiedRadixCache`，仅修改旧 `hiradix_cache.py` 不�
 - 禁用未经适配的 CP/DCP、HiSparse、SSM、speculative/draft、请求快照和池地址重定位；不把普通 MHA 的 FP16/BF16 NHD 检查放宽后宣称支持 DSA/V4。
 - DSA 必须保留实际 MLA/indexer/scale 数据；GLM 的物理 indexer 层由上游 pool 决定，不用固定的层数假设。
 - V4 必须保留 SWA、C4/C128、indexer 及相应压缩状态。C128 state 在 256-token 对齐处的省略是条件不变量，不是任意断点恢复承诺。
-- 每 rank 使用独立 manager/backing 路径，不能套用共享 Mooncake 的 rank0-only 写入策略。
+- 写入所有权按 pool 种类分流，不是一律每 rank 独立：rank-replicated pool（MLA latent KV）
+  在 TP>1 时同节点共享一个 store，`node_tp_rank == 0` 为 owner 独占写入，其余 rank attach
+  并读 owner 的 block index；head-sharded pool 仍是每 rank 独立 manager/backing 路径。
+  非 owner 仍必须各自 retire 一对完整 `_Offload`——`num_source_safe_offloads()` 与
+  `num_completed_offloads()` 进 MIN all_reduce，缺一对会让 commit 永远停在 0、
+  `inc_lock_ref` 不释放、KV pool 耗尽。
 - 当前原生 `gds_mode="compat"` 不支持 remote/persistence，不能称为严格硬件 GDS。
 
 ## 指标与工具

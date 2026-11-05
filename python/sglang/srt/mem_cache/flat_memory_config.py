@@ -29,6 +29,15 @@ def validate_flat_memory_direct(cfg: Any) -> dict:
         or cfg.enable_dp_attention
     ):
         raise ValueError("Flat compat requires PP1/DP1 and no CP/DCP/DP attention")
+    # FLAT_MEMORY: Each node keeps its own DRAM segment, so a multi-node run
+    # gets per-node stores with no sharing between them -- the native side
+    # holds a single remote segment, not a pool. Stated as a limit rather than
+    # left to fail later: nnodes > 1 otherwise starts and silently caches less
+    # than the cluster's DRAM.
+    if cfg.nnodes != 1:
+        raise ValueError(
+            "Flat compat is single-node; cross-node DRAM pooling is not implemented"
+        )
     if cfg.hicache_write_policy != "write_through":
         raise ValueError("Flat compat requires --hicache-write-policy write_through")
     if cfg.speculative_algorithm is not None:
@@ -49,9 +58,18 @@ def validate_flat_memory_direct(cfg: Any) -> dict:
         raise ValueError(
             "Flat compat currently requires a non-disaggregated server; use the host backend for PD"
         )
+    # FLAT_MEMORY: remote_dram_gb / remote_ssd_gb are the names
+    # FlatMemoryConfig.from_dict reads; the *_capacity_gb spellings are kept so
+    # a config written against the older names is still rejected rather than
+    # silently ignored.
     if config.get("enable_persistence", False) or any(
         config.get(name, 0)
-        for name in ("remote_dram_capacity_gb", "remote_ssd_capacity_gb")
+        for name in (
+            "remote_dram_gb",
+            "remote_ssd_gb",
+            "remote_dram_capacity_gb",
+            "remote_ssd_capacity_gb",
+        )
     ):
         raise ValueError("Flat compat does not support persistence or remote storage")
     return config

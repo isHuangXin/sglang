@@ -111,6 +111,12 @@ def create_flat_memory_cache(ctx):
         tp_rank=ctx.tp_rank,
         tp_size=ctx.tp_size,
         device=cache.device,
+        # FLAT_MEMORY: The node-local share needs this node's slice of the
+        # cluster-global tp_rank: which rank owns the segment, how many peers
+        # attach to it, and a GVA segment id unique cluster-wide.
+        node_rank=ctx.server_args.node_rank,
+        nnodes=ctx.server_args.nnodes,
+        pp_size=ctx.server_args.pp_size,
         # FLAT_MEMORY: Shared-store mode needs the owner rank to finish creating
         # the node's shm objects before the peers attach, and the shm names to
         # separate concurrent servers. The HTTP port is unique per live server on

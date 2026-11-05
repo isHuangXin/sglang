@@ -35,6 +35,10 @@ from sglang.srt.mem_cache.unified_cache.unified_cache_linker import UnifiedCache
 
 logger = logging.getLogger(__name__)
 
+# Mirrors MAX_NODES in src/flat_memory/include/gva_encoder.h: the GVA packs the
+# segment id into bits [59:48], and Encode() throws above that.
+_MAX_GVA_NODES = 4096
+
 
 class FlatLoadResult(msgspec.Struct, frozen=True):
     rid: str
@@ -123,6 +127,9 @@ class FlatMemoryDirectLinker(UnifiedCacheLinker):
         tp_rank: int,
         tp_size: int,
         device: torch.device | str,
+        node_rank: int = 0,
+        nnodes: int = 1,
+        pp_size: int = 1,
         manager: Any = None,
         barrier: Any = None,
         shm_token: str = "",
@@ -140,12 +147,20 @@ class FlatMemoryDirectLinker(UnifiedCacheLinker):
         self.page_size = pool_group.page_size
         self.num_layers = pool_group.num_layers
         self.tp_rank, self.tp_size = tp_rank, tp_size
+        self.node_rank, self.nnodes = node_rank, nnodes
+        # FLAT_MEMORY: The share is node-local -- memfd descriptors travel over
+        # an abstract Unix socket and an RDMA-registered heap is one host's
+        # memory -- but tp_rank is cluster-global and engine.py hands each node
+        # a contiguous slice of it. Mirrors _calculate_rank_ranges() rather than
+        # importing it, which would make mem_cache depend on entrypoints.
+        self.ranks_per_node = tp_size // max(nnodes // max(pp_size, 1), 1)
+        self.node_tp_rank = tp_rank % self.ranks_per_node
         # FLAT_MEMORY: Rank-replicated pools (MLA latent KV) hold byte-identical
-        # bytes on all ranks, so the node keeps one copy: rank 0 owns and writes
-        # the DRAM segment and the SSD pool, the others attach and read. Head
-        # sharded pools stay fully private per rank.
+        # bytes on all ranks, so the node keeps one copy: the node's first rank
+        # owns and writes the DRAM segment and the SSD pool, the others attach
+        # and read. Head sharded pools stay fully private per rank.
         self.shared_store = bool(pool_group.rank_replicated) and tp_size > 1
-        self.offload_owner = not self.shared_store or tp_rank == 0
+        self.offload_owner = not self.shared_store or self.node_tp_rank == 0
         self._config = dict(config)
         self._closed = False
         self._barrier = barrier
@@ -167,17 +182,25 @@ class FlatMemoryDirectLinker(UnifiedCacheLinker):
                 # and the same DRAM segment, so the node's budget is usable in
                 # full instead of being split eight ways.
                 native_config.dram_shared = True
-                native_config.store_owner = tp_rank == 0
+                native_config.store_owner = self.offload_owner
                 # Under memfd every rank maps the same pages, so they all share
                 # the owner's segment identity (0) and a GVA means the same
                 # thing everywhere. Under rdma a peer must distinguish the
                 # owner's segment from its own, so the GVA's 12-bit node field
-                # names one process: node_index * 16 + tp_rank.
+                # names one process.
                 if native_config.dram_share_mode == "rdma":
-                    native_config.segment_id = tp_rank
+                    native_config.segment_id = self._segment_identity()
+                # peers counts this node's attachers only: distribute() accepts
+                # exactly that many and the socket cannot reach another host, so
+                # a cluster-wide count would block the owner forever. The token
+                # carries node_rank because with pp_size > 1 two nodes run the
+                # same tp_rank slice, and on one host that would collide.
                 self._segments = FlatSharedSegments(
-                    token=f"flat_mem_{model_namespace[:16]}_tp{tp_size}_{shm_token}",
-                    peers=tp_size - 1,
+                    token=(
+                        f"flat_mem_{model_namespace[:16]}_tp{tp_size}"
+                        f"_n{node_rank}_{shm_token}"
+                    ),
+                    peers=self.ranks_per_node - 1,
                     dram_bytes=int(native_config.dram_capacity_gb * 1024**3),
                     owner=native_config.store_owner,
                     share_dram=native_config.dram_share_mode == "memfd",
@@ -246,12 +269,34 @@ class FlatMemoryDirectLinker(UnifiedCacheLinker):
         self._unsafe_error: FlatUnsafeIOError | None = None
         self._lock = threading.RLock()
 
+    def _segment_identity(self) -> int:
+        # The GVA's node field must name one process cluster-wide, since the
+        # router keys on [segment_id][media] and a collision would resolve a
+        # remote block to the local backend. tp_rank alone is not enough: with
+        # pp_size > 1 engine.py's tp_rank_range restarts at 0 on each node, so
+        # two nodes' rank-0 processes would share an identity.
+        # tp_size is the stride because tp_rank < tp_size holds on every node,
+        # which makes node_rank recoverable and the mapping injective. A fixed
+        # stride (the 16 this comment used to specify) collides as soon as
+        # tp_size exceeds it.
+        identity = self.node_rank * self.tp_size + self.tp_rank
+        if identity >= _MAX_GVA_NODES:
+            raise ValueError(
+                f"Flat GVA node field holds {_MAX_GVA_NODES} segments, but "
+                f"node_rank={self.node_rank} tp_size={self.tp_size} "
+                f"tp_rank={self.tp_rank} needs id {identity}"
+            )
+        return identity
+
     def _create_manager(self):
         # The owner must have formatted the shared index, mapped the DRAM segment
         # and preallocated the pool file before any peer attaches to them, and
         # must not tear them down while a peer is still mapped. Barriering here
         # is what orders that; the native side never spins waiting (it would need
         # the GIL released, and a crashed rank would hang the rest).
+        # The barrier spans the whole TP group while the handover it orders is
+        # node-local. That is a superset, so the ordering still holds -- every
+        # node's owner is past its manager before any peer connects.
         if not self.shared_store or self._barrier is None:
             return self._manager_factory()
         rdma_shared = self._native_config.dram_share_mode == "rdma"
@@ -259,10 +304,15 @@ class FlatMemoryDirectLinker(UnifiedCacheLinker):
             manager = self._manager_factory()
             payload = ""
             if rdma_shared:
-                # Both are only knowable after the owner started its transfer
-                # engine and allocated the segment, so they travel with the
-                # fds rather than through the config the peers were built from.
-                payload = f"{manager.rdma_local_name()}|{manager.dram_segment_base()}"
+                # The name and base are only knowable after the owner started
+                # its transfer engine and allocated the segment, so they travel
+                # with the fds rather than through the config the peers were
+                # built from. The segment id travels too: a peer cannot derive
+                # it without replicating engine.py's tp_rank_range layout.
+                payload = (
+                    f"{manager.rdma_local_name()}|{manager.dram_segment_base()}"
+                    f"|{self._native_config.segment_id}"
+                )
             self._barrier()
             # Accepting after the barrier means every peer is already waiting to
             # connect, so the handover cannot outrun the listener.
@@ -273,13 +323,15 @@ class FlatMemoryDirectLinker(UnifiedCacheLinker):
         self._native_config.dram_fd = self._segments.dram_fd
         self._native_config.index_fd = self._segments.index_fd
         if rdma_shared:
-            name, _, base = self._segments.payload.partition("|")
-            if not name or not base:
+            fields = self._segments.payload.split("|")
+            if len(fields) != 3 or not all(fields):
                 raise RuntimeError(
-                    "Flat RDMA-shared DRAM handover carried no owner engine "
-                    f"name and base address, got {self._segments.payload!r}"
+                    "Flat RDMA-shared DRAM handover needs the owner engine "
+                    "name, segment base address and segment id, got "
+                    f"{self._segments.payload!r}"
                 )
-            self._native_config.owner_segment_id = 0
+            name, base, owner_id = fields
+            self._native_config.owner_segment_id = int(owner_id)
             self._native_config.owner_dram_size = int(
                 self._native_config.dram_capacity_gb * 1024**3
             )

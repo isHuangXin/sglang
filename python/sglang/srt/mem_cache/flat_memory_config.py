@@ -58,18 +58,32 @@ def validate_flat_memory_direct(cfg: Any) -> dict:
         raise ValueError(
             "Flat compat currently requires a non-disaggregated server; use the host backend for PD"
         )
-    # FLAT_MEMORY: remote_dram_gb / remote_ssd_gb are the names
-    # FlatMemoryConfig.from_dict reads; the *_capacity_gb spellings are kept so
-    # a config written against the older names is still rejected rather than
-    # silently ignored.
+    # FLAT_MEMORY: remote_dram_gb is the name FlatMemoryConfig.from_dict reads;
+    # the *_capacity_gb spellings stay rejected so an old config is not ignored.
     if config.get("enable_persistence", False) or any(
         config.get(name, 0)
         for name in (
             "remote_dram_gb",
-            "remote_ssd_gb",
             "remote_dram_capacity_gb",
             "remote_ssd_capacity_gb",
         )
     ):
-        raise ValueError("Flat compat does not support persistence or remote storage")
+        raise ValueError("Flat compat does not support persistence or remote DRAM")
+    _validate_remote_ssd(config, num_segments=cfg.tp_size * cfg.nnodes)
     return config
+
+
+def _validate_remote_ssd(config: dict, *, num_segments: int) -> None:
+    # Another node's SSD (flat_memory_system.ssd_server), the overflow tier.
+    if not config.get("remote_ssd_gb", 0):
+        return
+    if not config.get("remote_ssd_addr"):
+        raise ValueError("remote_ssd_gb requires remote_ssd_addr (the owner's host:port)")
+    segment_id = int(config.get("remote_ssd_segment_id", -1))
+    # Ranks take ids 0..num_segments-1 and the native remote-DRAM default is 1,
+    # so the owner's id must sit above both or the router would alias them.
+    if segment_id < max(2, num_segments) or segment_id >= 4096:
+        raise ValueError(
+            f"remote_ssd_segment_id must be in [{max(2, num_segments)}, 4096) "
+            "and equal the owner's --segment-id"
+        )

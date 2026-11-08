@@ -21,6 +21,11 @@ from sglang.srt.mem_cache.storage.flat_memory.io_result import (
     FlatUnsafeIOError,
     FlatWriteResult,
 )
+from sglang.srt.mem_cache.storage.flat_memory.master_bootstrap import (
+    AUTO,
+    resolve_master_addr,
+    stop_daemon,
+)
 from sglang.srt.mem_cache.storage.flat_memory.payload import (
     GPUTransfer,
     LookupProbeResult,
@@ -167,10 +172,26 @@ class FlatMemoryDirectLinker(UnifiedCacheLinker):
         self._owns_manager = manager is None
         self._segments: FlatSharedSegments | None = None
         self._native_config = None
+        self._master_proc = None
+        self._master_token = (
+            f"{model_namespace[:16]}_tp{tp_size}_n{node_rank}_{shm_token}"
+        )
         if manager is None:
             from flat_memory_system.manager import FlatMemoryConfig, FlatMemoryManager
 
             native_config = FlatMemoryConfig.from_dict(config)
+            # FLAT_MEMORY: on by default; master_addr="off" disables, a
+            # host:port uses an existing master.
+            native_config.master_addr, self._master_proc = resolve_master_addr(
+                mode=str(config.get("master_addr", AUTO)),
+                token=self._master_token,
+                is_starter=self.node_tp_rank == 0,
+                barrier=barrier,
+            )
+            if native_config.master_addr and not self.shared_store:
+                # Private stores are distinct segments to the master, so each
+                # rank needs its own id; all would claim 0 otherwise and conflict.
+                native_config.segment_id = self._segment_identity()
             native_config.gds_mode = "compat"
             native_config.gpu_id = (
                 self.device.index
@@ -938,6 +959,8 @@ class FlatMemoryDirectLinker(UnifiedCacheLinker):
         # kernel reclaim the segment once every rank has done the same.
         if self._segments is not None:
             self._segments.close()
+        stop_daemon(self._master_proc, token=self._master_token)
+        self._master_proc = None
 
     def clear(self) -> None:
         self.reset()

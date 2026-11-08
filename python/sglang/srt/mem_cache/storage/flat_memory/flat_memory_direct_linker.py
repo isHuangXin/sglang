@@ -261,6 +261,11 @@ class FlatMemoryDirectLinker(UnifiedCacheLinker):
             native_config.reclaim_min_idle_seconds = float(
                 config.get("reclaim_min_idle_seconds", 60.0)
             )
+            # FLAT_MEMORY: half the master's 10 s read lease; the lease is what
+            # keeps a confirmed copy's bytes from reuse while it is cached.
+            native_config.master_lookup_cache_seconds = float(
+                config.get("master_lookup_cache_seconds", 5.0)
+            )
             # FLAT_MEMORY: one read through a hole beat two reads up to 200-500 KiB
             # in an O_DIRECT sweep of the B200 RAID. Only the unset default is
             # capped by the run size; an explicit value is validated natively.

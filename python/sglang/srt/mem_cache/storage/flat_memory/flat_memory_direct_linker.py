@@ -23,6 +23,7 @@ from sglang.srt.mem_cache.storage.flat_memory.io_result import (
 )
 from sglang.srt.mem_cache.storage.flat_memory.master_bootstrap import (
     AUTO,
+    DEFAULT_MASTER_PORT,
     resolve_master_addr,
     stop_daemon,
 )
@@ -138,6 +139,7 @@ class FlatMemoryDirectLinker(UnifiedCacheLinker):
         manager: Any = None,
         barrier: Any = None,
         shm_token: str = "",
+        dist_init_addr: str | None = None,
     ):
         if config.get("gds_mode", "compat") != "compat":
             raise ValueError("Flat direct linker requires gds_mode=compat")
@@ -181,12 +183,17 @@ class FlatMemoryDirectLinker(UnifiedCacheLinker):
 
             native_config = FlatMemoryConfig.from_dict(config)
             # FLAT_MEMORY: on by default; master_addr="off" disables, a
-            # host:port uses an existing master.
+            # host:port uses an existing master. With nnodes > 1 node 0 hosts
+            # one master for the cluster, on master_port of dist_init_addr's host.
             native_config.master_addr, self._master_proc = resolve_master_addr(
                 mode=str(config.get("master_addr", AUTO)),
                 token=self._master_token,
                 is_starter=self.node_tp_rank == 0,
                 barrier=barrier,
+                node_rank=node_rank,
+                nnodes=nnodes,
+                dist_init_addr=dist_init_addr,
+                master_port=int(config.get("master_port", DEFAULT_MASTER_PORT)),
             )
             if native_config.master_addr and not self.shared_store:
                 # Private stores are distinct segments to the master, so each

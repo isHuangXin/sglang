@@ -123,6 +123,7 @@ def create_flat_memory_cache(ctx):
         # the node, equal on every rank, and never None (nccl_port can be).
         barrier=cache._barrier_attn_groups,
         shm_token=str(ctx.server_args.port),
+        dist_init_addr=ctx.server_args.dist_init_addr,
     )
     try:
         runtime = FlatMemoryCache(

@@ -20,6 +20,7 @@ from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
 from sglang.srt.mem_cache.storage.flat_memory import flat_memory_direct_linker
 from sglang.srt.mem_cache.storage.flat_memory.flat_memory_direct_linker import (
     FlatMemoryDirectLinker,
+    LayerLoadCounter,
 )
 from sglang.srt.mem_cache.storage.flat_memory.io_result import (
     FlatCapacityError,
@@ -173,6 +174,87 @@ def _observe_cleanup(transfer):
         yield events
 
 
+def _two_layer_transfer(*, pages, staging_bytes, batch_pages=128, capacity=64 * ALIGNMENT):
+    buffers = [
+        torch.arange(pages * ALIGNMENT, dtype=torch.uint8).reshape(pages, ALIGNMENT) + layer
+        for layer in range(2)
+    ]
+    entry = DevicePoolEntry(
+        name=PoolName.KV,
+        indices_from_pool=PoolName.KV,
+        device_pool=None,
+        components=[buffers],
+        layer_mapping={0: 0, 1: 1},
+        page_size=1,
+        rows_are_pages=True,
+    )
+    layout = PayloadLayout(
+        pool_group=DevicePoolGroup([entry], num_layers=2, page_size=1),
+        model_namespace="cpu-layer-major",
+        tp_rank=0,
+        tp_size=1,
+        max_io_bytes=ALIGNMENT,
+    )
+    manager = _CPUManager(capacity)
+    transfer = GPUTransfer(
+        layout=layout,
+        manager=manager,
+        device=torch.device("cpu"),
+        staging_bytes=staging_bytes,
+        batch_pages=batch_pages,
+    )
+    return transfer, manager, buffers, _request(list(range(pages)))
+
+
+def _two_pool_transfer(*, pages, swa_pages, staging_bytes, batch_pages, capacity):
+    kv = [torch.full((pages, ALIGNMENT), layer, dtype=torch.uint8) for layer in range(2)]
+    swa = [torch.full((pages, ALIGNMENT), 9, dtype=torch.uint8)]
+    entries = [
+        DevicePoolEntry(
+            name=PoolName.KV,
+            indices_from_pool=PoolName.KV,
+            device_pool=None,
+            components=[kv],
+            layer_mapping={0: 0, 1: 1},
+            page_size=1,
+            rows_are_pages=True,
+        ),
+        DevicePoolEntry(
+            name=PoolName.SWA,
+            indices_from_pool=PoolName.SWA,
+            device_pool=None,
+            components=[swa],
+            layer_mapping={1: 0},
+            page_size=1,
+            rows_are_pages=True,
+        ),
+    ]
+    layout = PayloadLayout(
+        pool_group=DevicePoolGroup(entries, num_layers=2, page_size=1),
+        model_namespace="cpu-two-pool",
+        tp_rank=0,
+        tp_size=1,
+        max_io_bytes=ALIGNMENT,
+    )
+    manager = _CPUManager(capacity)
+    transfer = GPUTransfer(
+        layout=layout,
+        manager=manager,
+        device=torch.device("cpu"),
+        staging_bytes=staging_bytes,
+        batch_pages=batch_pages,
+    )
+    tail = list(range(pages - swa_pages, pages))
+    request = _request(list(range(pages))) + [
+        PoolTransfer(
+            name=PoolName.SWA,
+            host_indices=torch.tensor(tail, dtype=torch.int64),
+            keys=[f"page-{row}" for row in tail],
+        )
+    ]
+    return transfer, manager, request
+
+
 def _make_linker(transfer):
     linker = FlatMemoryDirectLinker.__new__(FlatMemoryDirectLinker)
     linker.transfer = transfer
@@ -280,6 +362,98 @@ class TestFlatPayloadIO(CustomTestCase):
             self.assertEqual(manager.put_gpu_file_detailed.call_count, 3)
         finally:
             transfer.budget.release(held)
+
+    def test_layer_major_order_and_progress_release_complete_layers_only(self):
+        """FC-CIO: the forward may start layer l only after all of l has landed."""
+        pages = 3
+        transfer, _, buffers, request = _two_layer_transfer(
+            pages=pages, staging_bytes=4 * ALIGNMENT, batch_pages=2
+        )
+        self.assertEqual(
+            [fragment.layer for fragment in transfer.layout.fragments(request)],
+            [0] * pages + [1] * pages,
+        )
+        transfer.write(request)
+        expected = [buffer.clone() for buffer in buffers]
+        for buffer in buffers:
+            buffer.zero_()
+        progress = []
+
+        def observe(done, total, layer):
+            # Every layer reported complete must already be fully in place.
+            for complete in range(layer + 1):
+                torch.testing.assert_close(buffers[complete], expected[complete])
+            progress.append((done, total, layer))
+
+        transfer.read(request, on_progress=observe)
+        layers = [layer for *_, layer in progress]
+        # Monotonic, layer 0 opens before the read ends, and the last report
+        # covers the whole payload.
+        self.assertEqual(layers, sorted(layers))
+        self.assertIn(0, layers[:-1])
+        self.assertEqual(layers[-1], 1)
+        self.assertEqual(progress[-1][0], progress[-1][1])
+
+    def test_each_write_extent_holds_whole_pages_in_order(self):
+        """One native write is one extent. A batch holding layer slices of many
+        pages lets one failed write or one reclaimed extent void every page."""
+        for staging, snapshot in ((10 * ALIGNMENT, False), (64 * ALIGNMENT, True)):
+            with self.subTest(snapshot=snapshot):
+                # Four fragments per batch: two pages, so several extents either way.
+                transfer, manager, _, request = _two_layer_transfer(
+                    pages=5, staging_bytes=staging, batch_pages=4
+                )
+                transfer.write(request)
+                self.assertEqual(transfer.snapshot_writes, int(snapshot))
+                layout = transfer.layout
+                written_pages = []
+                for call in manager.put_gpu_file_detailed.call_args_list:
+                    pages = [layout.page_key_of(key) for key in call.args[0]]
+                    for page in set(pages):
+                        self.assertEqual(pages.count(page), 2, "page split across extents")
+                    written_pages.extend(dict.fromkeys(pages))
+                self.assertGreater(manager.put_gpu_file_detailed.call_count, 1)
+                self.assertEqual(written_pages, [f"page-{row}" for row in range(5)])
+
+    def test_each_write_extent_holds_every_pool_share_of_its_pages(self):
+        """A restore needs each pool's fragments of a page; one pool's share in
+        another extent voids the page when that extent is lost."""
+        transfer, manager, request = _two_pool_transfer(
+            pages=5, swa_pages=2, staging_bytes=16 * ALIGNMENT, batch_pages=6,
+            capacity=64 * ALIGNMENT,
+        )
+        transfer.write(request)
+        layout = transfer.layout
+        per_page = {f"page-{row}": 2 + (row >= 3) for row in range(5)}
+        written = []
+        for call in manager.put_gpu_file_detailed.call_args_list:
+            pages = [layout.page_key_of(key) for key in call.args[0]]
+            for page in set(pages):
+                self.assertEqual(pages.count(page), per_page[page], page)
+            written.extend(dict.fromkeys(pages))
+        self.assertGreater(manager.put_gpu_file_detailed.call_count, 1)
+        self.assertEqual(written, [f"page-{row}" for row in range(5)])
+
+    def test_capacity_failure_keeps_leading_pages_whole_in_every_pool(self):
+        transfer, _, request = _two_pool_transfer(
+            pages=4, swa_pages=4, staging_bytes=16 * ALIGNMENT, batch_pages=6,
+            capacity=6 * ALIGNMENT,
+        )
+        with self.assertRaises(FlatCapacityError):
+            transfer.write(request)
+        boundaries = transfer.lookup(keys=request[0].keys, transfers=request)
+        # Three fragments per page across both pools: two pages fit in six blocks.
+        self.assertEqual(max(boundaries, default=0), 2)
+
+    def test_capacity_failure_mid_write_keeps_the_leading_whole_pages(self):
+        transfer, manager, _, request = _two_layer_transfer(
+            pages=5, staging_bytes=10 * ALIGNMENT, capacity=5 * ALIGNMENT
+        )
+        with self.assertRaises(FlatCapacityError):
+            transfer.write(request)
+        boundaries = transfer.lookup(keys=request[0].keys, transfers=request)
+        # Two whole pages (4 fragments) fit before the store ran out.
+        self.assertEqual(max(boundaries, default=0), 2)
 
     def test_page_key_of_inverts_every_fragment_key(self):
         """Reclaim reports arrive as fragment keys; a parse that drifts from
@@ -1042,3 +1216,28 @@ class TestFlatLinkerWriteIO(CustomTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestLayerLoadCounter(CustomTestCase):
+    def test_batch_index_waits_for_every_member_and_fails_closed(self):
+        """A combined layer must not open until all restores reached it, and a
+        failed read must stop the forward rather than serve partial pages."""
+        counter = LayerLoadCounter(num_layers=3)
+        first, second = counter.update_producer(), counter.update_producer()
+        batch = counter.combine([first, second])
+        counter.set_consumer(batch)
+        counter.complete_through(first, 1)
+        layers = counter.futures[batch]
+        self.assertFalse(layers[0].done())
+        counter.complete_through(second, 0)
+        self.assertTrue(layers[0].done())
+        self.assertFalse(layers[1].done())
+        counter.wait_until(0)
+        counter.complete(second, "injected read failure")
+        with self.assertRaises(FlatUnsafeIOError):
+            counter.wait_until(1)
+        counter.complete(first, None)
+        self.assertTrue(counter.done(batch))
+        counter.forget(batch)
+        counter.set_consumer(batch)
+        counter.wait_until(2)  # a forgotten, finished index never blocks

@@ -74,6 +74,8 @@ class PayloadFragment(msgspec.Struct, frozen=True):
     key: str
     source: torch.Tensor
     padded_length: int
+    # FLAT_MEMORY: Model layer id the KV pools wait on (wait_until(layer_id)).
+    layer: int = 0
 
 
 class PayloadLayout:
@@ -98,6 +100,8 @@ class PayloadLayout:
         self.pool_group = pool_group
         self.max_io_bytes = max_io_bytes
         self.specs: dict[PoolName, tuple[FragmentSpec, ...]] = {}
+        # FLAT_MEMORY: FC-CIO layer-major order: model layer -> spec indices per pool.
+        self._specs_by_layer: dict[PoolName, dict[int, tuple[int, ...]]] = {}
         identity = []
         for entry in pool_group.entries:
             specs = []
@@ -138,6 +142,18 @@ class PayloadLayout:
                         )
                     )
             self.specs[entry.name] = tuple(specs)
+            # A buffer no layer maps to is grouped with layer 0, so it lands first.
+            buffer_layer = {}
+            for layer, buffer_index in entry.layer_mapping.items():
+                buffer_layer[buffer_index] = min(
+                    layer, buffer_layer.get(buffer_index, layer)
+                )
+            by_layer: dict[int, list[int]] = {}
+            for index, spec in enumerate(specs):
+                by_layer.setdefault(buffer_layer.get(spec.buffer, 0), []).append(index)
+            self._specs_by_layer[entry.name] = {
+                layer: tuple(indices) for layer, indices in sorted(by_layer.items())
+            }
             identity.append(
                 (
                     str(entry.name),
@@ -206,6 +222,56 @@ class PayloadLayout:
         )
 
     def fragments(self, transfers: list[PoolTransfer]) -> Iterator[PayloadFragment]:
+        # FLAT_MEMORY: FC-CIO layer-major order, ascending model layer across pools,
+        # so a read can release layer l to the forward pass before l + 1 lands.
+        yield from self._layer_major(self._prepare(transfers))
+
+    def write_groups(
+        self, transfers: list[PoolTransfer], *, max_bytes: int, max_fragments: int
+    ) -> Iterator[list[PayloadFragment]]:
+        # FLAT_MEMORY: Each write batch becomes one extent. A batch holds whole
+        # pages across every pool, layer-major inside, so a failed later batch or
+        # a reclaimed extent costs only its own pages: a restore needs each pool's
+        # share of a page, and splitting pools across extents voids the page too.
+        prepared = self._prepare(transfers)
+        rows = [dict(pages) for _, _, pages in prepared]
+        # The pool covering the most pages (the full KV prefix) fixes page order;
+        # pools holding a subset, such as SWA's trailing window, align by key.
+        reference = max(prepared, key=lambda item: len(item[2]), default=None)
+        order: dict[str, None] = {}
+        for _, _, pages in ([reference] if reference else []) + prepared:
+            for key, _ in pages:
+                order.setdefault(key)
+        page_bytes = {
+            name: sum(spec.padded_length for spec in self.specs[name])
+            for name, _, _ in prepared
+        }
+        group, group_bytes, group_fragments = [], 0, 0
+        for key in order:
+            owners = [i for i, pool_rows in enumerate(rows) if key in pool_rows]
+            size = sum(page_bytes[prepared[i][0]] for i in owners)
+            fragments = sum(len(self.specs[prepared[i][0]]) for i in owners)
+            if group and (
+                group_bytes + size > max_bytes
+                or group_fragments + fragments > max_fragments
+            ):
+                yield self._group_fragments(prepared, rows, group)
+                group, group_bytes, group_fragments = [], 0, 0
+            group.append(key)
+            group_bytes += size
+            group_fragments += fragments
+        if group:
+            yield self._group_fragments(prepared, rows, group)
+
+    def _group_fragments(self, prepared, rows, keys) -> list[PayloadFragment]:
+        subset = [
+            (name, entry, [(key, pool_rows[key]) for key in keys if key in pool_rows])
+            for (name, entry, _), pool_rows in zip(prepared, rows)
+        ]
+        return list(self._layer_major([item for item in subset if item[2]]))
+
+    def _prepare(self, transfers: list[PoolTransfer]) -> list:
+        prepared = []
         for transfer in transfers:
             entry = self.pool_group.entry_map[transfer.name]
             if transfer.host_indices is None:
@@ -218,20 +284,32 @@ class PayloadLayout:
                 raise ValueError(
                     f"Flat GPU transfer {transfer.name} keys/slots disagree"
                 )
-            for page_key, row in zip(keys, locations):
-                for spec in self.specs[transfer.name]:
+            prepared.append((transfer.name, entry, list(zip(keys, locations))))
+        return prepared
+
+    def _layer_major(self, prepared: list) -> Iterator[PayloadFragment]:
+        layers = sorted(
+            {layer for name, _, _ in prepared for layer in self._specs_by_layer[name]}
+        )
+        for layer in layers:
+            for name, entry, pages in prepared:
+                specs = self.specs[name]
+                for index in self._specs_by_layer[name].get(layer, ()):
+                    spec = specs[index]
                     buffer = entry.components[spec.component][spec.buffer]
-                    page = buffer.narrow(0, row, entry._row_span)
-                    if not page.is_contiguous():
-                        raise ValueError(
-                            f"Flat GPU pool {entry.name} moved or changed layout"
+                    for page_key, row in pages:
+                        page = buffer.narrow(0, row, entry._row_span)
+                        if not page.is_contiguous():
+                            raise ValueError(
+                                f"Flat GPU pool {entry.name} moved or changed layout"
+                            )
+                        raw = page.view(torch.uint8).reshape(-1)
+                        yield PayloadFragment(
+                            self._key(name=name, page_key=page_key, spec=spec),
+                            raw.narrow(0, spec.offset, spec.length),
+                            spec.padded_length,
+                            layer,
                         )
-                    raw = page.view(torch.uint8).reshape(-1)
-                    yield PayloadFragment(
-                        self._key(name=transfer.name, page_key=page_key, spec=spec),
-                        raw.narrow(0, spec.offset, spec.length),
-                        spec.padded_length,
-                    )
 
 
 class StagingBudget:
@@ -393,12 +471,23 @@ class GPUTransfer:
                 transfers, on_source_consumed=on_source_consumed, media_hint=media_hint
             )
 
-    def read(self, transfers: list[PoolTransfer], *, medium: str = "ssd") -> None:
+    def read(
+        self,
+        transfers: list[PoolTransfer],
+        *,
+        medium: str = "ssd",
+        on_progress: Callable[[int, int, int], None] | None = None,
+    ) -> None:
+        # FLAT_MEMORY: on_progress(done_bytes, total_bytes, layers_done_through)
+        # runs after each batch, once its bytes are in place in the device pages.
         self.raise_if_unsafe()
         budget = self.dram_read_budget if medium == "dram" else self.budget
+        fragments = list(self.layout.fragments(transfers))
+        total_bytes = sum(fragment.padded_length for fragment in fragments)
+        done_bytes = consumed = 0
         with self._context(), self._stream_context():
             for batch, total in self._batches(
-                self.layout.fragments(transfers), batch_bytes=self.read_batch_bytes
+                fragments, batch_bytes=self.read_batch_bytes
             ):
                 self._with_stage(
                     total,
@@ -408,6 +497,17 @@ class GPUTransfer:
                     budget=budget,
                 )
                 self._record_batch(batch, write=False)
+                done_bytes += total
+                consumed += len(batch)
+                if on_progress is not None:
+                    # Fragments ascend by layer, so everything below the next
+                    # pending fragment's layer is complete.
+                    through = (
+                        fragments[consumed].layer - 1
+                        if consumed < len(fragments)
+                        else fragments[-1].layer
+                    )
+                    on_progress(done_bytes, total_bytes, through)
 
     def raise_if_unsafe(self) -> None:
         if self._unsafe_error is not None:
@@ -439,10 +539,17 @@ class GPUTransfer:
     def _write_transfers(self, transfers, *, on_source_consumed, media_hint) -> None:
         whole_bytes = self.layout.padded_bytes(transfers)
         remaining = whole_bytes
+        # A group that fits is exactly one batch; only an oversized page splits.
         batches = iter(
-            self._batches(
-                self.layout.fragments(transfers), batch_bytes=self.write_batch_bytes
-            )
+            [
+                batch
+                for group in self.layout.write_groups(
+                    transfers,
+                    max_bytes=self.write_batch_bytes,
+                    max_fragments=self.batch_pages,
+                )
+                for batch in self._batches(group, batch_bytes=self.write_batch_bytes)
+            ]
         )
         attempted_snapshot = False
         for batch, total in batches:

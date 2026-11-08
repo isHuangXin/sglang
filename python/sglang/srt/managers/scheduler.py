@@ -3939,6 +3939,11 @@ class Scheduler(
             new_batch.hicache_consumer_index = (
                 self.tree_cache.ready_to_load_host_cache()
             )
+        elif self.flat_memory_cache is not None:
+            # FLAT_MEMORY: The forward waits per layer on every still-streaming restore.
+            new_batch.hicache_consumer_index = (
+                self.flat_memory_cache.layer_wise_consumer()
+            )
 
         new_batch.prepare_for_extend()
 

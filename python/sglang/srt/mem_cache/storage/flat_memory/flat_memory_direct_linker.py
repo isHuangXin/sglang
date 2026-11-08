@@ -7,7 +7,13 @@ import os
 import threading
 import time
 from collections import deque
-from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from concurrent.futures import (
+    FIRST_COMPLETED,
+    Future,
+    InvalidStateError,
+    ThreadPoolExecutor,
+    wait,
+)
 from dataclasses import replace
 from typing import Any
 
@@ -77,51 +83,110 @@ class _LookupQuery(msgspec.Struct, eq=False):
 
 
 class LayerLoadCounter:
-    """Completion gate; Flat publishes all layers only after the full read succeeds."""
+    """Per-layer completion; a KV pool's wait_until(layer_id) blocks the forward.
+
+    Each restore owns one index; combine() makes a batch index whose layer l
+    completes once every member's layer l has.
+    """
 
     def __init__(self, num_layers: int):
         self.num_layers = num_layers
         self.producer_index = -1
         self.consumer_index = -1
-        self.futures: dict[int, Future] = {}
+        self.futures: dict[int, list[Future]] = {}
         self._lock = threading.Lock()
 
     def update_producer(self) -> int:
         with self._lock:
             self.producer_index += 1
-            self.futures[self.producer_index] = Future()
+            self.futures[self.producer_index] = [
+                Future() for _ in range(self.num_layers)
+            ]
             return self.producer_index
 
     def set_consumer(self, index: int) -> None:
         self.consumer_index = index
 
-    def complete(self, index: int, error: str | None) -> None:
+    def _layers(self, index: int) -> list[Future] | None:
         with self._lock:
-            future = self.futures[index]
+            return self.futures.get(index)
+
+    def complete_through(self, index: int, layer: int) -> None:
+        for future in (self._layers(index) or [])[: max(0, layer + 1)]:
+            _resolve(future)
+
+    def complete(self, index: int, error: str | None) -> None:
+        for future in self._layers(index) or ():
             if error is None:
-                future.set_result(None)
-            else:
-                future.set_exception(RuntimeError(error))
+                _resolve(future)
+            elif not future.done():
+                try:
+                    future.set_exception(FlatUnsafeIOError(error))
+                except InvalidStateError:
+                    pass
+
+    def combine(self, indices: list[int]) -> int:
+        combined = self.update_producer()
+        targets = self._layers(combined)
+        members = [layers for index in indices if (layers := self._layers(index))]
+        for layer, target in enumerate(targets):
+            parts = [layers[layer] for layers in members]
+            if not parts:
+                _resolve(target)
+                continue
+            remaining = [len(parts)]
+            lock = threading.Lock()
+
+            def finished(_, parts=parts, target=target, remaining=remaining, lock=lock):
+                with lock:
+                    remaining[0] -= 1
+                    if remaining[0]:
+                        return
+                error = next(
+                    (part.exception() for part in parts if part.exception()), None
+                )
+                if error is None:
+                    _resolve(target)
+                elif not target.done():
+                    target.set_exception(error)
+
+            for part in parts:
+                part.add_done_callback(finished)
+        return combined
 
     def wait_until(self, threshold: int) -> None:
-        with self._lock:
-            future = self.futures.get(self.consumer_index)
-        if future is not None:
-            future.result()
-            if threshold == self.num_layers - 1:
-                with self._lock:
-                    self.futures.pop(self.consumer_index, None)
+        layers = self._layers(self.consumer_index)
+        if layers is None:
+            return
+        error = layers[min(threshold, self.num_layers - 1)].exception()
+        if error is not None:
+            # FLAT_MEMORY: The pages are already published; never compute on them.
+            raise FlatUnsafeIOError(
+                f"Flat layer-wise restore failed before layer {threshold}: {error}"
+            ) from error
+
+    def done(self, index: int) -> bool:
+        layers = self._layers(index)
+        return layers is None or all(future.done() for future in layers)
 
     def forget(self, index: int) -> None:
         with self._lock:
-            future = self.futures.get(index)
-            if future is not None and future.done():
+            layers = self.futures.get(index)
+            if layers is not None and all(future.done() for future in layers):
                 self.futures.pop(index)
 
     def reset(self) -> None:
         with self._lock:
             self.futures.clear()
             self.producer_index = self.consumer_index = -1
+
+
+def _resolve(future: Future) -> None:
+    if not future.done():
+        try:
+            future.set_result(None)
+        except InvalidStateError:
+            pass
 
 
 class FlatMemoryDirectLinker(UnifiedCacheLinker):
@@ -191,6 +256,18 @@ class FlatMemoryDirectLinker(UnifiedCacheLinker):
             native_config.reclaim_low_watermark = float(
                 config.get("reclaim_low_watermark", 0.80)
             )
+            # FLAT_MEMORY: twice the default restore_lease_timeout, which bounds a
+            # restore's lookup-to-read span.
+            native_config.reclaim_min_idle_seconds = float(
+                config.get("reclaim_min_idle_seconds", 60.0)
+            )
+            # FLAT_MEMORY: one read through a hole beat two reads up to 200-500 KiB
+            # in an O_DIRECT sweep of the B200 RAID. Only the unset default is
+            # capped by the run size; an explicit value is validated natively.
+            if "gds_merge_gap_bytes" not in config:
+                native_config.gds_merge_gap_bytes = min(
+                    256 * 1024, native_config.gds_max_io_bytes
+                )
             # FLAT_MEMORY: on by default; master_addr="off" disables, a
             # host:port uses an existing master. With nnodes > 1 node 0 hosts
             # one master for the cluster, on master_port of dist_init_addr's host.
@@ -300,6 +377,10 @@ class FlatMemoryDirectLinker(UnifiedCacheLinker):
         self._storage_generation = 0
         self._offload_coverage: dict[Future, frozenset[PageRecord]] = {}
         self._load_batches: deque[tuple[int, dict[str, Future]]] = deque()
+        # FLAT_MEMORY: per-restore layer counter index and (done, total) bytes.
+        self._rid_counters: dict[str, int] = {}
+        self._consumer_indices: list[int] = []
+        self._read_progress: dict[str, tuple[int, int]] = {}
         self._offloads: deque[_Offload] = deque()
         self._prefetch_samples = []
         self._backup_samples = []
@@ -580,7 +661,12 @@ class FlatMemoryDirectLinker(UnifiedCacheLinker):
             if not self._pending_loads:
                 return -1
             pending, self._pending_loads = self._pending_loads, {}
-            counter_index = self.layer_done_counter.update_producer()
+            for rid in pending:
+                self._rid_counters[rid] = self.layer_done_counter.update_producer()
+                self._read_progress[rid] = (0, 0)
+            counter_index = self.layer_done_counter.combine(
+                [self._rid_counters[rid] for rid in pending]
+            )
             futures = {rid: Future() for rid in pending}
             self._loads.update(futures)
             self._load_batches.append((counter_index, dict(futures)))
@@ -592,10 +678,49 @@ class FlatMemoryDirectLinker(UnifiedCacheLinker):
                     transfers,
                     ready_event,
                     futures[rid],
-                    counter_index,
+                    self._rid_counters[rid],
                     futures,
                 )
             return counter_index
+
+    def load_progress(self, rid: str) -> tuple[int, int]:
+        with self._lock:
+            return self._read_progress.get(rid, (0, 0))
+
+    def read_bandwidth(self) -> float | None:
+        # FLAT_MEMORY: bytes/second over the recent restores; None before any.
+        with self._lock:
+            samples = self._prefetch_samples[-16:]
+        seconds = sum(sample[2] for sample in samples)
+        return sum(sample[1] for sample in samples) / seconds if seconds > 0 else None
+
+    def layer_counter_for(self, rids: list[str]) -> int:
+        # FLAT_MEMORY: the batch's consumer index; -1 when no member still streams.
+        with self._lock:
+            # A finished consumer index reads as done once forgotten, so drop it.
+            for index in self._consumer_indices:
+                self.layer_done_counter.forget(index)
+            self._consumer_indices = [
+                index
+                for index in self._consumer_indices
+                if not self.layer_done_counter.done(index)
+            ]
+            indices = [
+                self._rid_counters[rid]
+                for rid in rids
+                if rid in self._rid_counters
+                and not self.layer_done_counter.done(self._rid_counters[rid])
+            ]
+            if not indices:
+                return -1
+            combined = self.layer_done_counter.combine(indices)
+            self._consumer_indices.append(combined)
+            return combined
+
+    def _progress(self, rid: str, counter_index: int, done, total, layer) -> None:
+        with self._lock:
+            self._read_progress[rid] = (done, total)
+        self.layer_done_counter.complete_through(counter_index, layer)
 
     def start_layer_wise_loading(self) -> int:
         return self.start_preparing_loads()
@@ -621,7 +746,7 @@ class FlatMemoryDirectLinker(UnifiedCacheLinker):
     def _dispatch_read(self, rid, transfers, ready_event, result, counter_index, batch):
         try:
             medium, dram, ssd, mixed = self._media_counts(transfers)
-            args = (rid, transfers, ready_event, medium, dram, ssd, mixed)
+            args = (rid, transfers, ready_event, medium, dram, ssd, mixed, counter_index)
             if medium == "ssd":
                 read = self._ssd_executor.submit(
                     self._read, *args, io_bytes=self._payload_bytes(transfers)
@@ -650,14 +775,20 @@ class FlatMemoryDirectLinker(UnifiedCacheLinker):
         self._finish_read(value, result, counter_index, batch)
 
     def _read(
-        self, rid, transfers, ready_event, medium, dram, ssd, mixed
+        self, rid, transfers, ready_event, medium, dram, ssd, mixed, counter_index
     ) -> FlatLoadResult:
         started = time.perf_counter()
         failure = None
         unsafe = False
         try:
             self._wait_ready(ready_event)
-            self.transfer.read(transfers, medium=medium)
+            self.transfer.read(
+                transfers,
+                medium=medium,
+                on_progress=lambda done, total, layer: self._progress(
+                    rid, counter_index, done, total, layer
+                ),
+            )
         except Exception as error:
             failure = f"{type(error).__name__}: {error}"
             unsafe = isinstance(error, FlatUnsafeIOError)
@@ -686,15 +817,8 @@ class FlatMemoryDirectLinker(UnifiedCacheLinker):
             if value.unsafe:
                 self._unsafe_error = FlatUnsafeIOError(value.error)
             result.set_result(value)
-            if all(future.done() for future in batch.values()):
-                errors = [
-                    future.result().error
-                    for future in batch.values()
-                    if future.result().error
-                ]
-                self.layer_done_counter.complete(
-                    counter_index, "; ".join(errors) if errors else None
-                )
+        # The batch index combines its members' counters, so it follows on its own.
+        self.layer_done_counter.complete(counter_index, value.error)
 
     def load_ready(self, rid: str) -> bool:
         with self._lock:
@@ -720,6 +844,9 @@ class FlatMemoryDirectLinker(UnifiedCacheLinker):
                 return None
             result = future.result()
             self._loads.pop(rid)
+            self._read_progress.pop(rid, None)
+            if (index := self._rid_counters.pop(rid, None)) is not None:
+                self.layer_done_counter.forget(index)
             kept = deque()
             for counter_index, batch in self._load_batches:
                 batch.pop(rid, None)
@@ -975,6 +1102,9 @@ class FlatMemoryDirectLinker(UnifiedCacheLinker):
             self._lookup_ssd_pages.clear()
             self._offloads.clear()
             self._load_batches.clear()
+            self._rid_counters.clear()
+            self._consumer_indices.clear()
+            self._read_progress.clear()
             self.layer_done_counter.reset()
 
     def close(self) -> None:

@@ -150,6 +150,10 @@ class _Prefetch(msgspec.Struct, kw_only=True):
     ssd_pages: int = 0
     bypass: bool = False
     revoke_reason: str = ""
+    # FLAT_MEMORY: FC-CIO layer-wise restore: committed before the read ends;
+    # stream_hold keeps the published pages from eviction until it does.
+    streaming: bool = False
+    stream_hold: Any = None
     admission_attempted: bool = False
     admitted: bool = False
     allocation_wait_started: float = 0.0
@@ -235,6 +239,17 @@ class FlatMemoryCache:
             raise ValueError("Flat scope_agent_context_tokens must be nonnegative")
         self._write_scope_hint = MEDIA_HINT_ANY
         self.scope_hint_tokens = {"dram": 0, "ssd": 0, "any": 0}
+        # FLAT_MEMORY: FC-CIO layer-pipelined restore. Off: a published page whose
+        # read later fails can only fail closed, and an early admit stalls the
+        # forward pass on storage. The lead bounds that stall; it is arbitrary.
+        self.layer_wise_restore = bool(config.get("layer_wise_restore", False))
+        self.layer_wise_admit_lead = (
+            float(config.get("layer_wise_admit_lead_ms", 200.0)) / 1000
+        )
+        if self.layer_wise_admit_lead < 0:
+            raise ValueError("Flat layer_wise_admit_lead_ms must be nonnegative")
+        self._streaming: dict[str, _Prefetch] = {}
+        self.layer_wise_commits = 0
         # FLAT_MEMORY: page key -> (node id, page hash) of the node that backed it up.
         self._page_nodes: dict[str, tuple[int, str]] = {}
         self._polls = 0
@@ -479,7 +494,12 @@ class FlatMemoryCache:
         self._log_metrics()
         # FLAT_MEMORY: Every rank visits the same request list, never worker order.
         states = list(self.prefetches.values())
-        if not states:
+        streams = [
+            state
+            for rid, state in self._streaming.items()
+            if rid not in self.prefetches
+        ]
+        if not states and not streams:
             return
         now = time.monotonic()
         query_flags = self._reduce(
@@ -514,7 +534,7 @@ class FlatMemoryCache:
             elif ready:
                 self._finish_query(state)
         self._expire_leases()
-        self._poll_reads(states)
+        self._poll_reads(states + streams)
         for state in states:
             if state.cancelled and state.phase == "ready":
                 self._forget(state)
@@ -1051,10 +1071,10 @@ class FlatMemoryCache:
         self.cache_linker.start_preparing_loads()
 
     def _poll_reads(self, states: list[_Prefetch]) -> None:
-        done, errors = [], []
+        done, errors, nearly = [], [], []
         for state in states:
             ready, failed = False, False
-            if state.phase == "read":
+            if state.phase == "read" or state.streaming:
                 try:
                     ready = self.cache_linker.load_ready(state.req.rid)
                 except FlatUnsafeIOError:
@@ -1063,10 +1083,24 @@ class FlatMemoryCache:
                     ready, failed = True, 1
             done.append(int(ready))
             errors.append(int(failed))
+            nearly.append(int(not ready and self._near_done(state)))
         done = self._reduce(done, torch.distributed.ReduceOp.MIN)
         errors = self._reduce(errors, torch.distributed.ReduceOp.MAX)
-        for state, ready, failed in zip(states, done, errors):
+        if self.layer_wise_restore:
+            nearly = self._reduce(nearly, torch.distributed.ReduceOp.MIN)
+        for state, ready, failed, near in zip(states, done, errors, nearly):
+            if state.streaming:
+                if ready and failed:
+                    raise FlatUnsafeIOError(
+                        "Flat layer-wise restore failed after its pages were "
+                        "published; refusing to serve them"
+                    )
+                if ready:
+                    self._finish_stream(state)
+                continue
             if not ready:
+                if near and not state.cancelled and not state.revoke_reason:
+                    self._stream_commit(state)
                 continue
             if failed == 2:
                 raise FlatUnsafeIOError(
@@ -1099,6 +1133,52 @@ class FlatMemoryCache:
                 self._record_read_metrics(state)
                 state.phase = "ready"
             self.cache_linker.forget_request(state.req.rid)
+
+    def _near_done(self, state: _Prefetch) -> bool:
+        # FLAT_MEMORY: Admit only once the rest of the read is shorter than the
+        # lead, so the forward pass waits at most about that long on storage.
+        if not self.layer_wise_restore or state.phase != "read":
+            return False
+        done, total = self.cache_linker.load_progress(state.req.rid)
+        bandwidth = self.cache_linker.read_bandwidth()
+        if total <= 0 or bandwidth is None:
+            return False
+        return (total - done) / bandwidth <= self.layer_wise_admit_lead
+
+    def _stream_commit(self, state: _Prefetch) -> None:
+        done, total = self.cache_linker.load_progress(state.req.rid)
+        self._commit(state)
+        node = state.hold_node
+        state.stream_hold = (node, self.cache.inc_lock_ref(node).to_dec_params())
+        state.streaming = True
+        state.phase = "ready"
+        self._streaming[state.req.rid] = state
+        self.layer_wise_commits += 1
+        self._diagnose(
+            state, layer_wise_commit=1, layer_wise_remaining_bytes=total - done
+        )
+
+    def _finish_stream(self, state: _Prefetch) -> None:
+        ready_ns = time.monotonic_ns()
+        if state.restore_episode is not None:
+            state.restore_episode.restored_tokens = state.loaded_tokens
+            state.restore_episode.observe_ready(
+                ready_ns=ready_ns, endpoint="flat_all_tp_ready"
+            )
+        self._record_read_metrics(state)
+        node, params = state.stream_hold
+        self.cache.dec_lock_ref(node, params)
+        state.stream_hold = None
+        state.streaming = False
+        self._streaming.pop(state.req.rid, None)
+        self.cache_linker.forget_request(state.req.rid)
+
+    def layer_wise_consumer(self) -> int:
+        # FLAT_MEMORY: Every streaming restore, not just the batch's own: another
+        # request may already have matched a published, still-loading node.
+        if not self._streaming:
+            return -1
+        return self.cache_linker.layer_counter_for(list(self._streaming))
 
     def _commit(self, state: _Prefetch) -> None:
         # FLAT_MEMORY: All required components and ranks completed before tree insertion.
@@ -1381,7 +1461,9 @@ class FlatMemoryCache:
             raise RuntimeError("Flat cannot forget a restore before I/O drain")
         self._finalize_wait(state, "cancelled" if state.cancelled else "forgotten")
         self._release_hold(state)
-        self.cache_linker.forget_request(state.req.rid)
+        # A streaming read still owns its linker load until _finish_stream.
+        if not state.streaming:
+            self.cache_linker.forget_request(state.req.rid)
         self.tree_linker.hit_markers.pop(state.req.rid, None)
         self.prefetches.pop(state.req.rid, None)
         self._drop_lease(state.req.rid)
@@ -1555,7 +1637,7 @@ class FlatMemoryCache:
             self._last_metrics_log = now
 
     def is_idle(self) -> bool:
-        return not self.prefetches and not self.pending_offloads
+        return not self.prefetches and not self.pending_offloads and not self._streaming
 
     def has_unfinished_io(self) -> bool:
         return self.cache_linker.has_unfinished_io()
@@ -1615,6 +1697,8 @@ class FlatMemoryCache:
             flat_restore_admission_dropped_tokens=self.admission_dropped_tokens,
             flat_restore_revalidated_requests=self._revalidated_requests,
             flat_reclaim_invalidated_nodes=self.reclaim_invalidated_nodes,
+            flat_restore_layer_wise_commits=self.layer_wise_commits,
+            flat_restore_streaming=len(self._streaming),
             **{
                 f"flat_scope_hint_{medium}_tokens": tokens
                 for medium, tokens in self.scope_hint_tokens.items()

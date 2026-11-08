@@ -26,6 +26,7 @@ from sglang.srt.mem_cache.flat_memory_cache import (
 from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.storage.flat_memory.io_result import FlatUnsafeIOError
 from sglang.srt.mem_cache.storage.flat_memory.payload import (
     MEDIA_HINT_ANY,
     MEDIA_HINT_DRAM,
@@ -55,6 +56,9 @@ class _Storage:
         self.ssd_rids = set()
         self.media_hints = []
         self.reclaimed_pages = set()
+        self.progress = {}
+        self.bandwidth = None
+        self.consumers = []
 
     def take_reclaimed_pages(self):
         pages, self.reclaimed_pages = self.reclaimed_pages, set()
@@ -103,7 +107,22 @@ class _Storage:
         )
 
     def load_ready(self, rid):
+        if self.loads[rid].done() and self.loads[rid].result().error:
+            raise RuntimeError(self.loads[rid].result().error)
         return self.loads[rid].done()
+
+    def fail(self, rid):
+        self.loads[rid].set_result(NS(error="injected read failure"))
+
+    def load_progress(self, rid):
+        return self.progress.get(rid, (0, 0))
+
+    def read_bandwidth(self):
+        return self.bandwidth
+
+    def layer_counter_for(self, rids):
+        self.consumers.append(list(rids))
+        return 7
 
     def take_load_result(self, rid):
         return self.loads.pop(rid).result()
@@ -456,6 +475,79 @@ class TestFlatMemoryAdmission(CustomTestCase):
         )
         self.runtime.scope_media_hints = False
         self.assertEqual(classify(cached_tokens=8, input_tokens=9), MEDIA_HINT_ANY)
+
+    def _streaming(self):
+        self.runtime.layer_wise_restore = True
+        self.runtime.layer_wise_admit_lead = 1.0
+        req = self._req()
+        self.runtime.poll()
+        self.runtime.prepare_admission([req], self._adder(), has_chunked_req=False)
+        state = self.runtime.prefetches[req.rid]
+        self.assertEqual(state.phase, "read")
+        self.storage.bandwidth = 100.0
+        self.storage.progress[req.rid] = (50, 100)  # 0.5 s left, inside the lead
+        self.runtime.poll()
+        return req, state
+
+    def test_layer_wise_restore_admits_before_the_read_ends(self):
+        """FC-CIO: a nearly read prefix is published and admitted early, and its
+        pages stay pinned until the last layer lands."""
+        req, state = self._streaming()
+        loaded = state.loaded_tokens
+        self.assertEqual(state.phase, "ready")
+        self.assertTrue(state.streaming and self.runtime.is_ready(req.rid))
+        self.assertEqual(self.runtime.layer_wise_consumer(), 7)
+        self.assertEqual(self.storage.consumers[-1], [req.rid])
+        adder = self._adder()
+        self.runtime.prepare_admission([req], adder, has_chunked_req=False)
+        req.init_next_round_input(self.cache)
+        self.runtime.before_admission(req, adder)
+        adder.add_one_req(req, has_chunked_req=False, truncation_align_size=None)
+        self.runtime.after_admission(req, adder)
+        self.runtime.finish_admission(adder, can_progress=True)
+        self.assertNotIn(req.rid, self.runtime.prefetches)
+        self.cache.dec_lock_ref(
+            req.last_node,
+            DecLockRefParams(
+                swa_uuid_for_lock=req.swa_uuid_for_lock,
+                skip_lock_node_ids=req.skip_lock_node_ids,
+            ),
+        )
+        # Still streaming: the request lock is gone, the stream hold is not.
+        self.cache.evict(EvictParams(swa_num_tokens=64, num_tokens=64))
+        self.assertEqual(self._match_len(req), loaded)
+        self.assertFalse(self.runtime.is_idle())
+        self.storage.complete(req.rid)
+        self.runtime.poll()
+        self.assertFalse(self.runtime._streaming)
+        self.assertEqual(self.runtime.layer_wise_consumer(), -1)
+        self.cache.evict(EvictParams(swa_num_tokens=64, num_tokens=64))
+        self.assertLess(self._match_len(req), loaded)
+
+    def test_layer_wise_restore_refuses_prefill_cuda_graphs(self):
+        """A replayed prefill graph skips the pools' Python layer waits."""
+        from sglang.srt.mem_cache.flat_memory_factory import (
+            _register_layer_wise_restore,
+        )
+
+        registered = []
+        pool = NS(register_layer_transfer_counter=registered.append)
+        worker = NS(register_hicache_layer_transfer_counter=registered.append)
+        for backend in (None, "tc_piecewise", "breakable", "full"):
+            ctx = NS(server_args=NS(cuda_graph_backend_prefill=backend), tp_worker=worker)
+            with self.assertRaises(ValueError):
+                _register_layer_wise_restore(ctx, pool=pool, counter="counter")
+        self.assertEqual(registered, [])
+        ctx = NS(server_args=NS(cuda_graph_backend_prefill="disabled"), tp_worker=worker)
+        _register_layer_wise_restore(ctx, pool=pool, counter="counter")
+        self.assertEqual(registered, ["counter", "counter"])
+
+    def test_layer_wise_read_failure_after_publish_fails_closed(self):
+        req, state = self._streaming()
+        self.assertTrue(state.streaming)
+        self.storage.fail(req.rid)
+        with self.assertRaises(FlatUnsafeIOError):
+            self.runtime.poll()
 
     def test_reclaimed_page_lets_its_node_back_up_again(self):
         """After native reclamation, a node still marked stored would never be

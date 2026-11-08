@@ -43,6 +43,17 @@ def _make_storage_collector(*, tp_rank: int):
     return collector(labels=labels)
 
 
+def _register_layer_wise_restore(ctx, *, pool, counter) -> None:
+    # FLAT_MEMORY: A replayed prefill graph never runs the pools' Python
+    # wait_until, so it would attend over pages still being read.
+    if ctx.server_args.cuda_graph_backend_prefill != "disabled":
+        raise ValueError(
+            "Flat layer_wise_restore requires --cuda-graph-backend-prefill disabled"
+        )
+    pool.register_layer_transfer_counter(counter)
+    ctx.tp_worker.register_hicache_layer_transfer_counter(counter)
+
+
 def create_flat_memory_cache(ctx):
     from sglang.srt.mem_cache.registry import _create_unified_radix_cache
 
@@ -143,6 +154,8 @@ def create_flat_memory_cache(ctx):
     except BaseException:
         linker.close()
         raise
+    if runtime.layer_wise_restore:
+        _register_layer_wise_restore(ctx, pool=pool, counter=linker.layer_done_counter)
     cache.flat_memory = runtime
     cache.linker = runtime
     cache.enable_storage_metrics = ctx.params.enable_metrics

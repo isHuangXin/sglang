@@ -77,6 +77,12 @@ _WAIT_BUCKETS = (
     + _SCHEDULER_GATES
     + _PREPARE_GATES
 )
+# FLAT_MEMORY: Reclaim reports are reconciled every this many polls, since each
+# check costs a TP collective. Arbitrary.
+_RECLAIM_SYNC_POLLS = 64
+# Bound for the page -> node map; arbitrary, rebuilt from live nodes past it.
+_MAX_PAGE_NODES = 1 << 22
+
 _CONTROL_NAMES = (
     "scheduler",
     "poll",
@@ -229,6 +235,10 @@ class FlatMemoryCache:
             raise ValueError("Flat scope_agent_context_tokens must be nonnegative")
         self._write_scope_hint = MEDIA_HINT_ANY
         self.scope_hint_tokens = {"dram": 0, "ssd": 0, "any": 0}
+        # FLAT_MEMORY: page key -> (node id, page hash) of the node that backed it up.
+        self._page_nodes: dict[str, tuple[int, str]] = {}
+        self._polls = 0
+        self.reclaim_invalidated_nodes = 0
         self.drain_timeout = float(config.get("drain_timeout", 30.0))
         self.lease_timeout = float(
             config.get("restore_lease_timeout", self.drain_timeout)
@@ -464,6 +474,7 @@ class FlatMemoryCache:
     @_timed_control
     def poll(self) -> None:
         self._poll_offloads()
+        self._sync_reclaimed()
         self.cache_linker.poll_queries()
         self._log_metrics()
         # FLAT_MEMORY: Every rank visits the same request list, never worker order.
@@ -1436,13 +1447,55 @@ class FlatMemoryCache:
             self.scope_hint_tokens[
                 {MEDIA_HINT_DRAM: "dram", MEDIA_HINT_SSD: "ssd"}.get(hint, "any")
             ] += len(node.key)
+            namespace = request_storage_namespace(node.key)
             self.tree_linker._offload_node(
-                node_id,
-                key_namespace=request_storage_namespace(node.key),
-                media_hint=hint,
+                node_id, key_namespace=namespace, media_hint=hint
             )
+            for page_hash in node.hash_value or ():
+                self._page_nodes[namespace + page_hash] = (node.id, page_hash)
             # FLAT_MEMORY: Pending deduplicates writes; it is not durable storage state.
             node.external_cache_stored = False
+
+    def _sync_reclaimed(self) -> None:
+        # FLAT_MEMORY: Each rank's store reclaims on its own, but external_cache_stored
+        # gates write-through on every rank, so the cleared set must be the union.
+        self._polls += 1
+        if self._polls % _RECLAIM_SYNC_POLLS:
+            return
+        local = self._reclaimed_node_ids()
+        if not self._reduce([len(local)], torch.distributed.ReduceOp.MAX)[0]:
+            return
+        for node_id in sorted({i for ids in self.gather(sorted(local)) for i in ids}):
+            node = self.cache.tree_core.try_node_by_id(node_id)
+            # A pending write is re-decided by its own completion.
+            if (
+                node is not None
+                and node.external_cache_stored
+                and node.write_through_pending_id is None
+            ):
+                node.external_cache_stored = False
+                self.reclaim_invalidated_nodes += 1
+
+    def _reclaimed_node_ids(self) -> set[int]:
+        found = set()
+        for page in self.cache_linker.take_reclaimed_pages():
+            entry = self._page_nodes.pop(page, None)
+            if entry is None:
+                continue
+            node_id, page_hash = entry
+            node = self.cache.tree_core.try_node_by_id(node_id)
+            # A split moves leading pages into a new parent, so walk up.
+            while node is not None and page_hash not in (node.hash_value or ()):
+                node = node.parent
+            if node is not None and node.id is not None:
+                found.add(node.id)
+        if len(self._page_nodes) > _MAX_PAGE_NODES:
+            self._page_nodes = {
+                page: entry
+                for page, entry in self._page_nodes.items()
+                if self.cache.tree_core.try_node_by_id(entry[0]) is not None
+            }
+        return found
 
     def replace_pending_offload_node(self, ack_id, old_node_id, new_node_ids) -> None:
         self.tree_linker.replace_pending_offload_node(ack_id, old_node_id, new_node_ids)
@@ -1530,6 +1583,7 @@ class FlatMemoryCache:
             )
         self.tree_linker.reset()
         self.arrivals.clear()
+        self._page_nodes.clear()
         self._admission_states = []
         self._admission_candidate = None
         self._leases = []
@@ -1560,6 +1614,7 @@ class FlatMemoryCache:
             flat_restore_ready_dropped_tokens=self.ready_dropped_tokens,
             flat_restore_admission_dropped_tokens=self.admission_dropped_tokens,
             flat_restore_revalidated_requests=self._revalidated_requests,
+            flat_reclaim_invalidated_nodes=self.reclaim_invalidated_nodes,
             **{
                 f"flat_scope_hint_{medium}_tokens": tokens
                 for medium, tokens in self.scope_hint_tokens.items()

@@ -281,6 +281,17 @@ class TestFlatPayloadIO(CustomTestCase):
         finally:
             transfer.budget.release(held)
 
+    def test_page_key_of_inverts_every_fragment_key(self):
+        """Reclaim reports arrive as fragment keys; a parse that drifts from
+        _key() silently stops re-backing up reclaimed pages."""
+        transfer, _, _, request = _make_transfer(row_bytes=ALIGNMENT + 1)
+        layout = transfer.layout
+        page = "request-v1-abc:page:with:colons"
+        keys = layout.keys_for_page(name=request[0].name, page_key=page)
+        self.assertGreater(len(keys), 1)
+        self.assertEqual({layout.page_key_of(key) for key in keys}, {page})
+        self.assertIsNone(layout.page_key_of("flat-v1:other:" + keys[0]))
+
     def test_media_hint_reaches_native_write_on_both_staging_paths(self):
         """FC-GVA: a scope hint dropped on either write path silently lands on DRAM."""
         for budget, row_bytes, max_io, snapshot in (

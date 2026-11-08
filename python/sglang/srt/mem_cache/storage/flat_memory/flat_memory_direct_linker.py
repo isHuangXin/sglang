@@ -413,6 +413,16 @@ class FlatMemoryDirectLinker(UnifiedCacheLinker):
         with self._lock:
             return self._lookup_generations.get(rid, -1)
 
+    def take_reclaimed_pages(self) -> set[str]:
+        # FLAT_MEMORY: Only the owner reclaims; a peer's native call returns nothing.
+        if self.manager is None:
+            return set()
+        return {
+            page
+            for key in self.manager.take_reclaimed_keys()
+            if (page := self.layout.page_key_of(key)) is not None
+        }
+
     def restore_ssd_pages(self, rid: str, *, start: int, end: int) -> int:
         # FLAT_MEMORY: GVAs never migrate, so the probe's media bits stay valid.
         with self._lock:

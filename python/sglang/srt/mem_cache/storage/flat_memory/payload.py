@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import threading
 import time
 from collections.abc import Callable, Iterable, Iterator
@@ -165,6 +166,10 @@ class PayloadLayout:
             json.dumps(descriptor, sort_keys=True, separators=(",", ":")).encode()
         ).hexdigest()
         self.namespace = f"flat-v{FORMAT_VERSION}:{digest}"
+        # FLAT_MEMORY: The inverse of _key(); must change with it.
+        self._page_key_pattern = re.compile(
+            re.escape(self.namespace) + r":[^:]+:c\d+:b\d+:f\d+:n\d+:(.+)\Z"
+        )
 
     def page_record(self, *, name: PoolName, page_key: str) -> PageRecord:
         return name, f"{self.namespace}:{page_key}"
@@ -182,6 +187,10 @@ class PayloadLayout:
             self._key(name=name, page_key=page_key, spec=spec)
             for spec in self.specs[name]
         ]
+
+    def page_key_of(self, storage_key: str) -> str | None:
+        match = self._page_key_pattern.match(storage_key)
+        return match.group(1) if match else None
 
     def _key(self, *, name: PoolName, page_key: str, spec: FragmentSpec) -> str:
         return (

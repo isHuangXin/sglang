@@ -18,7 +18,11 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
-from sglang.srt.mem_cache.flat_memory_cache import FlatMemoryCache
+from sglang.srt.mem_cache.flat_memory_cache import (
+    _RECLAIM_SYNC_POLLS,
+    FlatMemoryCache,
+    request_storage_namespace,
+)
 from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
@@ -50,6 +54,11 @@ class _Storage:
         self.source_safe = set()
         self.ssd_rids = set()
         self.media_hints = []
+        self.reclaimed_pages = set()
+
+    def take_reclaimed_pages(self):
+        pages, self.reclaimed_pages = self.reclaimed_pages, set()
+        return pages
 
     def restore_ssd_pages(self, rid, *, start, end):
         return end - start if rid in self.ssd_rids else 0
@@ -447,6 +456,36 @@ class TestFlatMemoryAdmission(CustomTestCase):
         )
         self.runtime.scope_media_hints = False
         self.assertEqual(classify(cached_tokens=8, input_tokens=9), MEDIA_HINT_ANY)
+
+    def test_reclaimed_page_lets_its_node_back_up_again(self):
+        """After native reclamation, a node still marked stored would never be
+        written again, so its KV is lost once HBM evicts it."""
+        req, state = self._restored()
+        node_id = self.cache.resolve_node_handle(state.hold_node).id
+        node = self.cache.resolve_node_handle(node_id)
+        node.external_cache_stored = False
+        self.storage.offload_enabled = True
+        self.runtime.offload_nodes([node_id])
+        self.storage.complete_backup()
+        self.runtime.poll()
+        self.assertTrue(node.external_cache_stored)
+        page = request_storage_namespace(node.key) + node.hash_value[0]
+        self.storage.reclaimed_pages = {page}
+        self.runtime._polls = _RECLAIM_SYNC_POLLS - 1
+        self.runtime.poll()
+        self.assertFalse(node.external_cache_stored)
+        self.assertEqual(self.runtime.reclaim_invalidated_nodes, 1)
+        self.assertNotIn(page, self.runtime._page_nodes)
+        self.runtime.release_request(req.rid)
+
+    def test_reclaimed_page_after_a_split_resolves_to_the_ancestor(self):
+        parent = NS(id=7, hash_value=["h0", "h1"], parent=None)
+        child = NS(id=8, hash_value=["h2"], parent=parent)
+        nodes = {7: parent, 8: child}
+        self.runtime._page_nodes = {"ns:h1": (8, "h1"), "ns:h2": (8, "h2")}
+        self.storage.reclaimed_pages = {"ns:h1", "ns:h2", "ns:unknown"}
+        with patch.object(self.cache.tree_core, "try_node_by_id", nodes.get):
+            self.assertEqual(self.runtime._reclaimed_node_ids(), {7, 8})
 
     def test_shared_head_rule_sends_only_the_prompt_head_to_dram(self):
         """Under write-through a system prompt is stored before it is shared."""

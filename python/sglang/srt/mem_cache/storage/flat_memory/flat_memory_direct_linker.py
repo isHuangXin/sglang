@@ -286,6 +286,7 @@ class FlatMemoryDirectLinker(UnifiedCacheLinker):
         self._lookups: dict[str, Future[list[int]]] = {}
         self._queries: dict[str, _LookupQuery] = {}
         self._lookup_generations: dict[str, int] = {}
+        self._lookup_ssd_pages: dict[str, tuple[bool, ...]] = {}
         self._physical_query_jobs: dict[str, Future[LookupProbeResult]] = {}
         self._storage_generation = 0
         self._offload_coverage: dict[Future, frozenset[PageRecord]] = {}
@@ -403,6 +404,11 @@ class FlatMemoryDirectLinker(UnifiedCacheLinker):
         with self._lock:
             return self._lookup_generations.get(rid, -1)
 
+    def restore_ssd_pages(self, rid: str, *, start: int, end: int) -> int:
+        # FLAT_MEMORY: GVAs never migrate, so the probe's media bits stay valid.
+        with self._lock:
+            return sum(self._lookup_ssd_pages.get(rid, ())[start:end])
+
     def submit_lookup(
         self, rid: str, transfers: list[PoolTransfer]
     ) -> Future[list[int]]:
@@ -483,6 +489,7 @@ class FlatMemoryDirectLinker(UnifiedCacheLinker):
                 return
             # FLAT_MEMORY: A write completing during the probe must leave a stale receipt.
             self._lookup_generations[rid] = generation
+            self._lookup_ssd_pages[rid] = result.ssd_pages
             query.dependencies = frozenset(
                 job
                 for job, records in offloads.items()
@@ -514,6 +521,7 @@ class FlatMemoryDirectLinker(UnifiedCacheLinker):
         with self._lock:
             self._queries.pop(rid, None)
             self._lookup_generations.pop(rid, None)
+            self._lookup_ssd_pages.pop(rid, None)
             future = self._lookups.pop(rid, None)
             if future is not None:
                 future.cancel()
@@ -630,7 +638,7 @@ class FlatMemoryDirectLinker(UnifiedCacheLinker):
         unsafe = False
         try:
             self._wait_ready(ready_event)
-            self.transfer.read(transfers)
+            self.transfer.read(transfers, medium=medium)
         except Exception as error:
             failure = f"{type(error).__name__}: {error}"
             unsafe = isinstance(error, FlatUnsafeIOError)
@@ -940,6 +948,7 @@ class FlatMemoryDirectLinker(UnifiedCacheLinker):
             self._lookups.clear()
             self._queries.clear()
             self._lookup_generations.clear()
+            self._lookup_ssd_pages.clear()
             self._offloads.clear()
             self._load_batches.clear()
             self.layer_done_counter.reset()

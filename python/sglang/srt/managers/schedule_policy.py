@@ -515,6 +515,8 @@ class PrefillAdder:
         self.cur_rem_token_offset = num_mixed_decode_tokens
         self._flat_full_reservation = 0
         self._flat_swa_reservation = 0
+        # FLAT_MEMORY: Running headroom already folded into the reservation above.
+        self._flat_charged_headroom = (0, 0)
 
         self.req_states = None
         self.can_run_list = []
@@ -908,6 +910,7 @@ class PrefillAdder:
         self.cur_rem_token_offset += full - self._flat_full_reservation
         self.rem_swa_token_offset += swa - self._flat_swa_reservation
         self._flat_full_reservation, self._flat_swa_reservation = full, swa
+        self._flat_charged_headroom = (extra_full, extra_swa)
 
     def plan_flat_restore(
         self,
@@ -916,6 +919,7 @@ class PrefillAdder:
         restored_prefix_len: int,
         full_tokens: int,
         swa_tokens: int,
+        check_pass_budget: bool = True,
     ) -> FlatRestoreAdmission:
         if (
             not 0
@@ -928,12 +932,16 @@ class PrefillAdder:
             raise ValueError("Invalid Flat restore SWA footprint")
         if self.is_hybrid_ssm_cache or self.is_all_swa:
             raise ValueError("Flat admission requires full or full/SWA pools")
-        if self.rem_input_tokens <= 0 or (
-            self.rem_chunk_tokens is not None and self.rem_chunk_tokens <= 0
+        # FLAT_MEMORY: Starting a private read spends no prefill compute this pass;
+        # only an admission-ready restore is gated by the pass budget.
+        if check_pass_budget and (
+            self.rem_input_tokens <= 0
+            or (self.rem_chunk_tokens is not None and self.rem_chunk_tokens <= 0)
         ):
             return FlatRestoreAdmission(False, reason="prefill_pass_budget")
         if (
-            self.prefill_max_requests is not None
+            check_pass_budget
+            and self.prefill_max_requests is not None
             and len(self.can_run_list) >= self.prefill_max_requests
         ):
             return FlatRestoreAdmission(False, reason="prefill_request_limit")
@@ -946,6 +954,15 @@ class PrefillAdder:
                 False, never_fits=True, reason="full_pool_capacity"
             )
         extra_full, extra_swa = self._flat_running_headroom()
+        # FLAT_MEMORY: A carried reservation already charged its headroom; charge
+        # only growth since then, or each extra lease double-counts running decode.
+        charged_full, charged_swa = (
+            self._flat_charged_headroom
+            if self._flat_full_reservation or self._flat_swa_reservation
+            else (0, 0)
+        )
+        extra_full = max(0, extra_full - charged_full)
+        extra_swa = max(0, extra_swa - charged_swa)
         full_required = full_tokens + full_reservation + extra_full
         full_available = self.rem_total_tokens
         if full_required >= full_available:

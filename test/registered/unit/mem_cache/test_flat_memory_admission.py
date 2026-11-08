@@ -43,6 +43,10 @@ class _Storage:
         self.offload_enabled = False
         self.backups = []
         self.source_safe = set()
+        self.ssd_rids = set()
+
+    def restore_ssd_pages(self, rid, *, start, end):
+        return end - start if rid in self.ssd_rids else 0
 
     def submit_lookup(self, rid, transfers):
         future = Future()
@@ -320,7 +324,53 @@ class TestFlatMemoryAdmission(CustomTestCase):
         self.runtime.release_request(competitor.rid)
         self.storage.complete(competitor.rid)
         self.runtime.poll()
-        self.assertIsNone(self.runtime._lease_rid)
+        self.assertEqual(self.runtime._leases, [])
+
+    def test_dram_restore_is_not_blocked_by_an_in_flight_ssd_restore(self):
+        """FC-MAS: a DRAM-resident prefix must not wait for an SSD read to finish."""
+        ssd = self._req("ssd", length=12, start=10)
+        dram = self._req("dram", length=12, start=40)
+        self.storage.ssd_rids.add(ssd.rid)
+        self.runtime.poll()
+        self.runtime.prepare_admission([ssd], self._adder(), has_chunked_req=False)
+        self.assertEqual(self.runtime.prefetches[ssd.rid].phase, "read")
+        self.runtime.prepare_admission([ssd, dram], self._adder(), has_chunked_req=False)
+        self.assertEqual(self.runtime.prefetches[dram.rid].phase, "read")
+        self.assertEqual(self.runtime._leases, [ssd.rid, dram.rid])
+        for req in (ssd, dram):
+            self.runtime.release_request(req.rid)
+            self.storage.complete(req.rid)
+        self.runtime.poll()
+        self.assertEqual(self.runtime._leases, [])
+
+    def test_restore_read_starts_while_a_chunked_prefill_runs(self):
+        """A restore must overlap a long chunked prefill instead of waiting for it."""
+        chunked = self._req("chunked", length=32, output=2)
+        self.runtime.release_request(chunked.rid)
+        restore = self._req("restore", length=12, start=60)
+        self.runtime.poll()
+        adder = self._adder()
+        adder.add_one_req(chunked, has_chunked_req=False, truncation_align_size=None)
+        self.assertEqual(chunked.extend_range.end, 16)
+        self.addCleanup(
+            self.cache.dec_lock_ref,
+            chunked.last_node,
+            DecLockRefParams(
+                swa_uuid_for_lock=chunked.swa_uuid_for_lock,
+                skip_lock_node_ids=chunked.skip_lock_node_ids,
+            ),
+        )
+        self.runtime.prepare_admission([restore], adder, has_chunked_req=True)
+        state = self.runtime.prefetches[restore.rid]
+        self.assertEqual(state.phase, "read")
+        # The chunk's 16 remaining input tokens stay charged against admission.
+        self.assertGreaterEqual(
+            adder._flat_full_reservation, state.full_reservation + 16
+        )
+        self.runtime.release_request(restore.rid)
+        self.storage.complete(restore.rid)
+        self.runtime.poll()
+        self.assertEqual(self.runtime._leases, [])
 
     def test_restore_reservation_accounts_for_admitted_chunk_future_input(self):
         """A concurrent restore must reserve the admitted chunk's remaining input."""

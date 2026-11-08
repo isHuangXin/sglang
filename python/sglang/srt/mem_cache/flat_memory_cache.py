@@ -135,6 +135,7 @@ class _Prefetch(msgspec.Struct, kw_only=True):
     ready_started: float = 0.0
     full_reservation: int = 0
     swa_reservation: int = 0
+    ssd_pages: int = 0
     bypass: bool = False
     revoke_reason: str = ""
     admission_attempted: bool = False
@@ -176,7 +177,9 @@ class FlatMemoryCache:
         self.restore_deferrals = 0
         self.ready_dropped_tokens = 0
         self.admission_dropped_tokens = 0
-        self._lease_rid: str | None = None
+        # FLAT_MEMORY: Rank-agreed lease order; collectives iterate it identically.
+        self._leases: list[str] = []
+        self._prefill_busy = False
         self._admission_candidate: str | None = None
         self._admission_states: list[_Prefetch] = []
         self._last_metrics_log = 0.0
@@ -189,8 +192,13 @@ class FlatMemoryCache:
             if threshold_override is None
             else threshold_override
         )
-        # FLAT_MEMORY: The legacy budget permits one oversized prefix; leases serialize it.
         self.max_prefetch_tokens = int(config.get("prefetch_max_tokens", 65536))
+        # FLAT_MEMORY: FC-MAS queues; GPU pages are still gated by plan_flat_restore.
+        # SSD default matches the SSD executor's two workers; DRAM default is arbitrary.
+        self.max_ssd_leases = int(config.get("restore_max_ssd_leases", 2))
+        self.max_dram_leases = int(config.get("restore_max_dram_leases", 4))
+        if self.max_ssd_leases < 1 or self.max_dram_leases < 1:
+            raise ValueError("Flat restore lease limits must be positive")
         self.drain_timeout = float(config.get("drain_timeout", 30.0))
         self.lease_timeout = float(
             config.get("restore_lease_timeout", self.drain_timeout)
@@ -303,18 +311,29 @@ class FlatMemoryCache:
         self._diagnose(state, wait_outcome=outcome, wait_finalized=1)
 
     def order_ready_requests(self, requests: list) -> list:
-        # FLAT_MEMORY: A ready lease gets the first real admission attempt.
+        # FLAT_MEMORY: A ready lease gets the first real admission attempt; the add
+        # loop stops at the first NO_TOKEN, and a lease behind it would keep its
+        # pinned pages, the very pages that made the earlier request not fit.
         ordered = (
             sorted(requests, key=lambda req: self.arrivals[req.rid])
             if self.ready_fcfs
             else requests
         )
-        lease = self.prefetches.get(self._lease_rid)
-        if lease is not None and lease.phase == "ready":
-            return [req for req in ordered if req.rid == self._lease_rid] + [
-                req for req in ordered if req.rid != self._lease_rid
+        ready = {
+            state.req.rid for state in self._active_leases() if state.phase == "ready"
+        }
+        if ready:
+            return [req for req in ordered if req.rid in ready] + [
+                req for req in ordered if req.rid not in ready
             ]
         return ordered
+
+    def _active_leases(self) -> list[_Prefetch]:
+        return [self.prefetches[rid] for rid in self._leases]
+
+    def _drop_lease(self, rid: str) -> None:
+        if rid in self._leases:
+            self._leases.remove(rid)
 
     def has_hit(self, rid: str) -> bool:
         # Completed Flat reads are already device hits; admission never queues DMA.
@@ -453,7 +472,7 @@ class FlatMemoryCache:
                 self._fallback(state, "query_refresh_timeout")
             elif ready:
                 self._finish_query(state)
-        self._expire_lease()
+        self._expire_leases()
         self._poll_reads(states)
         for state in states:
             if state.cancelled and state.phase == "ready":
@@ -487,12 +506,15 @@ class FlatMemoryCache:
             query_ms=(time.monotonic() - state.started) * 1000,
         )
 
-    def carry_reservation(self, adder) -> None:
-        lease = self.prefetches.get(self._lease_rid)
-        active = lease is not None and not lease.admitted
+    def carry_reservation(self, adder, *, exclude: str | None = None) -> None:
+        leases = [
+            state
+            for state in self._active_leases()
+            if not state.admitted and state.req.rid != exclude
+        ]
         adder.set_flat_restore_reservation(
-            full_tokens=lease.full_reservation if active else 0,
-            swa_tokens=lease.swa_reservation if active else 0,
+            full_tokens=sum(state.full_reservation for state in leases),
+            swa_tokens=sum(state.swa_reservation for state in leases),
         )
 
     @_timed_control
@@ -511,35 +533,98 @@ class FlatMemoryCache:
             if state.phase == "ready":
                 self._set_wait(state, "ready_admission")
         self._refresh_stale_queries(self._admission_states)
-        lease = self.prefetches.get(self._lease_rid)
-        if lease is not None:
-            for state in self._admission_states:
-                if state.phase == "allocate":
-                    self._set_wait(state, "existing_lease")
+        for lease in self._active_leases():
             if lease.phase == "ready":
                 self._revalidate_lease(lease, adder)
-        elif not has_chunked_req:
-            candidate = next(
-                (s for s in self._admission_states if s.phase == "allocate"), None
-            )
-            if candidate is not None:
-                self._admission_candidate = candidate.req.rid
-                for state in self._admission_states:
-                    if state is not candidate and state.phase == "allocate":
-                        self._set_wait(state, "candidate_queue")
-                if self._select_restore(candidate, adder):
-                    # FLAT_MEMORY: Private allocation may evict another unleased ready hit.
-                    for state in self._admission_states:
-                        if self._is_unleased(state) and state.phase == "ready":
-                            self._revalidate_unleased(state)
-                            if state.phase == "allocate":
-                                self._set_wait(state, "candidate_queue")
+        # FLAT_MEMORY: Reads start under chunked prefill too; plan_flat_restore
+        # charges the admitted chunk's remaining input as running headroom.
+        # A chunk the adder refused (SWA budget) is uncharged, so wait instead.
+        self._prefill_busy = has_chunked_req
+        if not has_chunked_req or adder.can_run_list:
+            self._select_restores(adder)
         else:
             for state in self._admission_states:
                 if state.phase == "allocate":
                     self._set_wait(state, "chunked_prefill")
         self.carry_reservation(adder)
         return self.order_ready_requests(requests)
+
+    def _select_restores(self, adder) -> None:
+        # FLAT_MEMORY: FC-MAS. DRAM and SSD restores hold separate lease slots,
+        # so a DRAM hit never queues behind a multi-GB SSD read.
+        candidates = [s for s in self._admission_states if s.phase == "allocate"]
+        if not candidates:
+            return
+        leases = self._active_leases()
+        slots = {
+            True: self.max_ssd_leases - sum(bool(s.ssd_pages) for s in leases),
+            False: self.max_dram_leases - sum(not s.ssd_pages for s in leases),
+        }
+        selected = blocked = False
+        for state in self._rank_restores(candidates):
+            if state.phase != "allocate":
+                continue
+            if blocked:
+                self._set_wait(state, "candidate_queue")
+                continue
+            ssd = bool(state.ssd_pages)
+            if slots[ssd] <= 0:
+                self._set_wait(state, "existing_lease")
+                continue
+            if selected:
+                # FLAT_MEMORY: The previous private allocation may have evicted this anchor.
+                self._revalidate_unleased(state)
+                if state.phase != "allocate":
+                    continue
+            self.carry_reservation(adder)
+            if self._select_restore(state, adder):
+                slots[ssd] -= 1
+                selected = True
+                self._revalidate_ready_unleased()
+            elif state.phase == "allocate":
+                # FLAT_MEMORY: A budget veto stops lower-priority candidates from
+                # overtaking it, so a large old restore cannot starve.
+                self._admission_candidate = state.req.rid
+                blocked = True
+
+    def _revalidate_ready_unleased(self) -> None:
+        # FLAT_MEMORY: Private allocation may evict another unleased ready hit.
+        for state in self._admission_states:
+            if self._is_unleased(state) and state.phase == "ready":
+                self._revalidate_unleased(state)
+                if state.phase == "allocate":
+                    self._set_wait(state, "candidate_queue")
+
+    def _rank_restores(self, candidates: list[_Prefetch]) -> list[_Prefetch]:
+        # FLAT_MEMORY: Eq. 1 HRRN on SSD bytes; values are MAX-reduced so every
+        # rank sorts identical integers.
+        page = self.cache.page_size
+        now = time.monotonic()
+        local = []
+        for state in candidates:
+            local.append(
+                self.cache_linker.restore_ssd_pages(
+                    state.req.rid,
+                    start=(len(state.result.device_indices) - state.query_start)
+                    // page,
+                    end=(state.queried_endpoint - state.query_start) // page,
+                )
+            )
+            local.append(int((now - state.started) * 1000))
+        agreed = self._reduce(local, torch.distributed.ReduceOp.MAX)
+        wait_ms = {}
+        for state, ssd_pages, waited in zip(candidates, agreed[::2], agreed[1::2]):
+            state.ssd_pages = ssd_pages
+            wait_ms[state.req.rid] = waited
+        dram = [state for state in candidates if not state.ssd_pages]
+        ssd = sorted(
+            (state for state in candidates if state.ssd_pages),
+            key=lambda state: (
+                -wait_ms[state.req.rid] / state.ssd_pages,
+                self.arrivals[state.req.rid],
+            ),
+        )
+        return dram + ssd
 
     def _agree_requests(self, requests: list) -> None:
         identity = json.dumps([req.rid for req in requests], separators=(",", ":"))
@@ -735,6 +820,7 @@ class FlatMemoryCache:
             restored_prefix_len=state.queried_endpoint,
             full_tokens=footprint.get(PoolName.KV, 0),
             swa_tokens=footprint.get(PoolName.SWA, 0),
+            check_pass_budget=False,
         )
         state.allocation_plan_attempts += 1
         self._diagnose(state, allocation_plan_attempts=state.allocation_plan_attempts)
@@ -764,9 +850,12 @@ class FlatMemoryCache:
         state.loaded_tokens = state.read_endpoint - device_tokens
         state.lease_started = time.monotonic()
         self._freeze_pre_prepare(state)
-        self._lease_rid = state.req.rid
+        self._leases.append(state.req.rid)
         self._diagnose(
             state,
+            lease_medium="ssd" if state.ssd_pages else "dram",
+            lease_ssd_pages=state.ssd_pages,
+            lease_concurrency=len(self._leases),
             read_anchor_tokens=device_tokens,
             read_endpoint=state.read_endpoint,
             prepared_tokens=state.loaded_tokens,
@@ -852,7 +941,7 @@ class FlatMemoryCache:
         return full, swa
 
     def _revalidate_lease(self, state: _Prefetch, adder) -> None:
-        adder.set_flat_restore_reservation(full_tokens=0, swa_tokens=0)
+        self.carry_reservation(adder, exclude=state.req.rid)
         plan = adder.plan_flat_restore(
             state.req,
             restored_prefix_len=state.read_endpoint,
@@ -1037,9 +1126,9 @@ class FlatMemoryCache:
             return
         if state.phase != "ready":
             raise RuntimeError("Flat attempted admission before storage readiness")
-        if req.rid == self._lease_rid:
+        if req.rid in self._leases:
             # FLAT_MEMORY: Ordinary admission now charges the owner's suffix/decode.
-            adder.set_flat_restore_reservation(full_tokens=0, swa_tokens=0)
+            self.carry_reservation(adder, exclude=req.rid)
         req.storage_hit_length = self._reused_tokens(state)
         self._diagnose(
             state,
@@ -1068,37 +1157,46 @@ class FlatMemoryCache:
             for state, accepted in zip(states, minima):
                 if accepted:
                     self._forget(state, keep_arrival=True)
-        state = self.prefetches.get(self._lease_rid or self._admission_candidate)
+        watched = self._active_leases()
+        candidate = self.prefetches.get(self._admission_candidate)
+        if candidate is not None and candidate.req.rid not in self._leases:
+            watched.append(candidate)
+        now = time.monotonic()
         # FLAT_MEMORY: A rank-local gate may skip admission without rejecting the KV.
-        can_wait = bool(
-            state is not None
-            and state.phase == "allocate"
-            and state.allocation_wait_eligible
-            and time.monotonic() < state.allocation_wait_deadline
-        )
-        can_progress, admission_attempted, can_wait = self._reduce(
-            [
-                int(can_progress),
-                int(state is not None and state.admission_attempted),
-                int(can_wait),
+        flags = self._reduce(
+            [int(can_progress)]
+            + [
+                value
+                for state in watched
+                for value in (
+                    int(state.admission_attempted),
+                    int(
+                        state.phase == "allocate"
+                        and state.allocation_wait_eligible
+                        and now < state.allocation_wait_deadline
+                    ),
+                )
             ],
             torch.distributed.ReduceOp.MIN,
         )
-        if (
-            state is not None
-            and not state.bypass
-            and not can_progress
-            and (
-                (state.phase == "allocate" and not can_wait)
-                or (state.phase == "ready" and admission_attempted)
-            )
+        can_progress = flags[0]
+        for state, admission_attempted, can_wait in zip(
+            watched, flags[1::2], flags[2::2]
         ):
-            reason = (
-                "allocation_wait_timeout"
-                if state.phase == "allocate" and state.allocation_wait_eligible
-                else "no_admission_progress"
-            )
-            self._fallback(state, reason)
+            if (
+                not state.bypass
+                and not can_progress
+                and (
+                    (state.phase == "allocate" and not can_wait)
+                    or (state.phase == "ready" and admission_attempted)
+                )
+            ):
+                reason = (
+                    "allocation_wait_timeout"
+                    if state.phase == "allocate" and state.allocation_wait_eligible
+                    else "no_admission_progress"
+                )
+                self._fallback(state, reason)
         self._admission_states = []
         self._admission_candidate = None
         self.carry_reservation(adder)
@@ -1153,16 +1251,26 @@ class FlatMemoryCache:
                 self._handoff(state)
                 self._forget(state, keep_arrival=True)
 
-    def _expire_lease(self) -> None:
-        state = self.prefetches.get(self._lease_rid)
-        if state is None:
+    def _expire_leases(self) -> None:
+        leases = self._active_leases()
+        if not leases:
             return
+        now = time.monotonic()
+        # FLAT_MEMORY: A ready lease behind a running chunked prefill is waiting on
+        # compute that is making progress, not on a stuck read.
         expired = self._reduce(
-            [int(time.monotonic() - state.lease_started >= self.lease_timeout)],
+            [
+                int(
+                    now - state.lease_started >= self.lease_timeout
+                    and not (state.phase == "ready" and self._prefill_busy)
+                )
+                for state in leases
+            ],
             torch.distributed.ReduceOp.MAX,
-        )[0]
-        if expired and not state.revoke_reason:
-            self._fallback(state, "lease_expired")
+        )
+        for state, lapsed in zip(leases, expired):
+            if lapsed and not state.revoke_reason:
+                self._fallback(state, "lease_expired")
 
     def _fallback(self, state: _Prefetch, reason: str, *, count: bool = True) -> None:
         if state.restore_episode is not None:
@@ -1184,8 +1292,7 @@ class FlatMemoryCache:
                 self.ready_dropped_tokens += state.loaded_tokens
         self._finish_allocation_wait(state, reason)
         self._release_hold(state)
-        if self._lease_rid == state.req.rid:
-            self._lease_rid = None
+        self._drop_lease(state.req.rid)
         state.full_reservation = state.swa_reservation = 0
         state.phase, state.bypass = "ready", True
         self._set_wait(state, "ready_admission")
@@ -1229,8 +1336,7 @@ class FlatMemoryCache:
         self.cache_linker.forget_request(state.req.rid)
         self.tree_linker.hit_markers.pop(state.req.rid, None)
         self.prefetches.pop(state.req.rid, None)
-        if self._lease_rid == state.req.rid:
-            self._lease_rid = None
+        self._drop_lease(state.req.rid)
         if not keep_arrival:
             self.arrivals.pop(state.req.rid, None)
 
@@ -1332,7 +1438,9 @@ class FlatMemoryCache:
         self.tree_linker.reset()
         self.arrivals.clear()
         self._admission_states = []
-        self._admission_candidate = self._lease_rid = None
+        self._admission_candidate = None
+        self._leases = []
+        self._prefill_busy = False
 
     def close(self) -> None:
         self.reset()
@@ -1350,7 +1458,10 @@ class FlatMemoryCache:
             pending_prefetches=len(self.prefetches),
             flat_io_errors=self.io_errors,
             flat_capacity_pressure_offloads=self.capacity_pressure_offloads,
-            flat_restore_lease_active=int(self._lease_rid is not None),
+            flat_restore_lease_active=len(self._leases),
+            flat_restore_ssd_leases_active=sum(
+                bool(state.ssd_pages) for state in self._active_leases()
+            ),
             flat_restore_lease_fallbacks=self.lease_fallbacks,
             flat_restore_deferrals=self.restore_deferrals,
             flat_restore_ready_dropped_tokens=self.ready_dropped_tokens,

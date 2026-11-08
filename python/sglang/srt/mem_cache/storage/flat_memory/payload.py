@@ -28,6 +28,8 @@ PageRecord = tuple[PoolName, str]
 class LookupProbeResult(msgspec.Struct, frozen=True):
     boundaries: tuple[int, ...]
     missing_records: frozenset[PageRecord] = frozenset()
+    # FLAT_MEMORY: Per probed page, whether any fragment's GVA is SSD (>= 2^60).
+    ssd_pages: tuple[bool, ...] = ()
 
 
 def align_up(size: int) -> int:
@@ -321,6 +323,9 @@ class GPUTransfer:
         self.read_batch_bytes = (
             (self.read_quota_bytes - ALIGNMENT + 1) // ALIGNMENT * ALIGNMENT
         )
+        # FLAT_MEMORY: FC-MAS. DRAM restores get a separate one-batch budget,
+        # so they never queue behind SSD read or write staging.
+        self.dram_read_budget = StagingBudget(self.read_quota_bytes)
         self.snapshot_writes = 0
         self.streaming_writes = 0
         self.snapshot_budget_fallbacks = 0
@@ -372,8 +377,9 @@ class GPUTransfer:
         with self._context(), self._stream_context():
             self._write_transfers(transfers, on_source_consumed=on_source_consumed)
 
-    def read(self, transfers: list[PoolTransfer]) -> None:
+    def read(self, transfers: list[PoolTransfer], *, medium: str = "ssd") -> None:
         self.raise_if_unsafe()
+        budget = self.dram_read_budget if medium == "dram" else self.budget
         with self._context(), self._stream_context():
             for batch, total in self._batches(
                 self.layout.fragments(transfers), batch_bytes=self.read_batch_bytes
@@ -383,6 +389,7 @@ class GPUTransfer:
                     lambda stage: self._transfer_batch(
                         batch=batch, stage=stage, write=False
                     ),
+                    budget=budget,
                 )
                 self._record_batch(batch, write=False)
 
@@ -397,6 +404,7 @@ class GPUTransfer:
             if owner is not None:
                 self._retained_staging.append(owner)
         self.budget.poison(error)
+        self.dram_read_budget.poison(error)
 
     @staticmethod
     def _write_results(result: dict, *, count: int, complete: bool) -> list[bool]:
@@ -487,10 +495,18 @@ class GPUTransfer:
             self._record_batch(batch, write=True)
             offset += total
 
-    def _with_stage(self, total: int, transfer, *, reserved: bool = False) -> None:
+    def _with_stage(
+        self,
+        total: int,
+        transfer,
+        *,
+        reserved: bool = False,
+        budget: StagingBudget | None = None,
+    ) -> None:
+        budget = self.budget if budget is None else budget
         allocated = total + ALIGNMENT - 1
         if not reserved:
-            self.budget.acquire(allocated)
+            budget.acquire(allocated)
         owner = stage = None
         unsafe = False
         try:
@@ -513,7 +529,7 @@ class GPUTransfer:
                     self._retain_stage(owner, failure)
                     raise failure from error
                 owner = stage = None
-                self.budget.release(allocated)
+                budget.release(allocated)
 
     @staticmethod
     def _pack_batch(batch, stage) -> None:
@@ -598,9 +614,14 @@ class GPUTransfer:
         candidates = set(range(1, len(keys) + 1))
         possible = set(candidates)
         pools = []
+        ssd_pages = [False] * len(keys)
         for transfer in transfers:
             states = self.page_addresses(name=transfer.name, keys=keys)
             exists = [bool(addresses) and all(addresses) for addresses in states]
+            for index, addresses in enumerate(states):
+                ssd_pages[index] |= any(
+                    address and address >> 60 == 1 for address in addresses
+                )
             records = [
                 self.layout.page_record(name=transfer.name, page_key=key)
                 for key in keys
@@ -638,7 +659,9 @@ class GPUTransfer:
                 missing.update(
                     records[index] for index in required if not exists[index]
                 )
-        return LookupProbeResult(tuple(sorted(candidates)), frozenset(missing))
+        return LookupProbeResult(
+            tuple(sorted(candidates)), frozenset(missing), tuple(ssd_pages)
+        )
 
     def page_addresses(self, *, name: PoolName, keys: list[str]) -> list[list[int]]:
         states = []
@@ -673,7 +696,11 @@ class GPUTransfer:
                 "logical_write_bytes": self.logical_write_bytes,
                 "padded_read_bytes": self.padded_read_bytes,
                 "padded_write_bytes": self.padded_write_bytes,
-                "gpu_staging_bytes": self.budget.current_bytes,
+                "gpu_staging_bytes": self.budget.current_bytes
+                + self.dram_read_budget.current_bytes,
+                "gpu_dram_read_staging_bytes": self.dram_read_budget.current_bytes,
+                "gpu_dram_read_staging_peak_bytes": self.dram_read_budget.peak_bytes,
+                "gpu_dram_read_staging_wait_count": self.dram_read_budget.wait_count,
                 "gpu_staging_peak_bytes": self.budget.peak_bytes,
                 "gpu_staging_budget_bytes": self.budget.total_bytes,
                 "gpu_staging_wait_seconds": self.budget.wait_seconds,

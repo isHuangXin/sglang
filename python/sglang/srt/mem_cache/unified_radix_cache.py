@@ -566,6 +566,13 @@ class UnifiedRadixCache(BasePrefixCache):
     def is_chunk_cache(self) -> bool:
         return self.disable
 
+    def _insert_for_req(self, req: Req, params: InsertParams) -> InsertResult:
+        if self.flat_memory is None:
+            return self.insert(params)
+        # FLAT_MEMORY: Write-through backups fired by this insert carry req's scope.
+        with self.flat_memory.write_scope(req):
+            return self.insert(params)
+
     def insert(self, params: InsertParams) -> InsertResult:
         if self.disable:
             return InsertResult(prefix_len=0)
@@ -920,7 +927,7 @@ class UnifiedRadixCache(BasePrefixCache):
 
             insert_params.key = radix_key
             insert_params.value = values
-            result = self.insert(insert_params)
+            result = self._insert_for_req(req, insert_params)
 
             # Free unaligned tail (+ deferred truncation tail)
             ranges = [(page_aligned_len, len(kv_indices))]
@@ -1015,7 +1022,7 @@ class UnifiedRadixCache(BasePrefixCache):
 
         insert_params.key = radix_key
         insert_params.value = values
-        result = self.insert(insert_params)
+        result = self._insert_for_req(req, insert_params)
 
         # Match prefix. SWA insertion retains one extra window before the
         # page-aligned boundary, so the normal match remains safe to repoint.

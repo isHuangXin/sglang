@@ -9,6 +9,7 @@ import logging
 import math
 import time
 from concurrent.futures import Future
+from contextlib import contextmanager
 from functools import wraps
 from typing import TYPE_CHECKING, Any
 
@@ -19,6 +20,11 @@ from sglang.srt.environ import envs
 from sglang.srt.mem_cache.base_prefix_cache import MatchPrefixParams, MatchResult
 from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.srt.mem_cache.storage.flat_memory.io_result import FlatUnsafeIOError
+from sglang.srt.mem_cache.storage.flat_memory.payload import (
+    MEDIA_HINT_ANY,
+    MEDIA_HINT_DRAM,
+    MEDIA_HINT_SSD,
+)
 from sglang.srt.mem_cache.unified_cache.components import LinkerTransferPhase
 from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
     ExternalCacheHitMarker,
@@ -199,6 +205,30 @@ class FlatMemoryCache:
         self.max_dram_leases = int(config.get("restore_max_dram_leases", 4))
         if self.max_ssd_leases < 1 or self.max_dram_leases < 1:
             raise ValueError("Flat restore lease limits must be positive")
+        # FLAT_MEMORY: FC-GVA Table 2 write-time scope classification.
+        self.scope_media_hints = bool(config.get("scope_media_hints", True))
+        # Paper tau has no published value. 8192 is about 2.5x the ~3K mean per-turn
+        # growth estimated from the CC replay statistics; not tuned on a real run.
+        self.scope_short_turn_tokens = int(config.get("scope_short_turn_tokens", 8192))
+        if self.scope_short_turn_tokens < 0:
+            raise ValueError("Flat scope_short_turn_tokens must be nonnegative")
+        # FLAT_MEMORY: Write-through stores a prefix before anyone shares it, so
+        # refcount > 1 rarely fires; a positive value sends every prompt's first
+        # tokens (the system prompt region) to DRAM instead. Off: replays that
+        # isolate sessions would only waste DRAM on unshared copies.
+        self.scope_shared_head_tokens = int(config.get("scope_shared_head_tokens", 0))
+        if self.scope_shared_head_tokens < 0:
+            raise ValueError("Flat scope_shared_head_tokens must be nonnegative")
+        # FLAT_MEMORY: Table 2 L_agent. Positive makes a long context outrank the
+        # short-turn rule, so an agentic session's history stays on SSD; 0 keeps
+        # short-turn first. The paper gives no value.
+        self.scope_agent_context_tokens = int(
+            config.get("scope_agent_context_tokens", 0)
+        )
+        if self.scope_agent_context_tokens < 0:
+            raise ValueError("Flat scope_agent_context_tokens must be nonnegative")
+        self._write_scope_hint = MEDIA_HINT_ANY
+        self.scope_hint_tokens = {"dram": 0, "ssd": 0, "any": 0}
         self.drain_timeout = float(config.get("drain_timeout", 30.0))
         self.lease_timeout = float(
             config.get("restore_lease_timeout", self.drain_timeout)
@@ -1243,6 +1273,13 @@ class FlatMemoryCache:
         # FLAT_MEMORY: Release the saved endpoint/params, not req.last_node after rematch.
         self._release_hold(state)
         state.admitted = True
+        # FLAT_MEMORY: The first admission fixes the scope; a retracted request
+        # re-admits with its own earlier tokens cached and must not look like turn 2.
+        if req.flat_media_hint is None:
+            req.flat_media_hint = self._classify_scope(
+                cached_tokens=len(req.prefix_indices),
+                input_tokens=len(req.origin_input_ids),
+            )
 
     def on_admitted(self, requests: list) -> None:
         for req in requests:
@@ -1340,13 +1377,69 @@ class FlatMemoryCache:
         if not keep_arrival:
             self.arrivals.pop(state.req.rid, None)
 
+    def _classify_scope(self, *, cached_tokens: int, input_tokens: int) -> int:
+        # FLAT_MEMORY: Table 2: nothing cached at arrival is turn 1 (SSD); a short
+        # new suffix on a cached prefix is a short turn (DRAM) unless L_agent is
+        # set and the context reaches it.
+        if not self.scope_media_hints:
+            return MEDIA_HINT_ANY
+        if cached_tokens <= 0:
+            return MEDIA_HINT_SSD
+        if (
+            self.scope_agent_context_tokens
+            and input_tokens >= self.scope_agent_context_tokens
+        ):
+            return MEDIA_HINT_SSD
+        if input_tokens - cached_tokens < self.scope_short_turn_tokens:
+            return MEDIA_HINT_DRAM
+        return MEDIA_HINT_SSD
+
+    @contextmanager
+    def write_scope(self, req: Req):
+        # FLAT_MEMORY: Inserts run their BackupKV actions synchronously, so the
+        # inserting request's scope is known for exactly the nodes it creates.
+        self._write_scope_hint = (
+            MEDIA_HINT_ANY if req.flat_media_hint is None else req.flat_media_hint
+        )
+        try:
+            yield
+        finally:
+            self._write_scope_hint = MEDIA_HINT_ANY
+
+    def _node_media_hint(self, node) -> int:
+        if not self.scope_media_hints:
+            return self._write_scope_hint
+        # FLAT_MEMORY: A node already reached by another insert is a shared prefix.
+        if node.hit_count > 1:
+            return MEDIA_HINT_DRAM
+        if (
+            self.scope_shared_head_tokens
+            and self._node_start_tokens(node) < self.scope_shared_head_tokens
+        ):
+            return MEDIA_HINT_DRAM
+        return self._write_scope_hint
+
+    @staticmethod
+    def _node_start_tokens(node) -> int:
+        start, parent = 0, node.parent
+        while parent is not None and parent.key is not None:
+            start += len(parent.key)
+            parent = parent.parent
+        return start
+
     def offload_nodes(self, node_ids) -> None:
         for node_id in node_ids:
             node = self.cache.resolve_node_handle(node_id)
             if node.external_cache_stored or node.write_through_pending_id is not None:
                 continue
+            hint = self._node_media_hint(node)
+            self.scope_hint_tokens[
+                {MEDIA_HINT_DRAM: "dram", MEDIA_HINT_SSD: "ssd"}.get(hint, "any")
+            ] += len(node.key)
             self.tree_linker._offload_node(
-                node_id, key_namespace=request_storage_namespace(node.key)
+                node_id,
+                key_namespace=request_storage_namespace(node.key),
+                media_hint=hint,
             )
             # FLAT_MEMORY: Pending deduplicates writes; it is not durable storage state.
             node.external_cache_stored = False
@@ -1467,6 +1560,10 @@ class FlatMemoryCache:
             flat_restore_ready_dropped_tokens=self.ready_dropped_tokens,
             flat_restore_admission_dropped_tokens=self.admission_dropped_tokens,
             flat_restore_revalidated_requests=self._revalidated_requests,
+            **{
+                f"flat_scope_hint_{medium}_tokens": tokens
+                for medium, tokens in self.scope_hint_tokens.items()
+            },
             application_host_staging_bytes=0,
             host_pool_bytes=0,
             gds_mode="compat",

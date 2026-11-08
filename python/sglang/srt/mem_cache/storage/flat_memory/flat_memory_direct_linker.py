@@ -28,6 +28,7 @@ from sglang.srt.mem_cache.storage.flat_memory.master_bootstrap import (
     stop_daemon,
 )
 from sglang.srt.mem_cache.storage.flat_memory.payload import (
+    MEDIA_HINT_ANY,
     GPUTransfer,
     LookupProbeResult,
     PageRecord,
@@ -182,6 +183,14 @@ class FlatMemoryDirectLinker(UnifiedCacheLinker):
             from flat_memory_system.manager import FlatMemoryConfig, FlatMemoryManager
 
             native_config = FlatMemoryConfig.from_dict(config)
+            # FLAT_MEMORY: reclamation is on for serving; 0.90 matches Mooncake's
+            # eviction high watermark, and the 0.10 hysteresis is arbitrary.
+            native_config.reclaim_high_watermark = float(
+                config.get("reclaim_high_watermark", 0.90)
+            )
+            native_config.reclaim_low_watermark = float(
+                config.get("reclaim_low_watermark", 0.80)
+            )
             # FLAT_MEMORY: on by default; master_addr="off" disables, a
             # host:port uses an existing master. With nnodes > 1 node 0 hosts
             # one master for the cluster, on master_port of dist_init_addr's host.
@@ -742,7 +751,9 @@ class FlatMemoryDirectLinker(UnifiedCacheLinker):
             raise RuntimeError("; ".join(errors))
         return [result.rid for result in results]
 
-    def offload(self, transfers: list[PoolTransfer]) -> bool:
+    def offload(
+        self, transfers: list[PoolTransfer], *, media_hint: int = MEDIA_HINT_ANY
+    ) -> bool:
         self._check_open()
         expanded = self.pool_group.resolve_transfers(
             self._snapshot(transfers), allow_partial=True
@@ -776,7 +787,7 @@ class FlatMemoryDirectLinker(UnifiedCacheLinker):
         with self._lock:
             source_consumed = Future()
             future = self._write_executor.submit(
-                self._write, expanded, ready_event, source_consumed
+                self._write, expanded, ready_event, source_consumed, media_hint
             )
             self._offloads.append(_Offload(future, source_consumed))
             self._offload_coverage[future] = coverage
@@ -792,7 +803,9 @@ class FlatMemoryDirectLinker(UnifiedCacheLinker):
                 if future in query.dependencies:
                     query.eligible = True
 
-    def _write(self, transfers, ready_event, source_consumed=None) -> FlatWriteResult:
+    def _write(
+        self, transfers, ready_event, source_consumed=None, media_hint=MEDIA_HINT_ANY
+    ) -> FlatWriteResult:
         started = time.perf_counter()
         try:
             self._wait_ready(ready_event)
@@ -803,6 +816,7 @@ class FlatMemoryDirectLinker(UnifiedCacheLinker):
                     if source_consumed is not None
                     else None
                 ),
+                **({"media_hint": media_hint} if media_hint != MEDIA_HINT_ANY else {}),
             )
             pages = len({key for transfer in transfers for key in transfer.keys or []})
             with self._lock:

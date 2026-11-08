@@ -1214,6 +1214,8 @@ class Req(ReqDllmMixin):
             (*FLAT_CACHE_FIELDS, *FLAT_PREFETCH_FIELDS), None
         )
         self.flat_cached_tokens = dict.fromkeys(FLAT_CACHE_FIELDS, None)
+        # FLAT_MEMORY: FC-GVA write medium hint, fixed at first admission; None = unset.
+        self.flat_media_hint: Optional[int] = None
         self.kvcache_page_size: Optional[int] = None
         self.kvcache_bytes_per_page: Optional[int] = None
         self.storage_read_latency_ms: Optional[float] = None

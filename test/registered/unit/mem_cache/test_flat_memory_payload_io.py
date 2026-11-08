@@ -27,6 +27,7 @@ from sglang.srt.mem_cache.storage.flat_memory.io_result import (
 )
 from sglang.srt.mem_cache.storage.flat_memory.payload import (
     ALIGNMENT,
+    MEDIA_HINT_SSD,
     GPUTransfer,
     PayloadLayout,
     StagingBudget,
@@ -61,6 +62,7 @@ class _CPUManager:
             side_effect=lambda keys: [self.addresses.get(key, 0) for key in keys]
         )
         self.read_gpu = Mock(side_effect=self._read)
+        self.media_hints = []
 
     def _check(self, keys, sizes):
         existing = [key in self.objects for key in keys]
@@ -73,7 +75,8 @@ class _CPUManager:
             requested_bytes=requested,
         )
 
-    def _put(self, keys, pointers, sizes):
+    def _put(self, keys, pointers, sizes, media_hint=0):
+        self.media_hints.append(media_hint)
         admission = self._check(keys, sizes)
         if admission["status"] != "ok":
             return admission
@@ -277,6 +280,21 @@ class TestFlatPayloadIO(CustomTestCase):
             self.assertEqual(manager.put_gpu_file_detailed.call_count, 3)
         finally:
             transfer.budget.release(held)
+
+    def test_media_hint_reaches_native_write_on_both_staging_paths(self):
+        """FC-GVA: a scope hint dropped on either write path silently lands on DRAM."""
+        for budget, row_bytes, max_io, snapshot in (
+            (6 * ALIGNMENT - 3, ALIGNMENT + 1, 2 * ALIGNMENT, False),
+            (8 * ALIGNMENT, 17, 4 * ALIGNMENT, True),
+        ):
+            with self.subTest(snapshot=snapshot):
+                transfer, manager, _, request = _make_transfer(
+                    staging_bytes=budget, row_bytes=row_bytes, max_io_bytes=max_io
+                )
+                transfer.write(request, media_hint=MEDIA_HINT_SSD)
+                self.assertEqual(transfer.snapshot_writes, int(snapshot))
+                self.assertTrue(manager.media_hints)
+                self.assertEqual(set(manager.media_hints), {MEDIA_HINT_SSD})
 
     def test_owner_quotas_use_actual_fragments_and_exact_alignment_slack(self):
         for budget, row_bytes, max_io, enabled in (

@@ -32,6 +32,10 @@ class LookupProbeResult(msgspec.Struct, frozen=True):
     ssd_pages: tuple[bool, ...] = ()
 
 
+# FLAT_MEMORY: Must match MediaHint in flat_memory_manager.h.
+MEDIA_HINT_ANY, MEDIA_HINT_DRAM, MEDIA_HINT_SSD = 0, 1, 2
+
+
 def align_up(size: int) -> int:
     return (size + ALIGNMENT - 1) // ALIGNMENT * ALIGNMENT
 
@@ -372,10 +376,13 @@ class GPUTransfer:
         transfers: list[PoolTransfer],
         *,
         on_source_consumed: Callable[[], None] | None = None,
+        media_hint: int = MEDIA_HINT_ANY,
     ) -> None:
         self.raise_if_unsafe()
         with self._context(), self._stream_context():
-            self._write_transfers(transfers, on_source_consumed=on_source_consumed)
+            self._write_transfers(
+                transfers, on_source_consumed=on_source_consumed, media_hint=media_hint
+            )
 
     def read(self, transfers: list[PoolTransfer], *, medium: str = "ssd") -> None:
         self.raise_if_unsafe()
@@ -420,7 +427,7 @@ class GPUTransfer:
             raise RuntimeError("Flat GPU write did not complete every payload fragment")
         return results
 
-    def _write_transfers(self, transfers, *, on_source_consumed) -> None:
+    def _write_transfers(self, transfers, *, on_source_consumed, media_hint) -> None:
         whole_bytes = self.layout.padded_bytes(transfers)
         remaining = whole_bytes
         batches = iter(
@@ -448,6 +455,7 @@ class GPUTransfer:
                             batches=batches,
                             stage=stage,
                             on_source_consumed=on_source_consumed,
+                            media_hint=media_hint,
                         ),
                         reserved=True,
                     )
@@ -462,6 +470,7 @@ class GPUTransfer:
                     stage=stage,
                     write=True,
                     on_source_consumed=(on_source_consumed if remaining == 0 else None),
+                    media_hint=media_hint,
                 ),
             )
             self._record_batch(batch, write=True)
@@ -478,7 +487,9 @@ class GPUTransfer:
         )
         return all(self._write_results(admission, count=len(batch), complete=False))
 
-    def _write_snapshot(self, *, first, batches, stage, on_source_consumed) -> None:
+    def _write_snapshot(
+        self, *, first, batches, stage, on_source_consumed, media_hint
+    ) -> None:
         owned_batches = [first, *batches]
         offset = 0
         for batch, total in owned_batches:
@@ -491,7 +502,9 @@ class GPUTransfer:
         for index, (batch, total) in enumerate(owned_batches):
             # FLAT_MEMORY: Admission remains per native batch, never one storage extent.
             if index == 0 or not self._duplicate_batch(batch):
-                self._write_staged_batch(batch, stage.narrow(0, offset, total))
+                self._write_staged_batch(
+                    batch, stage.narrow(0, offset, total), media_hint=media_hint
+                )
             self._record_batch(batch, write=True)
             offset += total
 
@@ -540,7 +553,7 @@ class GPUTransfer:
             view[: fragment.source.numel()].copy_(fragment.source)
             offset += fragment.padded_length
 
-    def _write_staged_batch(self, batch, stage) -> None:
+    def _write_staged_batch(self, batch, stage, *, media_hint) -> None:
         pointers, offset = [], 0
         for fragment in batch:
             pointer = stage.data_ptr() + offset
@@ -552,18 +565,25 @@ class GPUTransfer:
             [fragment.key for fragment in batch],
             pointers,
             [fragment.padded_length for fragment in batch],
+            **({"media_hint": media_hint} if media_hint != MEDIA_HINT_ANY else {}),
         )
         self._write_results(result, count=len(batch), complete=True)
 
     def _transfer_batch(
-        self, *, batch, stage: torch.Tensor, write: bool, on_source_consumed=None
+        self,
+        *,
+        batch,
+        stage: torch.Tensor,
+        write: bool,
+        on_source_consumed=None,
+        media_hint: int = MEDIA_HINT_ANY,
     ) -> None:
         if write:
             self._pack_batch(batch, stage)
             self._sync()
             if on_source_consumed is not None:
                 on_source_consumed()
-            self._write_staged_batch(batch, stage)
+            self._write_staged_batch(batch, stage, media_hint=media_hint)
             return
         views, pointers, sizes, keys = [], [], [], []
         offset = 0

@@ -22,6 +22,11 @@ from sglang.srt.mem_cache.flat_memory_cache import FlatMemoryCache
 from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.storage.flat_memory.payload import (
+    MEDIA_HINT_ANY,
+    MEDIA_HINT_DRAM,
+    MEDIA_HINT_SSD,
+)
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
@@ -44,6 +49,7 @@ class _Storage:
         self.backups = []
         self.source_safe = set()
         self.ssd_rids = set()
+        self.media_hints = []
 
     def restore_ssd_pages(self, rid, *, start, end):
         return end - start if rid in self.ssd_rids else 0
@@ -98,9 +104,10 @@ class _Storage:
         self.loads.pop(rid, None)
         self.transfers.pop(rid, None)
 
-    def offload(self, transfers):
+    def offload(self, transfers, media_hint=0):
         if not self.offload_enabled:
             return False
+        self.media_hints.append(media_hint)
         self.backups.append(Future())
         return True
 
@@ -371,6 +378,87 @@ class TestFlatMemoryAdmission(CustomTestCase):
         self.storage.complete(restore.rid)
         self.runtime.poll()
         self.assertEqual(self.runtime._leases, [])
+
+    def test_first_admission_fixes_the_write_scope_hint_for_its_backups(self):
+        """FC-GVA Table 2: a short turn on a cached prefix writes to DRAM, even later."""
+        req, state = self._restored()
+        node_id = self.cache.resolve_node_handle(state.hold_node).id
+        # A retracted request re-admits with its own tokens cached; its first
+        # admission's scope must survive, here pre-set to the opposite medium.
+        req.flat_media_hint = MEDIA_HINT_SSD
+        adder = self._adder()
+        self.runtime.prepare_admission([req], adder, has_chunked_req=False)
+        req.init_next_round_input(self.cache)
+        self.runtime.before_admission(req, adder)
+        adder.add_one_req(req, has_chunked_req=False, truncation_align_size=None)
+        self.runtime.after_admission(req, adder)
+        self.runtime.finish_admission(adder, can_progress=True)
+        self.assertEqual(req.flat_media_hint, MEDIA_HINT_SSD)
+        req.flat_media_hint = None
+        self.assertEqual(
+            self.runtime._classify_scope(
+                cached_tokens=len(req.prefix_indices),
+                input_tokens=len(req.origin_input_ids),
+            ),
+            MEDIA_HINT_DRAM,
+            "This restored request is a short turn on a cached prefix",
+        )
+        req.flat_media_hint = MEDIA_HINT_DRAM
+
+        node = self.cache.resolve_node_handle(node_id)
+        node.external_cache_stored, node.hit_count = False, 1
+        self.storage.offload_enabled = True
+        with self.runtime.write_scope(req):
+            self.runtime.offload_nodes([node_id])
+        node.external_cache_stored = False
+        self.runtime.tree_linker._offload_node(node_id)  # outside any scope
+        self.assertEqual(self.storage.media_hints, [MEDIA_HINT_DRAM, 0])
+        for index in range(2):
+            self.storage.complete_backup(index)
+        self.runtime.poll()
+        self.cache.dec_lock_ref(
+            req.last_node,
+            DecLockRefParams(
+                swa_uuid_for_lock=req.swa_uuid_for_lock,
+                skip_lock_node_ids=req.skip_lock_node_ids,
+            ),
+        )
+
+    def test_scope_rules_follow_table_2_with_short_turn_before_agentic(self):
+        classify = self.runtime._classify_scope
+        tau = self.runtime.scope_short_turn_tokens
+        # Turn 1: nothing cached at arrival, however short.
+        self.assertEqual(classify(cached_tokens=0, input_tokens=10), MEDIA_HINT_SSD)
+        # A long agentic context with a short new suffix is still a short turn.
+        self.assertEqual(
+            classify(cached_tokens=200_000, input_tokens=200_000 + tau - 1),
+            MEDIA_HINT_DRAM,
+        )
+        self.assertEqual(
+            classify(cached_tokens=200_000, input_tokens=200_000 + tau), MEDIA_HINT_SSD
+        )
+        # With L_agent set, a long context outranks the short-turn rule.
+        self.runtime.scope_agent_context_tokens = 200_000
+        self.assertEqual(
+            classify(cached_tokens=200_000, input_tokens=200_001), MEDIA_HINT_SSD
+        )
+        self.assertEqual(
+            classify(cached_tokens=100_000, input_tokens=100_001), MEDIA_HINT_DRAM
+        )
+        self.runtime.scope_media_hints = False
+        self.assertEqual(classify(cached_tokens=8, input_tokens=9), MEDIA_HINT_ANY)
+
+    def test_shared_head_rule_sends_only_the_prompt_head_to_dram(self):
+        """Under write-through a system prompt is stored before it is shared."""
+        root = NS(key=None, parent=None, hit_count=0)
+        head = NS(key=[0] * 4096, parent=root, hit_count=1)
+        body = NS(key=[0] * 4096, parent=head, hit_count=1)
+        self.runtime._write_scope_hint = MEDIA_HINT_SSD
+        self.assertEqual(self.runtime._node_media_hint(head), MEDIA_HINT_SSD)
+        self.runtime.scope_shared_head_tokens = 4096
+        self.assertEqual(self.runtime._node_media_hint(head), MEDIA_HINT_DRAM)
+        self.assertEqual(self.runtime._node_media_hint(body), MEDIA_HINT_SSD)
+        self.runtime._write_scope_hint = MEDIA_HINT_ANY
 
     def test_restore_reservation_accounts_for_admitted_chunk_future_input(self):
         """A concurrent restore must reserve the admitted chunk's remaining input."""

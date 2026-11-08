@@ -547,7 +547,9 @@ class UnifiedCacheLinkerWrapper:
             if not self.cache.resolve_node_handle(node_id).external_cache_stored:
                 self._offload_node(node_id)
 
-    def _offload_node(self, node_id: NodeId, *, key_namespace: str = "") -> None:
+    def _offload_node(
+        self, node_id: NodeId, *, key_namespace: str = "", media_hint: int = 0
+    ) -> None:
         cache = self.cache
         node = cache.resolve_node_handle(node_id)
         transfers = []
@@ -563,7 +565,12 @@ class UnifiedCacheLinkerWrapper:
         queued_at = time.monotonic()
         lock_params = cache.inc_lock_ref(node_id).to_dec_params()
         try:
-            queued = self.cache_linker.offload(transfers)
+            # FLAT_MEMORY: Only the Flat linker accepts a write-time medium hint.
+            queued = (
+                self.cache_linker.offload(transfers, media_hint=media_hint)
+                if media_hint
+                else self.cache_linker.offload(transfers)
+            )
         except BaseException:
             cache.dec_lock_ref(node_id, lock_params)
             raise

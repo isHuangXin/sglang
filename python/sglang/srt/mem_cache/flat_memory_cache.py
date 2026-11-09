@@ -210,8 +210,10 @@ class FlatMemoryCache:
         )
         self.max_prefetch_tokens = int(config.get("prefetch_max_tokens", 65536))
         # FLAT_MEMORY: FC-MAS queues; GPU pages are still gated by plan_flat_restore.
-        # SSD default matches the SSD executor's two workers; DRAM default is arbitrary.
-        self.max_ssd_leases = int(config.get("restore_max_ssd_leases", 2))
+        # The linker sizes its SSD executor from the same key. 4 overlaps one
+        # restore's lookup/Python time with others' I/O now that reads skip
+        # staging; not tuned on a real run. DRAM default is arbitrary.
+        self.max_ssd_leases = int(config.get("restore_max_ssd_leases", 4))
         self.max_dram_leases = int(config.get("restore_max_dram_leases", 4))
         if self.max_ssd_leases < 1 or self.max_dram_leases < 1:
             raise ValueError("Flat restore lease limits must be positive")

@@ -144,6 +144,9 @@ class TestFlatMemoryPayloadStream(CustomTestCase):
                     "gds_max_io_bytes": ALIGNMENT,
                     "gpu_stage_bytes": 8 * ALIGNMENT,
                     "gpu_batch_pages": 1,
+                    # The fake writer has no gpu_batch_copy; the snapshot
+                    # lifecycle under test is the same for either pack path.
+                    "native_page_copies": False,
                 },
                 model_namespace="snapshot-stream-reuse",
                 tp_rank=0,

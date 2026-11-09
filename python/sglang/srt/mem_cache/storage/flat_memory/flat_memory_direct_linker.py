@@ -35,6 +35,10 @@ from sglang.srt.mem_cache.storage.flat_memory.master_bootstrap import (
 )
 from sglang.srt.mem_cache.storage.flat_memory.payload import (
     MEDIA_HINT_ANY,
+    PAGE_FOUND,
+    PAGE_ON_DRAM,
+    PAGE_ON_OTHER,
+    PAGE_ON_SSD,
     GPUTransfer,
     LookupProbeResult,
     PageRecord,
@@ -351,6 +355,7 @@ class FlatMemoryDirectLinker(UnifiedCacheLinker):
             device=self.device,
             staging_bytes=int(config.get("gpu_stage_bytes", 128 * 1024 * 1024)),
             batch_pages=int(config.get("gpu_batch_pages", 128)),
+            native_page_copies=bool(config.get("native_page_copies", True)),
         )
         self.backup_wait_seconds = float(config.get("backup_wait_seconds", 10.0))
         self.drain_timeout = float(config.get("drain_timeout", 30.0))
@@ -368,7 +373,11 @@ class FlatMemoryDirectLinker(UnifiedCacheLinker):
         self._dram_executor = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="flat-dram"
         )
-        self._ssd_executor = SSDReadExecutor(workers=2)
+        # FLAT_MEMORY: one worker per SSD lease FlatMemoryCache may grant, so a
+        # granted lease never queues for a thread (same key, same default).
+        self._ssd_executor = SSDReadExecutor(
+            workers=max(1, int(config.get("restore_max_ssd_leases", 4)))
+        )
         self._write_executor = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="flat-write"
         )
@@ -731,20 +740,24 @@ class FlatMemoryDirectLinker(UnifiedCacheLinker):
         return self.start_preparing_loads()
 
     def _media_counts(self, transfers) -> tuple[str, int, int, int]:
-        media: dict[str, set[int]] = {}
+        media: dict[str, int] = {}
         for transfer in transfers:
             keys = transfer.keys or []
-            addresses = self.transfer.page_addresses(name=transfer.name, keys=keys)
-            for key, page in zip(keys, addresses):
-                if not page or not all(page):
+            states = self.transfer.page_states(name=transfer.name, keys=keys)
+            for key, state in zip(keys, states):
+                if not state & PAGE_FOUND:
                     raise RuntimeError(
                         "Flat GPU restore lost a required payload fragment"
                     )
-                media.setdefault(key, set()).update(address >> 60 for address in page)
-        dram = sum(kinds == {0} for kinds in media.values())
-        ssd = sum(1 in kinds for kinds in media.values())
-        mixed = sum(0 in kinds and 1 in kinds for kinds in media.values())
-        if any(kinds - {0, 1} for kinds in media.values()):
+                media[key] = media.get(key, 0) | state
+        on_dram = PAGE_ON_DRAM | PAGE_ON_SSD | PAGE_ON_OTHER
+        dram = sum(state & on_dram == PAGE_ON_DRAM for state in media.values())
+        ssd = sum(bool(state & PAGE_ON_SSD) for state in media.values())
+        mixed = sum(
+            bool(state & PAGE_ON_DRAM) and bool(state & PAGE_ON_SSD)
+            for state in media.values()
+        )
+        if any(state & PAGE_ON_OTHER for state in media.values()):
             raise RuntimeError("Flat compat cannot read remote/unknown storage media")
         return ("ssd" if ssd else "dram", dram, ssd, mixed)
 

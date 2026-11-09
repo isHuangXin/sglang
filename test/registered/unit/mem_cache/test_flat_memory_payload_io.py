@@ -363,6 +363,69 @@ class TestFlatPayloadIO(CustomTestCase):
         finally:
             transfer.budget.release(held)
 
+    def test_plan_segments_enumerate_exactly_the_python_fragments(self):
+        """A native plan must name, place and order every fragment as fragments()
+        does: keys are the on-disk format, and order drives layer progress."""
+
+        def expand(segments):
+            return [
+                (
+                    segments.prefixes[s] + segments.page_keys[pool][page],
+                    segments.bases[s] + row * segments.row_bytes[s],
+                    segments.lengths[s],
+                    segments.padded[s],
+                    segments.layers[s],
+                )
+                for s, pool in enumerate(segments.pools)
+                for page, row in enumerate(segments.rows[pool])
+            ]
+
+        def python(fragments):
+            return [
+                (f.key, f.address(), f.nbytes(), f.padded_length, f.layer)
+                for f in fragments
+            ]
+
+        # fp16 pages of 3 * ALIGNMENT bytes split into two fragments by
+        # max_io_bytes, so offsets, element sizes and a subset pool all count.
+        pages = 4
+        kv = [torch.zeros(pages, 3 * ALIGNMENT // 2, dtype=torch.float16) for _ in range(2)]
+        swa = [torch.zeros(pages, 3 * ALIGNMENT // 2, dtype=torch.float16)]
+        entries = [
+            DevicePoolEntry(name=name, indices_from_pool=name, device_pool=None,
+                            components=[buffers], layer_mapping=mapping, page_size=1,
+                            rows_are_pages=True)
+            for name, buffers, mapping in (
+                (PoolName.KV, kv, {0: 0, 1: 1}), (PoolName.SWA, swa, {1: 0}),
+            )
+        ]
+        layout = PayloadLayout(
+            pool_group=DevicePoolGroup(entries, num_layers=2, page_size=1),
+            model_namespace="cpu-plan", tp_rank=0, tp_size=1,
+            max_io_bytes=2 * ALIGNMENT,
+        )
+        request = _request(list(range(pages))) + [
+            PoolTransfer(name=PoolName.SWA, host_indices=torch.tensor([3, 1]),
+                         keys=["page-3", "page-1"])
+        ]
+        self.assertEqual(
+            expand(layout.plan_segments(request)), python(layout.fragments(request))
+        )
+        plan_groups = [
+            expand(group)
+            for group in layout.write_plan_groups(
+                request, max_bytes=20 * ALIGNMENT, max_pages=128
+            )
+        ]
+        fragment_groups = [
+            python(group)
+            for group in layout.write_groups(
+                request, max_bytes=20 * ALIGNMENT, max_fragments=1 << 20
+            )
+        ]
+        self.assertGreater(len(plan_groups), 1)
+        self.assertEqual(plan_groups, fragment_groups)
+
     def test_layer_major_order_and_progress_release_complete_layers_only(self):
         """FC-CIO: the forward may start layer l only after all of l has landed."""
         pages = 3

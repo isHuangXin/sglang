@@ -35,6 +35,42 @@ class LookupProbeResult(msgspec.Struct, frozen=True):
 
 # FLAT_MEMORY: Must match MediaHint in flat_memory_manager.h.
 MEDIA_HINT_ANY, MEDIA_HINT_DRAM, MEDIA_HINT_SSD = 0, 1, 2
+# Must match page_states in flat_memory_pybind.cpp.
+PAGE_FOUND, PAGE_ON_DRAM, PAGE_ON_SSD, PAGE_ON_OTHER = 1, 2, 4, 8
+
+
+class PlanSegments(msgspec.Struct, frozen=True):
+    """Layer-major fragment order as segments: one (layer, pool, spec) each,
+    covering every page of its pool. Mirrors PayloadLayout._layer_major."""
+
+    prefixes: list[str]
+    bases: list[int]
+    row_bytes: list[int]
+    lengths: list[int]
+    padded: list[int]
+    pools: list[int]
+    layers: list[int]
+    page_keys: list[list[str]]
+    rows: list[list[int]]
+
+    def counts(self) -> list[int]:
+        return [len(self.rows[pool]) for pool in self.pools]
+
+
+class PlanBatch(msgspec.Struct, frozen=True):
+    """Fragments [begin, end) of a native FragmentPlan."""
+
+    plan: Any
+    begin: int
+    end: int
+    padded_bytes: int
+    logical_bytes: int
+    # Layer of the first fragment after this batch, or None at the end.
+    next_layer: int | None
+    last_layer: int
+
+    def __len__(self) -> int:
+        return self.end - self.begin
 
 
 def align_up(size: int) -> int:
@@ -72,10 +108,30 @@ class FragmentSpec(msgspec.Struct, frozen=True):
 
 class PayloadFragment(msgspec.Struct, frozen=True):
     key: str
+    # The fragment's bytes as a uint8 tensor, or, when row >= 0, the pool
+    # buffer holding them at `pointer`. The latter skips three torch view ops
+    # per fragment (~9.5 us; 1.4 s of Python per 150K-fragment restore).
     source: torch.Tensor
     padded_length: int
     # FLAT_MEMORY: Model layer id the KV pools wait on (wait_until(layer_id)).
     layer: int = 0
+    pointer: int = 0
+    length: int = 0
+    row: int = -1
+    row_span: int = 0
+    offset: int = 0
+
+    def nbytes(self) -> int:
+        return self.length if self.row >= 0 else self.source.numel()
+
+    def address(self) -> int:
+        return self.pointer if self.row >= 0 else self.source.data_ptr()
+
+    def view(self) -> torch.Tensor:
+        if self.row < 0:
+            return self.source
+        page = self.source.narrow(0, self.row, self.row_span)
+        return page.view(torch.uint8).reshape(-1).narrow(0, self.offset, self.length)
 
 
 class PayloadLayout:
@@ -209,9 +265,12 @@ class PayloadLayout:
         return match.group(1) if match else None
 
     def _key(self, *, name: PoolName, page_key: str, spec: FragmentSpec) -> str:
+        return self._key_prefix(name=name, spec=spec) + page_key
+
+    def _key_prefix(self, *, name: PoolName, spec: FragmentSpec) -> str:
         return (
             f"{self.namespace}:{name}:c{spec.component}:b{spec.buffer}:"
-            f"f{spec.part}:n{spec.length}:{page_key}"
+            f"f{spec.part}:n{spec.length}:"
         )
 
     def padded_bytes(self, transfers: list[PoolTransfer]) -> int:
@@ -235,6 +294,14 @@ class PayloadLayout:
         # share of a page, and splitting pools across extents voids the page too.
         prepared = self._prepare(transfers)
         rows = [dict(pages) for _, _, pages in prepared]
+        for keys in self._page_groups(
+            prepared, rows, max_bytes=max_bytes, max_count=max_fragments, count_pages=False
+        ):
+            yield self._group_fragments(prepared, rows, keys)
+
+    def _page_groups(
+        self, prepared, rows, *, max_bytes: int, max_count: int, count_pages: bool
+    ) -> Iterator[list[str]]:
         # The pool covering the most pages (the full KV prefix) fixes page order;
         # pools holding a subset, such as SWA's trailing window, align by key.
         reference = max(prepared, key=lambda item: len(item[2]), default=None)
@@ -250,25 +317,82 @@ class PayloadLayout:
         for key in order:
             owners = [i for i, pool_rows in enumerate(rows) if key in pool_rows]
             size = sum(page_bytes[prepared[i][0]] for i in owners)
-            fragments = sum(len(self.specs[prepared[i][0]]) for i in owners)
+            fragments = (
+                1
+                if count_pages
+                else sum(len(self.specs[prepared[i][0]]) for i in owners)
+            )
             if group and (
                 group_bytes + size > max_bytes
-                or group_fragments + fragments > max_fragments
+                or group_fragments + fragments > max_count
             ):
-                yield self._group_fragments(prepared, rows, group)
+                yield group
                 group, group_bytes, group_fragments = [], 0, 0
             group.append(key)
             group_bytes += size
             group_fragments += fragments
         if group:
-            yield self._group_fragments(prepared, rows, group)
+            yield group
 
     def _group_fragments(self, prepared, rows, keys) -> list[PayloadFragment]:
+        return list(self._layer_major(self._group_subset(prepared, rows, keys)))
+
+    @staticmethod
+    def _group_subset(prepared, rows, keys) -> list:
         subset = [
             (name, entry, [(key, pool_rows[key]) for key in keys if key in pool_rows])
             for (name, entry, _), pool_rows in zip(prepared, rows)
         ]
-        return list(self._layer_major([item for item in subset if item[2]]))
+        return [item for item in subset if item[2]]
+
+    def plan_segments(self, transfers: list[PoolTransfer]) -> PlanSegments:
+        return self._plan_segments(self._prepare(transfers))
+
+    def write_plan_groups(
+        self, transfers: list[PoolTransfer], *, max_bytes: int, max_pages: int
+    ) -> Iterator[PlanSegments]:
+        # FLAT_MEMORY: write_groups with the cap counted in pages, not fragments:
+        # a V4 page alone is ~190 fragments, so a fragment cap made every
+        # extent one page and scattered each layer across all of them.
+        prepared = self._prepare(transfers)
+        rows = [dict(pages) for _, _, pages in prepared]
+        for keys in self._page_groups(
+            prepared, rows, max_bytes=max_bytes, max_count=max_pages, count_pages=True
+        ):
+            yield self._plan_segments(self._group_subset(prepared, rows, keys))
+
+    def _plan_segments(self, prepared: list) -> PlanSegments:
+        fields: dict[str, list] = {
+            name: []
+            for name in ("prefixes", "bases", "row_bytes", "lengths", "padded", "pools", "layers")
+        }
+        layers = sorted(
+            {layer for name, _, _ in prepared for layer in self._specs_by_layer[name]}
+        )
+        for layer in layers:
+            for pool, (name, entry, pages) in enumerate(prepared):
+                if not pages:
+                    continue
+                specs = self.specs[name]
+                for index in self._specs_by_layer[name].get(layer, ()):
+                    spec = specs[index]
+                    buffer = entry.components[spec.component][spec.buffer]
+                    if not buffer[: entry._row_span].is_contiguous():
+                        raise ValueError(
+                            f"Flat GPU pool {entry.name} moved or changed layout"
+                        )
+                    fields["prefixes"].append(self._key_prefix(name=name, spec=spec))
+                    fields["bases"].append(buffer.data_ptr() + spec.offset)
+                    fields["row_bytes"].append(buffer.stride(0) * buffer.element_size())
+                    fields["lengths"].append(spec.length)
+                    fields["padded"].append(spec.padded_length)
+                    fields["pools"].append(pool)
+                    fields["layers"].append(layer)
+        return PlanSegments(
+            **fields,
+            page_keys=[[key for key, _ in pages] for _, _, pages in prepared],
+            rows=[[int(row) for _, row in pages] for _, _, pages in prepared],
+        )
 
     def _prepare(self, transfers: list[PoolTransfer]) -> list:
         prepared = []
@@ -294,21 +418,30 @@ class PayloadLayout:
         for layer in layers:
             for name, entry, pages in prepared:
                 specs = self.specs[name]
+                span = entry._row_span
                 for index in self._specs_by_layer[name].get(layer, ()):
                     spec = specs[index]
                     buffer = entry.components[spec.component][spec.buffer]
+                    # Equal strides on every page, so one check covers each
+                    # page the per-fragment narrow used to check.
+                    if not buffer[:span].is_contiguous():
+                        raise ValueError(
+                            f"Flat GPU pool {entry.name} moved or changed layout"
+                        )
+                    base = buffer.data_ptr() + spec.offset
+                    row_bytes = buffer.stride(0) * buffer.element_size()
+                    prefix = self._key_prefix(name=name, spec=spec)
                     for page_key, row in pages:
-                        page = buffer.narrow(0, row, entry._row_span)
-                        if not page.is_contiguous():
-                            raise ValueError(
-                                f"Flat GPU pool {entry.name} moved or changed layout"
-                            )
-                        raw = page.view(torch.uint8).reshape(-1)
                         yield PayloadFragment(
-                            self._key(name=name, page_key=page_key, spec=spec),
-                            raw.narrow(0, spec.offset, spec.length),
+                            prefix + page_key,
+                            buffer,
                             spec.padded_length,
                             layer,
+                            pointer=base + row * row_bytes,
+                            length=spec.length,
+                            row=row,
+                            row_span=span,
+                            offset=spec.offset,
                         )
 
 
@@ -371,10 +504,18 @@ class GPUTransfer:
         device: torch.device,
         staging_bytes: int,
         batch_pages: int = 128,
+        native_page_copies: bool = False,
     ):
         self.layout = layout
         self.manager = manager
         self.device = torch.device(device)
+        # FLAT_MEMORY: FC-CIO. Fragments are enumerated natively from a
+        # FragmentPlan; reads land straight in the KV page slices and writes
+        # pack with one gather launch, instead of a Python object and torch
+        # copy_ per ~10 KiB fragment (~150K per V4 restore). Needs the native
+        # manager's *_plan methods; fakes and CPU devices keep the old path.
+        self.native_page_copies = native_page_copies
+        self._plan_mode = native_page_copies and self.device.type == "cuda"
         if self.device.type == "cuda" and self.device.index is None:
             self.device = torch.device("cuda", torch.cuda.current_device())
         if any(
@@ -481,6 +622,9 @@ class GPUTransfer:
         # FLAT_MEMORY: on_progress(done_bytes, total_bytes, layers_done_through)
         # runs after each batch, once its bytes are in place in the device pages.
         self.raise_if_unsafe()
+        if self._plan_mode:
+            self._read_plan(transfers, on_progress=on_progress)
+            return
         budget = self.dram_read_budget if medium == "dram" else self.budget
         fragments = list(self.layout.fragments(transfers))
         total_bytes = sum(fragment.padded_length for fragment in fragments)
@@ -508,6 +652,68 @@ class GPUTransfer:
                         else fragments[-1].layer
                     )
                     on_progress(done_bytes, total_bytes, through)
+
+    def _read_plan(self, transfers, *, on_progress) -> None:
+        segments = self.layout.plan_segments(transfers)
+        plan = self._make_plan(segments)
+        total_bytes = sum(n * p for n, p in zip(segments.counts(), segments.padded))
+        done_bytes = 0
+        with self._context(), self._stream_context():
+            for batch in self._plan_batches(
+                plan, segments, batch_bytes=self.read_batch_bytes
+            ):
+                # Native streams must wait for earlier users of the destination
+                # pages; the pages are private until commit, so a failed read
+                # leaves nothing visible.
+                self._sync()
+                self.manager.read_plan(plan, batch.begin, batch.end)
+                self._record_batch(batch, write=False)
+                done_bytes += batch.padded_bytes
+                if on_progress is not None:
+                    through = (
+                        batch.next_layer - 1
+                        if batch.next_layer is not None
+                        else batch.last_layer
+                    )
+                    on_progress(done_bytes, total_bytes, through)
+
+    def _make_plan(self, segments: PlanSegments):
+        return self.manager.make_plan(
+            prefixes=segments.prefixes,
+            bases=segments.bases,
+            row_bytes=segments.row_bytes,
+            lengths=segments.lengths,
+            padded=segments.padded,
+            pools=segments.pools,
+            page_keys=segments.page_keys,
+            rows=segments.rows,
+        )
+
+    @staticmethod
+    def _plan_batches(plan, segments: PlanSegments, *, batch_bytes: int):
+        # Splits by padded bytes alone; a fragment larger than the budget still
+        # gets a batch of its own.
+        begin = at = padded = logical = 0
+        last_layer = 0
+        for count, size, length, layer in zip(
+            segments.counts(), segments.padded, segments.lengths, segments.layers
+        ):
+            left = count
+            while left:
+                take = min(left, max(0, batch_bytes - padded) // size)
+                if not take and at == begin:
+                    take = 1
+                if not take:
+                    yield PlanBatch(plan, begin, at, padded, logical, layer, last_layer)
+                    begin, padded, logical = at, 0, 0
+                    continue
+                left -= take
+                at += take
+                padded += take * size
+                logical += take * length
+                last_layer = layer
+        if at > begin:
+            yield PlanBatch(plan, begin, at, padded, logical, None, last_layer)
 
     def raise_if_unsafe(self) -> None:
         if self._unsafe_error is not None:
@@ -540,17 +746,32 @@ class GPUTransfer:
         whole_bytes = self.layout.padded_bytes(transfers)
         remaining = whole_bytes
         # A group that fits is exactly one batch; only an oversized page splits.
-        batches = iter(
-            [
-                batch
-                for group in self.layout.write_groups(
-                    transfers,
-                    max_bytes=self.write_batch_bytes,
-                    max_fragments=self.batch_pages,
-                )
-                for batch in self._batches(group, batch_bytes=self.write_batch_bytes)
-            ]
-        )
+        if self._plan_mode:
+            batches = iter(
+                [
+                    (batch, batch.padded_bytes)
+                    for group in self.layout.write_plan_groups(
+                        transfers,
+                        max_bytes=self.write_batch_bytes,
+                        max_pages=self.batch_pages,
+                    )
+                    for batch in self._plan_batches(
+                        self._make_plan(group), group, batch_bytes=self.write_batch_bytes
+                    )
+                ]
+            )
+        else:
+            batches = iter(
+                [
+                    batch
+                    for group in self.layout.write_groups(
+                        transfers,
+                        max_bytes=self.write_batch_bytes,
+                        max_fragments=self.batch_pages,
+                    )
+                    for batch in self._batches(group, batch_bytes=self.write_batch_bytes)
+                ]
+            )
         attempted_snapshot = False
         for batch, total in batches:
             remaining -= total
@@ -597,6 +818,9 @@ class GPUTransfer:
             on_source_consumed()
 
     def _duplicate_batch(self, batch) -> bool:
+        if isinstance(batch, PlanBatch):
+            admission = self.manager.check_write_plan(batch.plan, batch.begin, batch.end)
+            return all(self._write_results(admission, count=len(batch), complete=False))
         admission = self.manager.check_gpu_write(
             [fragment.key for fragment in batch],
             [fragment.padded_length for fragment in batch],
@@ -660,16 +884,29 @@ class GPUTransfer:
                 owner = stage = None
                 budget.release(allocated)
 
-    @staticmethod
-    def _pack_batch(batch, stage) -> None:
+    def _pack_batch(self, batch, stage) -> None:
+        if isinstance(batch, PlanBatch):
+            stage.zero_()
+            stream = torch.cuda.current_stream(self.device).cuda_stream
+            self.manager.pack_plan(
+                batch.plan, batch.begin, batch.end, stage.data_ptr(), stream
+            )
+            return
         offset = 0
         for fragment in batch:
             view = stage.narrow(0, offset, fragment.padded_length)
             view.zero_()
-            view[: fragment.source.numel()].copy_(fragment.source)
+            source = fragment.view()
+            view[: source.numel()].copy_(source)
             offset += fragment.padded_length
 
     def _write_staged_batch(self, batch, stage, *, media_hint) -> None:
+        if isinstance(batch, PlanBatch):
+            result = self.manager.put_plan(
+                batch.plan, batch.begin, batch.end, stage.data_ptr(), media_hint
+            )
+            self._write_results(result, count=len(batch), complete=True)
+            return
         pointers, offset = [], 0
         for fragment in batch:
             pointer = stage.data_ptr() + offset
@@ -723,12 +960,16 @@ class GPUTransfer:
         if len(results) != len(batch) or not all(results):
             raise RuntimeError("Flat GPU read did not complete every payload fragment")
         for fragment, view in zip(batch, views):
-            fragment.source.copy_(view[: fragment.source.numel()])
+            source = fragment.view()
+            source.copy_(view[: source.numel()])
         self._sync()
 
-    def _record_batch(self, batch: list[PayloadFragment], *, write: bool) -> None:
-        logical = sum(fragment.source.numel() for fragment in batch)
-        padded = sum(fragment.padded_length for fragment in batch)
+    def _record_batch(self, batch, *, write: bool) -> None:
+        if isinstance(batch, PlanBatch):
+            logical, padded = batch.logical_bytes, batch.padded_bytes
+        else:
+            logical = sum(fragment.nbytes() for fragment in batch)
+            padded = sum(fragment.padded_length for fragment in batch)
         with self._metrics_lock:
             if write:
                 self.logical_write_bytes += logical
@@ -752,12 +993,10 @@ class GPUTransfer:
         pools = []
         ssd_pages = [False] * len(keys)
         for transfer in transfers:
-            states = self.page_addresses(name=transfer.name, keys=keys)
-            exists = [bool(addresses) and all(addresses) for addresses in states]
-            for index, addresses in enumerate(states):
-                ssd_pages[index] |= any(
-                    address and address >> 60 == 1 for address in addresses
-                )
+            states = self.page_states(name=transfer.name, keys=keys)
+            exists = [bool(state & PAGE_FOUND) for state in states]
+            for index, state in enumerate(states):
+                ssd_pages[index] |= bool(state & PAGE_ON_SSD)
             records = [
                 self.layout.page_record(name=transfer.name, page_key=key)
                 for key in keys
@@ -799,6 +1038,27 @@ class GPUTransfer:
             tuple(sorted(candidates)), frozenset(missing), tuple(ssd_pages)
         )
 
+    def page_states(self, *, name: PoolName, keys: list[str]) -> list[int]:
+        # FLAT_MEMORY: per page, PAGE_FOUND when every fragment exists plus one
+        # PAGE_ON_* bit per medium holding a fragment.
+        if self._plan_mode:
+            prefixes = [
+                self.layout._key_prefix(name=name, spec=spec)
+                for spec in self.layout.specs[name]
+            ]
+            return self.manager.page_states(prefixes, keys)
+        states = []
+        for addresses in self.page_addresses(name=name, keys=keys):
+            state = PAGE_FOUND if addresses and all(addresses) else 0
+            for address in addresses:
+                if address:
+                    media = address >> 60
+                    state |= (
+                        PAGE_ON_DRAM if media == 0 else PAGE_ON_SSD if media == 1 else PAGE_ON_OTHER
+                    )
+            states.append(state)
+        return states
+
     def page_addresses(self, *, name: PoolName, keys: list[str]) -> list[list[int]]:
         states = []
         width = len(self.layout.specs[name])
@@ -818,10 +1078,8 @@ class GPUTransfer:
 
     def media(self, transfers: list[PoolTransfer]) -> str:
         for transfer in transfers:
-            for addresses in self.page_addresses(
-                name=transfer.name, keys=transfer.keys or []
-            ):
-                if any(address and address >> 60 == 1 for address in addresses):
+            for state in self.page_states(name=transfer.name, keys=transfer.keys or []):
+                if state & PAGE_ON_SSD:
                     return "ssd"
         return "dram"
 

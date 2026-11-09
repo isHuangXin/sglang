@@ -71,6 +71,21 @@ def _flat_optional_sum(outputs, name, integer=True):
     return sum(values)
 
 
+def _fill_measured_zero_tiers(output):
+    details = output.cached_tokens_details or {}
+    zero = []
+    if output.server_cached_tokens == 0:
+        # FLAT_MEMORY: a cold request has no tier details; every tier is a measured zero.
+        zero = ["device", "host", "storage"]
+    elif "device" in details and "storage" not in details:
+        # FLAT_MEMORY: the server omits "storage" only when no storage backend is enabled.
+        zero = ["storage"]
+    for medium in zero:
+        if getattr(output, f"server_cached_tokens_{medium}") is None:
+            setattr(output, f"server_cached_tokens_{medium}", 0)
+            setattr(output, f"cached_tokens_{medium}", 0)
+
+
 def consume_native_usage(output, meta):
     # FLAT_MEMORY: Native SSE usage is cumulative, including metadata-only chunks.
     if "id" in meta:
@@ -91,6 +106,7 @@ def consume_native_usage(output, meta):
     if output.server_cached_tokens is not None:
         output.cached_tokens = output.server_cached_tokens
     if "cached_tokens_details" not in meta:
+        _fill_measured_zero_tiers(output)
         return
     details = meta["cached_tokens_details"]
     output.cached_tokens_details = details if isinstance(details, dict) else None
@@ -100,6 +116,7 @@ def consume_native_usage(output, meta):
         value = value if type(value) is int and value >= 0 else None
         setattr(output, f"server_cached_tokens_{medium}", value)
         setattr(output, f"cached_tokens_{medium}", value)
+    _fill_measured_zero_tiers(output)
     for name in FLAT_DETAIL_FIELDS:
         value = details.get(name)
         types = (int, float) if name.endswith("_ms") else (int,)

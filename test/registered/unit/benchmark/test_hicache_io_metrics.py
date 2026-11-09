@@ -119,6 +119,7 @@ def _ssd_window_text(
     losses=(0, 0),
     instance="ssd-window-one",
     capacity=16_384,
+    direction_available=None,
 ):
     prefix = "mooncake_ssd_kv_io_"
     current = snapshot_ns // 100_000_000
@@ -137,6 +138,13 @@ def _ssd_window_text(
         f"{prefix}newest_bucket_id {current}",
     ]
     for index, direction in enumerate(("read", "write")):
+        if direction_available is not None:
+            available = direction_available[index]
+            lines.append(
+                f'{prefix}direction_available{{direction="{direction}"}} {int(available)}'
+            )
+            if not available:
+                continue
         lines.extend(
             (
                 f'{prefix}completed_bytes_total{{direction="{direction}"}} {totals[index]}',
@@ -144,7 +152,11 @@ def _ssd_window_text(
             )
         )
     for index, read, write in buckets:
-        for direction, value in (("read", read), ("write", write)):
+        for position, (direction, value) in enumerate(
+            (("read", read), ("write", write))
+        ):
+            if direction_available is not None and not direction_available[position]:
+                continue
             lines.append(
                 f'{prefix}bucket_bytes{{bucket_id="{index}",direction="{direction}"}} {value}'
             )
@@ -484,6 +496,40 @@ class TestSSDCompletionWindow(CustomTestCase):
         self.assertIsNone(missing["ssd_read_peak_bw_gbps"])
         self.assertEqual(missing["ssd_write_ops"], 7)
         self.assertAlmostEqual(missing["dram_read_bw_gbps"], 8 / 3)
+
+    def test_posix_writes_do_not_become_zero_cqe_peaks_or_hide_reads(self):
+        """Read CQEs remain measurable when the same owner writes through POSIX."""
+        for read_bytes in (0, 200_000_000):
+            with self.subTest(read_bytes=read_bytes):
+                before = _ssd_sample(
+                    snapshot_ns=150_000_000,
+                    buckets=((1, 0, 0),),
+                    direction_available=(True, False),
+                )
+                after = _ssd_sample(
+                    completed=True,
+                    snapshot_ns=250_000_000,
+                    buckets=((1, 0, 0), (2, read_bytes, 0)),
+                    direction_available=(True, False),
+                )
+                result = summarize_hicache_io(before, after)
+                self.assertEqual(result["ssd_read_peak_bw_gbps"], read_bytes / 1e8)
+                self.assertIsNone(result["ssd_write_peak_bw_gbps"])
+                self.assertEqual(result["ssd_write_ops"], 7)
+                self.assertEqual(result["mooncake_io_status"], "partial")
+                states = result["hicache_io_metadata"]["metric_status"]
+                self.assertEqual(states["ssd_read_peak_bw_gbps"]["status"], "ok")
+                self.assertEqual(
+                    states["ssd_write_peak_bw_gbps"]["status"], "unavailable"
+                )
+                self.assertIn(
+                    "write CQE observation", states["ssd_write_peak_bw_gbps"]["reason"]
+                )
+                snapshot = after["owner"]["snapshot"]["ssd_kv_io"]
+                self.assertEqual(
+                    snapshot["direction_available"], {"read": True, "write": False}
+                )
+                self.assertIsNone(snapshot["completed_bytes_total"]["write"])
 
     def test_uint64_counter_precision_does_not_erase_one_completed_byte(self):
         before = _ssd_sample(

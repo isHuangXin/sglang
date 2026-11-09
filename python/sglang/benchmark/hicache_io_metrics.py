@@ -218,7 +218,7 @@ def _ssd_window_samples(text: str) -> dict:
         if key in samples:
             raise _SnapshotError("Duplicate SSD byte-window sample")
         samples[key] = value
-        if len(samples) > 2 * _SSD_MAX_BUCKETS + 10:
+        if len(samples) > 2 * _SSD_MAX_BUCKETS + 12:
             raise _SnapshotError("SSD byte-window snapshot exceeds bounded capacity")
     return samples
 
@@ -257,9 +257,23 @@ def _parse_ssd_window_snapshot(text: str) -> dict:
         "instance_id": _identity(labels.get("instance_id"), "SSD byte-window instance"),
         **{field: _take_window_sample(samples, field) for field in _SSD_WINDOW_SCALARS},
     }
+    available = dict.fromkeys(("read", "write"), True)
+    if any(name == "direction_available" for name, _ in samples):
+        for direction in available:
+            value = _take_window_sample(
+                samples, "direction_available", direction=direction
+            )
+            if value not in (0, 1):
+                raise _SnapshotError("Invalid SSD byte-window direction capability")
+            available[direction] = bool(value)
+    result["direction_available"] = available
     for field in ("completed_bytes_total", "observation_losses_total"):
         result[field] = {
-            direction: _take_window_sample(samples, field, direction=direction)
+            direction: (
+                _take_window_sample(samples, field, direction=direction)
+                if available[direction]
+                else None
+            )
             for direction in ("read", "write")
         }
     buckets: dict[int, dict] = {}
@@ -305,6 +319,18 @@ def parse_owner_snapshot(text: str) -> dict:
     return result
 
 
+def _ssd_direction_capabilities(snapshot: Mapping) -> Mapping:
+    available = _mapping(
+        snapshot.get("direction_available", {"read": True, "write": True}),
+        "SSD byte-window direction capabilities",
+    )
+    if any(
+        type(available.get(direction)) is not bool for direction in ("read", "write")
+    ):
+        raise _SnapshotError("Invalid SSD byte-window direction capabilities")
+    return available
+
+
 def _validate_ssd_window(snapshot: Mapping) -> dict[int, Mapping]:
     if snapshot.get("error"):
         raise _SnapshotError(str(snapshot["error"]))
@@ -335,6 +361,7 @@ def _validate_ssd_window(snapshot: Mapping) -> dict[int, Mapping]:
     buckets = snapshot.get("buckets")
     if not isinstance(buckets, list) or len(buckets) > capacity:
         raise _SnapshotError("Missing or oversized SSD byte-window history")
+    available = _ssd_direction_capabilities(snapshot)
     indexed = {}
     for bucket in buckets:
         bucket = _mapping(bucket, "SSD byte-window bucket")
@@ -344,10 +371,13 @@ def _validate_ssd_window(snapshot: Mapping) -> dict[int, Mapping]:
         indexed[index] = {
             direction: _counter(bucket.get(direction), f"SSD {direction} bucket bytes")
             for direction in ("read", "write")
+            if available[direction]
         }
     for field in ("completed_bytes_total", "observation_losses_total"):
         counters = _mapping(snapshot.get(field), f"SSD {field}")
         for direction in ("read", "write"):
+            if not available[direction]:
+                continue
             value = _counter(counters.get(direction), f"SSD {direction} {field}")
             if (
                 field == "completed_bytes_total"
@@ -587,6 +617,10 @@ def _ssd_peak_delta(*, before: Mapping, after: Mapping, direction: str) -> dict:
         for sample in (before, after)
     )
     left, right = (_validate_ssd_window(snapshot) for snapshot in (begin, end))
+    if not all(
+        _ssd_direction_capabilities(snapshot)[direction] for snapshot in (begin, end)
+    ):
+        raise _SnapshotError(f"Native SSD {direction} CQE observation is unavailable")
     if begin["instance_id"] != end["instance_id"]:
         raise _SnapshotError("Mooncake SSD byte-window source restarted")
     if begin["capacity_buckets"] != end["capacity_buckets"]:
@@ -691,8 +725,39 @@ def _summarize_fetch(*, result: dict, pairs: list, metadata: dict) -> None:
         metadata["metric_status"][name]["reason"] = str(error)
 
 
-def format_hicache_io_report(result: Mapping) -> str:
+_OWNER_METRICS = ("ssd_write_ops", "ssd_read_peak_bw_gbps", "ssd_write_peak_bw_gbps")
+
+
+def _has_native_mooncake(sample: Mapping) -> bool:
+    """True when any TP rank exposed a Mooncake Store client snapshot."""
+    def walk(value):
+        if isinstance(value, Mapping):
+            native = value.get("mooncake")
+            if isinstance(native, Mapping) and native.get("schema_version") is not None:
+                return True
+            return any(walk(item) for item in value.values())
+        if isinstance(value, (list, tuple)):
+            return any(walk(item) for item in value)
+        return False
+
+    return walk(sample.get("server", {}) if isinstance(sample, Mapping) else {})
+
+
+def mark_not_tested(result: dict, *, owner_configured: bool, native_mooncake: bool) -> dict:
+    """FLAT_MEMORY: tag metrics this run cannot produce as not tested, not missing."""
+    statuses = result["hicache_io_metadata"]["metric_status"]
+    absent = [] if owner_configured else list(_OWNER_METRICS)
+    if not native_mooncake:
+        absent.append("avg_ssd_to_host_latency_ms")
+    for name in absent:
+        if statuses[name]["status"] != "ok":
+            statuses[name] = {"status": "not_tested", "reason": None}
+    return result
+
+
+def format_hicache_io_report(result: Mapping, *, enabled: bool = True) -> str:
     lines = ["----------------HiCache / Mooncake I/O----------------"]
+    statuses = result["hicache_io_metadata"]["metric_status"]
     labels = (
         ("Average SSD --> Host Latency (ms):", "avg_ssd_to_host_latency_ms"),
         ("DRAM Read bandwidth (GB/s):", "dram_read_bw_gbps"),
@@ -703,11 +768,12 @@ def format_hicache_io_report(result: Mapping) -> str:
     )
     for label, field in labels:
         value = result.get(field)
-        text = (
-            "N/A"
-            if value is None
-            else str(value) if field == "ssd_write_ops" else f"{value:.3f}"
-        )
+        if not enabled or statuses[field]["status"] == "not_tested":
+            text = "--"
+        elif value is None:
+            text = "N/A"
+        else:
+            text = str(value) if field == "ssd_write_ops" else f"{value:.3f}"
         lines.append(f"{label:<44} {text}")
     lines.extend(
         (
@@ -720,8 +786,8 @@ def format_hicache_io_report(result: Mapping) -> str:
             "Scope: completed/accounted snapshot interval; no drain or request ownership.",
         )
     )
-    for name, state in result["hicache_io_metadata"]["metric_status"].items():
-        if state["status"] != "ok":
+    for name, state in statuses.items():
+        if enabled and state["status"] not in ("ok", "not_tested"):
             lines.append(f"{name}: {state['status']} ({state['reason']})")
     return "\n".join(lines)
 
@@ -769,8 +835,9 @@ class HiCacheIOCollector:
         ) as session:
             # Credentials for SGLang must never be forwarded to a different owner.
             headers = self.headers if source == "server" else {}
+            params = {"hicache_io_mode": "readonly"} if source == "server" else None
             async with session.get(
-                url, headers=headers, allow_redirects=False
+                url, params=params, headers=headers, allow_redirects=False
             ) as response:
                 response.raise_for_status()
                 if response.status != 200:
@@ -823,5 +890,10 @@ class HiCacheIOCollector:
     async def __aexit__(self, exc_type, exc, traceback):
         if self.enabled:
             after = await self._capture() if exc_type is None else {}
-            self.result = summarize_hicache_io(self.before, after)
+            self.result = mark_not_tested(
+                summarize_hicache_io(self.before, after),
+                owner_configured=bool(self.owner_metrics_url),
+                native_mooncake=_has_native_mooncake(self.before)
+                or _has_native_mooncake(after),
+            )
         return False

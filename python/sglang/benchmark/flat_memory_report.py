@@ -61,8 +61,14 @@ def format_storage_restore_report(report: Mapping) -> str:
         f"  Scope: {report['scope']}",
         f"  Sample: {report['sample_unit']}; TP size: {report['tp_size']}",
     ]
+    fields = [report["fields"][name] for name in _restore_contract.FIELDS.values()]
+    # FLAT_MEMORY: no restore sample at all means this run has no instrumented restore path.
+    untested = all(field["status"] != "measured" and not field["sample_count"] for field in fields)
     for name in _restore_contract.FIELDS.values():
         field = report["fields"][name]
+        if untested:
+            lines.append(f"  {name}: --")
+            continue
         text = (f"{field['value']:.6g}" if field["status"] == "measured"
                 else f"N/A ({field['reason']})")
         lines.append(f"  {name}: {text} ms (samples: {field['sample_count']})")
@@ -310,11 +316,17 @@ def _legacy_cache(result):
         cached = _number(row.get("cached_tokens"), integer=True)
         details = _mapping(row.get("cached_tokens_details"))
         tiers = {tier: _number(details.get(tier), integer=True) for tier in ("device", "host", "storage")}
+        if "device" in details and "storage" not in details:
+            # FLAT_MEMORY: the server omits "storage" only when no storage backend is enabled.
+            tiers["storage"] = 0
         if cached is not None and prompt is not None and cached > prompt:
             cached = None
         known = [value for value in tiers.values() if value is not None]
         if cached is None or sum(known) > cached or (len(known) == 3 and sum(known) != cached):
             tiers = dict.fromkeys(tiers)
+        elif cached == 0:
+            # FLAT_MEMORY: a cold request has no details; every tier is a measured zero.
+            tiers = {tier: value or 0 for tier, value in tiers.items()}
         flat = [_number(details.get(f"flat_{tier}"), integer=True) for tier in ("dram", "ssd", "mixed")]
         dram, ssd, mixed = flat
         total = dram + ssd if dram is not None and ssd is not None else None

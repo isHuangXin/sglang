@@ -1838,28 +1838,28 @@ async def benchmark(
     if accept_length:
         print("{:<40} {:<10.2f}".format("Accept length:", accept_length))
     if args.cache_report or flat_mode or hicache_io.enabled:
+        # FLAT_MEMORY: one layout for every system; sections a run cannot
+        # measure print "--" instead of disappearing.
         print(format_cache_reports(cache_report))
         print(format_storage_restore_report(restore_report))
-        if cache_report["metrics_mode"] == "flat":
-            print("Mooncake Storage I/O Statistics".center(64, "-"))
-            print("  Storage I/O status: not_applicable")
-            print("  -- : Flat uses its own DRAM/SSD backend, not Mooncake Store.")
-            print("HiCache L2 Host I/O Statistics".center(64, "-"))
-            print("  L2 Host I/O status: not_applicable")
-            print("  -- : Flat does not construct a HiCache Host payload pool.")
+        print(format_hicache_io_report(hicache_io.result, enabled=hicache_io.enabled))
+        storage_latency = cache_usage["avg_storage_read_latency_ms"]
+        latency_status = hicache_io.result["hicache_io_metadata"]["metric_status"][
+            "avg_ssd_to_host_latency_ms"
+        ]["status"]
+        if not hicache_io.enabled or latency_status == "not_tested":
+            storage_text = "--"
+        else:
+            storage_text = "N/A" if storage_latency is None else f"{storage_latency:.3f}"
+        print(f"{'Legacy Storage --> Host Latency (ms):':<44} {storage_text}")
+        print(
+            "Legacy Storage latency retains its request aggregation; it is not SSD-only."
+        )
     if any(legacy_metrics.values()):
         print(
             "Legacy lifetime/proxy telemetry (not native Flat I/O-window measurements):"
         )
         print(json.dumps(legacy_metrics, default=str))
-    if hicache_io.enabled:
-        print(format_hicache_io_report(hicache_io.result))
-        storage_latency = cache_usage["avg_storage_read_latency_ms"]
-        storage_text = "N/A" if storage_latency is None else f"{storage_latency:.3f}"
-        print(f"{'Legacy Storage --> Host Latency (ms):':<44} {storage_text}")
-        print(
-            "Legacy Storage latency retains its request aggregation; it is not SSD-only."
-        )
     print("{s:{c}^{n}}".format(s="End-to-End Latency", n=50, c="-"))
     print(
         "{:<40} {:<10.2f}".format("Mean E2E Latency (ms):", metrics.mean_e2e_latency_ms)

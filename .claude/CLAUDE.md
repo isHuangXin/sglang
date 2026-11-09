@@ -65,7 +65,7 @@ v0.5.19 默认使用 `UnifiedRadixCache`，仅修改旧 `hiradix_cache.py` 不�
   非 owner 仍必须各自 retire 一对完整 `_Offload`——`num_source_safe_offloads()` 与
   `num_completed_offloads()` 进 MIN all_reduce，缺一对会让 commit 永远停在 0、
   `inc_lock_ref` 不释放、KV pool 耗尽。
-- 当前原生 `gds_mode="compat"` 不支持 remote/persistence，不能称为严格硬件 GDS。
+- 当前原生 `gds_mode="compat"` 支持 remote SSD/DRAM（`remote_ssd_gb` / `remote_dram_gb`），不支持 persistence，不能称为严格硬件 GDS。
 
 ## 指标与工具
 

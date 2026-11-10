@@ -289,6 +289,16 @@ class FlatMemoryCache:
         # matched in the current epoch needs no rematch.
         self._evict_epoch = 0
         self._evictions_seen = cache.evicted_tokens_total
+        # FLAT_MEMORY: periodic rank-0 summary of the control counters above, so a
+        # serving run shows where scheduler time goes. 0 disables it.
+        self.control_log_seconds = float(config.get("control_log_seconds", 30.0))
+        if self.control_log_seconds < 0:
+            raise ValueError("Flat control_log_seconds must be nonnegative")
+        self._logs_control = self.control_log_seconds > 0 and (
+            not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
+        )
+        self._control_log_at = time.monotonic()
+        self._control_logged = self._control_counters()
 
     def _create_control_reducer(self, config: dict) -> ShmControlReducer | None:
         # FLAT_MEMORY: Collective at construction, which every TP rank reaches in
@@ -331,6 +341,8 @@ class FlatMemoryCache:
     def begin_scheduler_pass(self) -> None:
         # FLAT_MEMORY: Close prior observations before making new scheduling decisions.
         now = time.monotonic()
+        if self._logs_control and now - self._control_log_at >= self.control_log_seconds:
+            self._log_control(now)
         for state in self.prefetches.values():
             if state.admitted or state.cancelled or state.wait_finalized:
                 continue
@@ -363,6 +375,46 @@ class FlatMemoryCache:
             ):
                 continue
             self._set_wait(state, reason, now=now)
+
+    def _control_counters(self) -> tuple[dict, dict, int]:
+        return (
+            dict(self._control_seconds),
+            dict(self._control_calls),
+            self._revalidated_requests,
+        )
+
+    def _log_control(self, now: float) -> None:
+        seconds, calls, revalidated = self._control_counters()
+        old_seconds, old_calls, old_revalidated = self._control_logged
+        passes = calls["scheduler"] - old_calls["scheduler"]
+
+        def per_pass(name: str) -> str:
+            spent = seconds.get(name, 0.0) - old_seconds.get(name, 0.0)
+            return f"{spent * 1000 / max(passes, 1):.3f}"
+
+        reduces = calls["reduce"] - old_calls["reduce"]
+        logger.info(
+            "Flat control %.0fs: %d passes, ms/pass scheduler=%s poll=%s "
+            "prepare_admission=%s finish_admission=%s rematch=%s reduce=%s "
+            "(%.2f reduces/pass, %s); rematched %d requests; evict epoch %d; "
+            "prefetches %d, leases %d",
+            now - self._control_log_at,
+            passes,
+            per_pass("scheduler"),
+            per_pass("poll"),
+            per_pass("prepare_admission"),
+            per_pass("finish_admission"),
+            per_pass("rematch"),
+            per_pass("reduce_collective"),
+            reduces / max(passes, 1),
+            "shm" if self._control_reducer is not None else "gloo",
+            revalidated - old_revalidated,
+            self._evict_epoch,
+            len(self.prefetches),
+            len(self._leases),
+        )
+        self._control_log_at = now
+        self._control_logged = (seconds, calls, revalidated)
 
     def record_control_time(self, name: str, elapsed_seconds: float) -> None:
         # FLAT_MEMORY: Rank-local inclusive times overlap; never sum parent and child.

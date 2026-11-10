@@ -409,6 +409,8 @@ class FlatMemoryDirectLinker(UnifiedCacheLinker):
         self._queries: dict[str, _LookupQuery] = {}
         self._lookup_generations: dict[str, int] = {}
         self._lookup_ssd_pages: dict[str, tuple[bool, ...]] = {}
+        # FLAT_MEMORY: page key -> combined page_states bits from the last probe.
+        self._lookup_media: dict[str, dict[str, int]] = {}
         self._physical_query_jobs: dict[str, Future[LookupProbeResult]] = {}
         self._storage_generation = 0
         self._offload_coverage: dict[Future, frozenset[PageRecord]] = {}
@@ -632,6 +634,10 @@ class FlatMemoryDirectLinker(UnifiedCacheLinker):
             # FLAT_MEMORY: A write completing during the probe must leave a stale receipt.
             self._lookup_generations[rid] = generation
             self._lookup_ssd_pages[rid] = result.ssd_pages
+            if result.page_media:
+                self._lookup_media[rid] = dict(zip(query.keys, result.page_media))
+            else:
+                self._lookup_media.pop(rid, None)
             query.dependencies = frozenset(
                 job
                 for job, records in offloads.items()
@@ -664,6 +670,7 @@ class FlatMemoryDirectLinker(UnifiedCacheLinker):
             self._queries.pop(rid, None)
             self._lookup_generations.pop(rid, None)
             self._lookup_ssd_pages.pop(rid, None)
+            self._lookup_media.pop(rid, None)
             future = self._lookups.pop(rid, None)
             if future is not None:
                 future.cancel()
@@ -767,11 +774,19 @@ class FlatMemoryDirectLinker(UnifiedCacheLinker):
     def start_layer_wise_loading(self) -> int:
         return self.start_preparing_loads()
 
-    def _media_counts(self, transfers) -> tuple[str, int, int, int]:
+    def _media_counts(self, rid, transfers) -> tuple[str, int, int, int]:
+        # FLAT_MEMORY: GVAs never migrate, so the probe's media bits stay valid and
+        # skip one lookup (and master RPC) per restore. read_plan still resolves
+        # current addresses, so a key reclaimed since the probe fails that read.
+        with self._lock:
+            known = self._lookup_media.get(rid)
         media: dict[str, int] = {}
         for transfer in transfers:
             keys = transfer.keys or []
-            states = self.transfer.page_states(name=transfer.name, keys=keys)
+            if known is not None and all(key in known for key in keys):
+                states = [known[key] for key in keys]
+            else:
+                states = self.transfer.page_states(name=transfer.name, keys=keys)
             for key, state in zip(keys, states):
                 if not state & PAGE_FOUND:
                     raise RuntimeError(
@@ -791,7 +806,7 @@ class FlatMemoryDirectLinker(UnifiedCacheLinker):
 
     def _dispatch_read(self, rid, transfers, ready_event, result, counter_index, batch):
         try:
-            medium, dram, ssd, mixed = self._media_counts(transfers)
+            medium, dram, ssd, mixed = self._media_counts(rid, transfers)
             args = (rid, transfers, ready_event, medium, dram, ssd, mixed, counter_index)
             if medium == "ssd":
                 read = self._ssd_executor.submit(
@@ -1161,6 +1176,7 @@ class FlatMemoryDirectLinker(UnifiedCacheLinker):
             self._queries.clear()
             self._lookup_generations.clear()
             self._lookup_ssd_pages.clear()
+            self._lookup_media.clear()
             self._offloads.clear()
             self._load_batches.clear()
             self._rid_counters.clear()

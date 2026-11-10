@@ -20,7 +20,11 @@ from sglang.srt.mem_cache.storage.flat_memory.flat_memory_direct_linker import (
     FlatMemoryDirectLinker,
 )
 from sglang.srt.mem_cache.storage.flat_memory.io_result import FlatCapacityError
-from sglang.srt.mem_cache.storage.flat_memory.payload import ALIGNMENT
+from sglang.srt.mem_cache.storage.flat_memory.payload import (
+    ALIGNMENT,
+    PAGE_FOUND,
+    PAGE_ON_DRAM,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -147,6 +151,43 @@ class TestFlatLookupDependencies(CustomTestCase):
 
     def run_probe(self, linker):
         linker._lookup_executor.run_next()
+
+    def test_dispatch_reuses_probe_media_and_falls_back_without_it(self):
+        """Restore dispatch takes media from the probe; a key it never saw is looked up."""
+        linker = self.make_linker(
+            sources={PoolName.KV: PoolName.KV, PoolName.SWA: PoolName.SWA}
+        )
+        keys = ["m0", "m1", "m2"]
+        self.publish(linker, keys)
+        self.publish(linker, keys[:2], name=PoolName.SWA)
+        linker.submit_lookup("media", _request(keys, trailing_pages=3))
+        self.run_probe(linker)
+        found, dram = PAGE_FOUND, PAGE_ON_DRAM
+        # m2 lacks its SWA page, so it is not found although its KV page is.
+        self.assertEqual(
+            linker._lookup_media["media"], {"m0": found | dram, "m1": found | dram, "m2": dram}
+        )
+        with patch.object(
+            linker.transfer, "page_states", side_effect=AssertionError("looked up")
+        ):
+            self.assertEqual(
+                linker._media_counts("media", _request(keys[:2], trailing_pages=2)),
+                ("dram", 2, 0, 0),
+            )
+            with self.assertRaisesRegex(RuntimeError, "lost a required payload"):
+                linker._media_counts("media", _request(keys, trailing_pages=3))
+        with patch.object(
+            linker.transfer, "page_states", wraps=linker.transfer.page_states
+        ) as lookup:
+            self.publish(linker, ["m9"])
+            self.publish(linker, ["m9"], name=PoolName.SWA)
+            self.assertEqual(
+                linker._media_counts("media", _request(["m9"], trailing_pages=1)),
+                ("dram", 1, 0, 0),
+            )
+            self.assertTrue(lookup.called)
+        linker.release_lookup("media")
+        self.assertNotIn("media", linker._lookup_media)
 
     def test_source_receipt_does_not_retire_durable_lookup_dependency(self):
         linker = self.make_linker()

@@ -264,6 +264,20 @@ class TestFlatMemoryAdmission(CustomTestCase):
             ).device_indices
         )
 
+    def test_control_log_reports_per_pass_cost_without_raising(self):
+        """The periodic control summary runs inside every scheduler pass."""
+        runtime = self.runtime
+        runtime._logs_control, runtime.control_log_seconds = True, 1e-9
+        runtime.begin_scheduler_pass()
+        for _ in range(2):
+            runtime.record_control_time("scheduler", 0.002)
+        with self.assertLogs(
+            "sglang.srt.mem_cache.flat_memory_cache", level="INFO"
+        ) as logs:
+            runtime.begin_scheduler_pass()
+        self.assertIn("2 passes, ms/pass scheduler=2.000", logs.output[-1])
+        self.assertIn("gloo", logs.output[-1])
+
     def test_window_rematch_runs_only_after_a_real_eviction(self):
         """A ready window state keeps its match until an eviction can drop its anchor."""
         req, state = self._restored()

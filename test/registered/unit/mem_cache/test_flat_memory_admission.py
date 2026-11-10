@@ -264,6 +264,29 @@ class TestFlatMemoryAdmission(CustomTestCase):
             ).device_indices
         )
 
+    def test_window_rematch_runs_only_after_a_real_eviction(self):
+        """A ready window state keeps its match until an eviction can drop its anchor."""
+        req, state = self._restored()
+        twin = self._req(rid="twin")
+        twin_state = self.runtime.prefetches[twin.rid]
+        self.assertEqual(twin_state.phase, "ready")
+
+        def admission_pass():
+            before = self.runtime._revalidated_requests
+            adder = self._adder()
+            self.runtime.prepare_admission([twin], adder, has_chunked_req=False)
+            self.runtime.finish_admission(adder, can_progress=True)
+            return self.runtime._revalidated_requests - before
+
+        self.assertEqual(admission_pass(), 0)
+        self.runtime._release_hold(state)
+        self.cache.evict(EvictParams(swa_num_tokens=64, num_tokens=64))
+        self.assertEqual(admission_pass(), 1)
+        # The lost anchor is noticed: the twin re-queries storage for the gap.
+        self.assertEqual(twin_state.phase, "query")
+        self.runtime.release_request(twin.rid)
+        self.runtime.release_request(req.rid)
+
     def test_early_release_reproduces_loss_with_real_swa_eviction(self):
         """The former early-unpin interleaving loses a genuinely restored prefix."""
         req, state = self._restored()

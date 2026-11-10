@@ -180,6 +180,9 @@ class UnifiedRadixCache(BasePrefixCache):
 
         assert params.tree_components is not None
         self.tree_components = tuple(params.tree_components)
+        # FLAT_MEMORY: tokens evicted across components; Flat skips anchor
+        # revalidation when an allocation evicted nothing.
+        self.evicted_tokens_total = 0
         self.enable_session_radix_cache = params.enable_session_radix_cache
         component_registry = COMPONENT_REGISTRY
         if params.component_registry_override:
@@ -662,6 +665,7 @@ class UnifiedRadixCache(BasePrefixCache):
         ):
             self.writing_check(write_back=True)
 
+        self.evicted_tokens_total += sum(tracker.values())
         # Report full-layer tokens only
         self.update_eviction_metrics(tracker[BASE_COMPONENT_TYPE], start_time)
         return EvictResult(

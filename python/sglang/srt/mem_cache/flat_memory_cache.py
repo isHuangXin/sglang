@@ -132,6 +132,8 @@ class _Prefetch(msgspec.Struct, kw_only=True):
     future: Future | None = None
     prepared: PreparedLinkerLoad | None = None
     phase: str = "query"
+    # Rank-agreed eviction epoch `result` was last matched in; -1 = never.
+    validated_epoch: int = -1
     hold_node: Any = None
     hold_params: Any = None
     cancelled: bool = False
@@ -227,8 +229,10 @@ class FlatMemoryCache:
             raise ValueError("Flat restore lease limits must be positive")
         # FLAT_MEMORY: Unleased requests revalidated and admitted per pass, so a
         # long waiting queue costs O(window) per pass. 0 disables the bound.
-        # Arbitrary; far above what one pass can admit.
-        self.admission_window = int(config.get("restore_admission_window", 128))
+        # One pass admits at most chunked_prefill_size / page_size requests (32
+        # at 8192 / 256) and holds at most 8 leases; each windowed request costs
+        # ~0.1 ms of radix rematch per pass, so 128 spent ~12 ms on spares.
+        self.admission_window = int(config.get("restore_admission_window", 32))
         if self.admission_window < 0:
             raise ValueError("Flat restore admission window must be non-negative")
         # FLAT_MEMORY: FC-GVA Table 2 write-time scope classification.
@@ -281,6 +285,10 @@ class FlatMemoryCache:
         if not math.isfinite(self.lease_timeout) or self.lease_timeout <= 0:
             raise ValueError("Flat restore_lease_timeout must be finite and positive")
         self._control_reducer = self._create_control_reducer(config)
+        # FLAT_MEMORY: only an eviction can drop a matched anchor, so a state
+        # matched in the current epoch needs no rematch.
+        self._evict_epoch = 0
+        self._evictions_seen = cache.evicted_tokens_total
 
     def _create_control_reducer(self, config: dict) -> ShmControlReducer | None:
         # FLAT_MEMORY: Collective at construction, which every TP rank reaches in
@@ -451,6 +459,7 @@ class FlatMemoryCache:
             restore_episode=req.storage_restore_timing.active,
             started=started,
             wait_since=started,
+            validated_epoch=self._evict_epoch,
             swa_evicted_before=req.kv.swa_evicted_seqlen if req.kv is not None else 0,
             original_device_tokens=device_hit_len,
             query_start=device_hit_len,
@@ -684,6 +693,7 @@ class FlatMemoryCache:
             state.admission_attempted = False
             if state.phase == "ready":
                 self._set_wait(state, "ready_admission")
+        self._note_evictions()
         self._refresh_stale_queries(self._admission_states)
         for lease in self._active_leases():
             if lease.phase == "ready":
@@ -747,12 +757,26 @@ class FlatMemoryCache:
             if self._select_restore(state, adder):
                 slots[ssd] -= 1
                 selected = True
-                self._revalidate_ready_unleased()
+                # A whole-window rematch costs ~0.1 ms per request; only an
+                # eviction by this private allocation can move another anchor.
+                if self._note_evictions():
+                    self._revalidate_ready_unleased()
             elif state.phase == "allocate":
                 # FLAT_MEMORY: A budget veto stops lower-priority candidates from
                 # overtaking it, so a large old restore cannot starve.
                 self._admission_candidate = state.req.rid
                 blocked = True
+
+    def _note_evictions(self) -> bool:
+        # FLAT_MEMORY: rank-agreed, so every rank skips or rematches the same states.
+        current = self.cache.evicted_tokens_total
+        evicted = self._reduce(
+            [int(current != self._evictions_seen)], torch.distributed.ReduceOp.MAX
+        )[0]
+        self._evictions_seen = current
+        if evicted:
+            self._evict_epoch += 1
+        return bool(evicted)
 
     def _revalidate_ready_unleased(self) -> None:
         # FLAT_MEMORY: Private allocation may evict another unleased ready hit.
@@ -860,7 +884,14 @@ class FlatMemoryCache:
         extra = extra or []
         if not states and not extra:
             return []
-        results = self._rematch(states)
+        # A state matched in this epoch keeps its result: no anchor it names was
+        # evicted, and inserts only extend device coverage. Its checks still run.
+        stale = [state for state in states if state.validated_epoch != self._evict_epoch]
+        fresh = iter(self._rematch(stale))
+        results = [
+            next(fresh) if state.validated_epoch != self._evict_epoch else state.result
+            for state in states
+        ]
         sizes = [len(result.device_indices) for result in results]
         now = time.monotonic()
         timed_out = [
@@ -878,6 +909,7 @@ class FlatMemoryCache:
         if minima != maxima:
             raise RuntimeError("Flat restore device anchor differs across TP ranks")
         for state, result, expired in zip(states, results, timed_out):
+            state.validated_epoch = self._evict_epoch
             self._apply_revalidation(state, result, timed_out=bool(expired))
         return reduced_extra
 

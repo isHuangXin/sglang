@@ -382,20 +382,24 @@ class FlatMemoryDirectLinker(UnifiedCacheLinker):
                 "Flat backup wait must be nonnegative and drain timeout positive"
             )
         self.layer_done_counter = LayerLoadCounter(self.num_layers)
+        # FLAT_MEMORY: probes are independent per request and release the GIL in
+        # the native lookup and its master RPC; one worker queued them for
+        # 0.2-4 s at 6 QPS. 4 is arbitrary; not tuned on a real run.
         self._lookup_executor = ThreadPoolExecutor(
-            max_workers=1, thread_name_prefix="flat-query"
+            max_workers=max(1, int(config.get("lookup_workers", 4))),
+            thread_name_prefix="flat-query",
         )
+        # FLAT_MEMORY: one worker per lease FlatMemoryCache may grant, so a
+        # granted lease never queues for a thread (same keys, same defaults).
+        ssd_leases = max(1, int(config.get("restore_max_ssd_leases", 4)))
+        dram_leases = max(1, int(config.get("restore_max_dram_leases", 4)))
         self._dispatch_executor = ThreadPoolExecutor(
-            max_workers=1, thread_name_prefix="flat-dispatch"
+            max_workers=ssd_leases + dram_leases, thread_name_prefix="flat-dispatch"
         )
         self._dram_executor = ThreadPoolExecutor(
-            max_workers=1, thread_name_prefix="flat-dram"
+            max_workers=dram_leases, thread_name_prefix="flat-dram"
         )
-        # FLAT_MEMORY: one worker per SSD lease FlatMemoryCache may grant, so a
-        # granted lease never queues for a thread (same key, same default).
-        self._ssd_executor = SSDReadExecutor(
-            workers=max(1, int(config.get("restore_max_ssd_leases", 4)))
-        )
+        self._ssd_executor = SSDReadExecutor(workers=ssd_leases)
         self._write_executor = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="flat-write"
         )
@@ -1066,6 +1070,21 @@ class FlatMemoryDirectLinker(UnifiedCacheLinker):
         if result.unsafe:
             raise FlatUnsafeIOError(result.error)
         return result.success
+
+    def peek_completed_offload_results(self, limit: int) -> list[FlatWriteResult]:
+        # FLAT_MEMORY: Read-only; peer stand-ins retire only at the gated pop.
+        with self._lock:
+            results = []
+            for offload in self._offloads:
+                if len(results) >= limit or not offload.future.done():
+                    break
+                result = offload.future.result()
+                results.append(
+                    FlatWriteResult(success=result)
+                    if isinstance(result, bool)
+                    else result
+                )
+            return results
 
     def pop_completed_offload_result(self) -> FlatWriteResult:
         with self._lock:

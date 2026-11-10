@@ -160,6 +160,12 @@ class _Storage:
             count += 1
         return count
 
+    def peek_completed_offload_results(self, limit):
+        return [
+            future.result()
+            for future in self.backups[: min(limit, self.num_completed_offloads())]
+        ]
+
     def pop_completed_offload_result(self):
         future = self.backups.pop(0)
         self.source_safe.discard(future)

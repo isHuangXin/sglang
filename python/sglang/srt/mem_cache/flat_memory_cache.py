@@ -18,6 +18,10 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.base_prefix_cache import MatchPrefixParams, MatchResult
+from sglang.srt.mem_cache.flat_memory_control_reduce import (
+    ShmControlReducer,
+    control_reduce_group,
+)
 from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.srt.mem_cache.storage.flat_memory.io_result import FlatUnsafeIOError
 from sglang.srt.mem_cache.storage.flat_memory.payload import (
@@ -80,6 +84,8 @@ _WAIT_BUCKETS = (
 # FLAT_MEMORY: Reclaim reports are reconciled every this many polls, since each
 # check costs a TP collective. Arbitrary.
 _RECLAIM_SYNC_POLLS = 64
+# Arbitrary; caps durable offloads retired per poll, extra ones wait a poll.
+_OFFLOAD_FLAG_SLOTS = 64
 # Bound for the page -> node map; arbitrary, rebuilt from live nodes past it.
 _MAX_PAGE_NODES = 1 << 22
 
@@ -274,6 +280,24 @@ class FlatMemoryCache:
             raise ValueError("Flat drain_timeout must be finite and positive")
         if not math.isfinite(self.lease_timeout) or self.lease_timeout <= 0:
             raise ValueError("Flat restore_lease_timeout must be finite and positive")
+        self._control_reducer = self._create_control_reducer(config)
+
+    def _create_control_reducer(self, config: dict) -> ShmControlReducer | None:
+        # FLAT_MEMORY: Collective at construction, which every TP rank reaches in
+        # the same order; any rank that cannot share memory keeps all on gloo.
+        transport = config.get("tp_control_transport", "shm")
+        if transport not in ("shm", "gloo"):
+            raise ValueError(f"Flat tp_control_transport must be shm or gloo: {transport}")
+        group = control_reduce_group(self.cache) if transport == "shm" else None
+        if group is None:
+            return None
+        # Arbitrary; a rank this late has hung, and gloo would hang too.
+        timeout = float(config.get("tp_control_timeout", 1800.0))
+        reducer = ShmControlReducer.create(group=group, timeout=timeout)
+        logger.info(
+            "Flat TP control reduce transport: %s", "shm" if reducer else "gloo"
+        )
+        return reducer
 
     @property
     def manager(self):
@@ -487,19 +511,44 @@ class FlatMemoryCache:
 
     @_timed_control
     def _reduce(self, values: list[int], op) -> list[int]:
-        tensor = torch.tensor(values, dtype=torch.int, device="cpu")
         started = time.monotonic()
         try:
+            if self._control_reducer is not None:
+                reduced = self._control_reducer.all_reduce(values, op)
+                if reduced is not None:
+                    return reduced
+            tensor = torch.tensor(values, dtype=torch.int, device="cpu")
             self.cache._all_reduce_attn_groups(tensor, op)
+            return tensor.tolist()
         finally:
             # FLAT_MEMORY: Includes waiting for peers, not just transport execution.
             self.record_control_time("reduce_collective", time.monotonic() - started)
-        return tensor.tolist()
+
+    def _reduce_fused(self, segments: list[tuple[list[int], Any]]) -> list[list[int]]:
+        # FLAT_MEMORY: One gloo MIN collective; MAX segments travel negated.
+        # A collective costs ~0.3-1.1 ms at TP8 regardless of length.
+        packed = []
+        for values, op in segments:
+            if op == torch.distributed.ReduceOp.MIN:
+                packed.extend(values)
+            elif op == torch.distributed.ReduceOp.MAX:
+                packed.extend(-value for value in values)
+            else:
+                raise ValueError(f"Unsupported fused reduce op: {op}")
+        reduced = self._reduce(packed, torch.distributed.ReduceOp.MIN) if packed else []
+        parts, offset = [], 0
+        for values, op in segments:
+            part = reduced[offset : offset + len(values)]
+            offset += len(values)
+            parts.append(
+                part
+                if op == torch.distributed.ReduceOp.MIN
+                else [-value for value in part]
+            )
+        return parts
 
     @_timed_control
     def poll(self) -> None:
-        self._poll_offloads()
-        self._sync_reclaimed()
         self.cache_linker.poll_queries()
         self._log_metrics()
         # FLAT_MEMORY: Every rank visits the same request list, never worker order.
@@ -509,59 +558,92 @@ class FlatMemoryCache:
             for rid, state in self._streaming.items()
             if rid not in self.prefetches
         ]
+        if not states and not streams and not self.pending_offloads:
+            # FLAT_MEMORY: All three are rank-consistent, so every rank skips alike.
+            self._sync_reclaimed()
+            return
+        leases = self._active_leases() if states else []
+        now = time.monotonic()
+        offload_counts, offload_flags = self._offload_flags()
+        query_flags, query_failures = self._query_flags(states, now=now)
+        reads = states + streams
+        read_done, read_errors, read_nearly = self._read_flags(reads)
+        # FLAT_MEMORY: All inputs are sampled before any transition, as the
+        # sequential collectives did; transitions below keep their old order.
+        (
+            offload_counts,
+            offload_flags,
+            query_flags,
+            query_failures,
+            lease_expired,
+            read_done,
+            read_errors,
+            read_nearly,
+        ) = self._reduce_fused(
+            [
+                (offload_counts, torch.distributed.ReduceOp.MIN),
+                (offload_flags, torch.distributed.ReduceOp.MAX),
+                (query_flags, torch.distributed.ReduceOp.MIN),
+                (query_failures, torch.distributed.ReduceOp.MAX),
+                (self._lease_flags(leases, now=now), torch.distributed.ReduceOp.MAX),
+                (read_done, torch.distributed.ReduceOp.MIN),
+                (read_errors, torch.distributed.ReduceOp.MAX),
+                (read_nearly, torch.distributed.ReduceOp.MIN),
+            ]
+        )
+        self._apply_offloads(offload_counts, offload_flags)
+        self._sync_reclaimed()
         if not states and not streams:
             return
-        now = time.monotonic()
-        query_flags = self._reduce(
-            [
-                value
-                for s in states
-                for value in (
-                    int(
-                        s.phase == "query" and s.future is not None and s.future.done()
-                    ),
-                    int(
-                        not s.allocation_wait_deadline
-                        or s.phase not in ("query", "allocate")
-                        or now < s.allocation_wait_deadline
-                    ),
-                    int(
-                        not s.refresh_deadline
-                        or s.phase != "query"
-                        or now < s.refresh_deadline
-                    ),
-                )
-            ],
-            torch.distributed.ReduceOp.MIN,
-        )
-        for state, ready, unexpired, refresh_unexpired in zip(
-            states, query_flags[::3], query_flags[1::3], query_flags[2::3]
+        for state, ready, unexpired, refresh_unexpired, failed in zip(
+            states,
+            query_flags[::3],
+            query_flags[1::3],
+            query_flags[2::3],
+            query_failures,
         ):
             if not unexpired:
                 self._fallback(state, "allocation_wait_timeout")
             elif not refresh_unexpired:
                 self._fallback(state, "query_refresh_timeout")
             elif ready:
-                self._finish_query(state)
-        self._expire_leases()
-        self._poll_reads(states + streams)
+                self._finish_query(state, failed=bool(failed))
+        self._apply_lease_expiry(leases, lease_expired)
+        self._apply_reads(reads, read_done, read_errors, read_nearly)
         for state in states:
             if state.cancelled and state.phase == "ready":
                 self._forget(state)
 
-    def _finish_query(self, state: _Prefetch) -> None:
+    def _query_flags(
+        self, states: list[_Prefetch], *, now: float
+    ) -> tuple[list[int], list[int]]:
+        flags, failures = [], []
+        for s in states:
+            done = s.phase == "query" and s.future is not None and s.future.done()
+            flags += (
+                int(done),
+                int(
+                    not s.allocation_wait_deadline
+                    or s.phase not in ("query", "allocate")
+                    or now < s.allocation_wait_deadline
+                ),
+                int(not s.refresh_deadline or s.phase != "query" or now < s.refresh_deadline),
+            )
+            # Only read where every rank agrees the query is done.
+            failures.append(int(done and s.future.exception() is not None))
+        return flags, failures
+
+    def _finish_query(self, state: _Prefetch, *, failed: bool) -> None:
         if state.cancelled:
             state.phase = "ready"
             return
-        failed = False
+        restorable = []
         try:
             restorable = state.future.result()
         except Exception:
-            failed = True
             self.io_errors += 1
             logger.exception("Flat storage lookup failed for request %s", state.req.rid)
-            restorable = []
-        if self._reduce([int(failed)], torch.distributed.ReduceOp.MAX)[0]:
+        if failed:
             self._fallback(state, "query_failed", count=False)
             return
         pages = self.tree_linker._sync_restorable_prefix(
@@ -716,11 +798,17 @@ class FlatMemoryCache:
         return dram + ssd
 
     def _agree_requests(self, requests: list) -> None:
-        identity = json.dumps([req.rid for req in requests], separators=(",", ":"))
+        # A rid containing NUL could alias another list; that only weakens this
+        # cross-rank check, and json.dumps cost ~2x as much at a 6K queue.
+        identity = "\0".join([req.rid for req in requests])
         digest = int.from_bytes(hashlib.sha256(identity.encode()).digest()[:4], "big")
         signature = [len(requests), digest & 0x7FFFFFFF]
-        minima = self._reduce(signature, torch.distributed.ReduceOp.MIN)
-        maxima = self._reduce(signature, torch.distributed.ReduceOp.MAX)
+        minima, maxima = self._reduce_fused(
+            [
+                (signature, torch.distributed.ReduceOp.MIN),
+                (signature, torch.distributed.ReduceOp.MAX),
+            ]
+        )
         if minima != maxima:
             raise RuntimeError("Flat restore admission queue differs across TP ranks")
 
@@ -737,53 +825,61 @@ class FlatMemoryCache:
         if not states:
             return
         generation = self.cache_linker.storage_generation
-        stale = self._reduce(
-            [
-                int(
-                    self._is_unleased(s)
-                    and s.future is not None
-                    and s.storage_probe_attempts < 2
-                    and s.queried_endpoint == s.query_start
-                    and s.queried_endpoint
-                    < len(s.key) // self.cache.page_size * self.cache.page_size
-                    and s.query_generation < generation
-                )
-                for s in states
-            ],
-            torch.distributed.ReduceOp.MAX,
-        )
-        unleased = [
-            (state, refresh)
-            for state, refresh in zip(states, stale)
-            if self._is_unleased(state)
+        stale = [
+            int(
+                self._is_unleased(s)
+                and s.future is not None
+                and s.storage_probe_attempts < 2
+                and s.queried_endpoint == s.query_start
+                and s.queried_endpoint
+                < len(s.key) // self.cache.page_size * self.cache.page_size
+                and s.query_generation < generation
+            )
+            for s in states
         ]
-        self._revalidate_unleased_many([state for state, _ in unleased])
-        for state, refresh in unleased:
+        was_unleased = [self._is_unleased(state) for state in states]
+        (stale,) = self._revalidate_unleased_many(
+            [state for state, keep in zip(states, was_unleased) if keep],
+            extra=[(stale, torch.distributed.ReduceOp.MAX)],
+        )
+        for state, refresh, keep in zip(states, stale, was_unleased):
+            if not keep:
+                continue
             if refresh and self._is_unleased(state) and state.phase == "ready":
                 self._refresh_query(state, state.result, reason="storage_generation")
 
     def _revalidate_unleased(self, state: _Prefetch) -> None:
         self._revalidate_unleased_many([state])
 
-    def _revalidate_unleased_many(self, states: list[_Prefetch]) -> None:
-        # FLAT_MEMORY: Three collectives per batch, independent of its size.
+    def _revalidate_unleased_many(
+        self, states: list[_Prefetch], *, extra: list | None = None
+    ) -> list[list[int]]:
+        # FLAT_MEMORY: One collective per batch, independent of its size; extra
+        # segments sampled before revalidation share it and are returned reduced.
         # Per-state handling only edits that state, so batching keeps the order.
-        if not states:
-            return
+        extra = extra or []
+        if not states and not extra:
+            return []
         results = self._rematch(states)
+        sizes = [len(result.device_indices) for result in results]
         now = time.monotonic()
-        timed_out = self._reduce(
+        timed_out = [
+            int(bool(state.allocation_wait_deadline) and now >= state.allocation_wait_deadline)
+            for state in states
+        ]
+        minima, maxima, timed_out, *reduced_extra = self._reduce_fused(
             [
-                int(
-                    bool(state.allocation_wait_deadline)
-                    and now >= state.allocation_wait_deadline
-                )
-                for state in states
-            ],
-            torch.distributed.ReduceOp.MAX,
+                (sizes, torch.distributed.ReduceOp.MIN),
+                (sizes, torch.distributed.ReduceOp.MAX),
+                (timed_out, torch.distributed.ReduceOp.MAX),
+                *extra,
+            ]
         )
+        if minima != maxima:
+            raise RuntimeError("Flat restore device anchor differs across TP ranks")
         for state, result, expired in zip(states, results, timed_out):
             self._apply_revalidation(state, result, timed_out=bool(expired))
+        return reduced_extra
 
     def _apply_revalidation(
         self, state: _Prefetch, result: MatchResult, *, timed_out: bool
@@ -841,16 +937,11 @@ class FlatMemoryCache:
     def _rematch(self, states: list[_Prefetch]) -> list[MatchResult]:
         self._revalidated_requests += len(states)
         # FLAT_MEMORY: A metadata-only query's original node/indices may be evicted.
-        results = [
+        # The caller agrees the anchor sizes across ranks.
+        return [
             self.cache.match_prefix(MatchPrefixParams(key=state.key))
             for state in states
         ]
-        sizes = [len(result.device_indices) for result in results]
-        minima = self._reduce(sizes, torch.distributed.ReduceOp.MIN)
-        maxima = self._reduce(sizes, torch.distributed.ReduceOp.MAX)
-        if minima != maxima:
-            raise RuntimeError("Flat restore device anchor differs across TP ranks")
-        return results
 
     def _refresh_query(
         self, state: _Prefetch, result: MatchResult, *, reason: str = "anchor_gap"
@@ -937,7 +1028,7 @@ class FlatMemoryCache:
         )
         state.allocation_plan_attempts += 1
         self._diagnose(state, allocation_plan_attempts=state.allocation_plan_attempts)
-        can_restore, never_fits, wait_eligible = self._sync_plan(plan)
+        can_restore, never_fits, wait_eligible, reservation = self._sync_plan(plan)
         state.allocation_wait_eligible = wait_eligible
         if not can_restore:
             self._observe_plan_gate(state, plan)
@@ -957,7 +1048,7 @@ class FlatMemoryCache:
                 )
             return False
         self._finish_allocation_wait(state, "budget_available")
-        state.full_reservation, state.swa_reservation = self._sync_reservation(plan)
+        state.full_reservation, state.swa_reservation = reservation
         state.read_anchor_tokens = device_tokens
         state.read_endpoint = state.queried_endpoint
         state.loaded_tokens = state.read_endpoint - device_tokens
@@ -977,7 +1068,7 @@ class FlatMemoryCache:
         self._prepare(state, keys=keys)
         return True
 
-    def _sync_plan(self, plan) -> tuple[bool, bool, bool]:
+    def _sync_plan(self, plan) -> tuple[bool, bool, bool, tuple[int, int]]:
         # FLAT_MEMORY: Durability-only backups cannot release additional GPU pages.
         # Source ownership is a retry opportunity, never speculative capacity credit.
         wait_eligible = plan.can_restore or (
@@ -985,16 +1076,24 @@ class FlatMemoryCache:
             and plan.reason in ("full_decode_headroom", "swa_decode_headroom")
             and self.tree_linker.source_lock_count > 0
         )
-        can_restore, wait_eligible = self._reduce(
-            [int(plan.can_restore), int(wait_eligible)], torch.distributed.ReduceOp.MIN
+        # The reservation rides along; callers use it only when can_restore.
+        (can_restore, wait_eligible), (never_fits, full, swa) = self._reduce_fused(
+            [
+                (
+                    [int(plan.can_restore), int(wait_eligible)],
+                    torch.distributed.ReduceOp.MIN,
+                ),
+                (
+                    [int(plan.never_fits), plan.full_reservation, plan.swa_reservation],
+                    torch.distributed.ReduceOp.MAX,
+                ),
+            ]
         )
-        never_fits = self._reduce(
-            [int(plan.never_fits)], torch.distributed.ReduceOp.MAX
-        )[0]
         return (
             bool(can_restore),
             bool(never_fits),
             bool(wait_eligible and not never_fits),
+            (full, swa),
         )
 
     def _observe_plan_gate(self, state: _Prefetch, plan) -> None:
@@ -1046,13 +1145,6 @@ class FlatMemoryCache:
             )
             state.allocation_wait_started = 0.0
 
-    def _sync_reservation(self, plan) -> tuple[int, int]:
-        full, swa = self._reduce(
-            [plan.full_reservation, plan.swa_reservation],
-            torch.distributed.ReduceOp.MAX,
-        )
-        return full, swa
-
     def _revalidate_lease(self, state: _Prefetch, adder) -> None:
         self.carry_reservation(adder, exclude=state.req.rid)
         plan = adder.plan_flat_restore(
@@ -1061,11 +1153,11 @@ class FlatMemoryCache:
             full_tokens=0,
             swa_tokens=0,
         )
-        can_restore, never_fits, _ = self._sync_plan(plan)
+        can_restore, never_fits, _, reservation = self._sync_plan(plan)
         if never_fits:
             self._fallback(state, "ready_never_fits")
         elif can_restore:
-            state.full_reservation, state.swa_reservation = self._sync_reservation(plan)
+            state.full_reservation, state.swa_reservation = reservation
             self._set_wait(state, "ready_admission")
         else:
             self._observe_plan_gate(state, plan)
@@ -1123,6 +1215,19 @@ class FlatMemoryCache:
         self.cache_linker.start_preparing_loads()
 
     def _poll_reads(self, states: list[_Prefetch]) -> None:
+        done, errors, nearly = self._read_flags(states)
+        done, errors, nearly = self._reduce_fused(
+            [
+                (done, torch.distributed.ReduceOp.MIN),
+                (errors, torch.distributed.ReduceOp.MAX),
+                (nearly, torch.distributed.ReduceOp.MIN),
+            ]
+        )
+        self._apply_reads(states, done, errors, nearly)
+
+    def _read_flags(
+        self, states: list[_Prefetch]
+    ) -> tuple[list[int], list[int], list[int]]:
         done, errors, nearly = [], [], []
         for state in states:
             ready, failed = False, False
@@ -1136,10 +1241,18 @@ class FlatMemoryCache:
             done.append(int(ready))
             errors.append(int(failed))
             nearly.append(int(not ready and self._near_done(state)))
-        done = self._reduce(done, torch.distributed.ReduceOp.MIN)
-        errors = self._reduce(errors, torch.distributed.ReduceOp.MAX)
-        if self.layer_wise_restore:
-            nearly = self._reduce(nearly, torch.distributed.ReduceOp.MIN)
+        # _near_done is False without layer-wise restore, so no extra segment then.
+        return done, errors, nearly if self.layer_wise_restore else []
+
+    def _apply_reads(
+        self,
+        states: list[_Prefetch],
+        done: list[int],
+        errors: list[int],
+        nearly: list[int],
+    ) -> None:
+        if not nearly:
+            nearly = [0] * len(states)
         for state, ready, failed, near in zip(states, done, errors, nearly):
             if state.streaming:
                 if ready and failed:
@@ -1328,8 +1441,12 @@ class FlatMemoryCache:
         states = self._admission_states
         if states:
             admitted = [int(state.admitted) for state in states]
-            minima = self._reduce(admitted, torch.distributed.ReduceOp.MIN)
-            maxima = self._reduce(admitted, torch.distributed.ReduceOp.MAX)
+            minima, maxima = self._reduce_fused(
+                [
+                    (admitted, torch.distributed.ReduceOp.MIN),
+                    (admitted, torch.distributed.ReduceOp.MAX),
+                ]
+            )
             if minima != maxima:
                 raise RuntimeError("Flat request admission differs across TP ranks")
             for state, accepted in zip(states, minima):
@@ -1437,23 +1554,19 @@ class FlatMemoryCache:
                 self._handoff(state)
                 self._forget(state, keep_arrival=True)
 
-    def _expire_leases(self) -> None:
-        leases = self._active_leases()
-        if not leases:
-            return
-        now = time.monotonic()
+    def _lease_flags(self, leases: list[_Prefetch], *, now: float) -> list[int]:
         # FLAT_MEMORY: A ready lease behind a running chunked prefill is waiting on
         # compute that is making progress, not on a stuck read.
-        expired = self._reduce(
-            [
-                int(
-                    now - state.lease_started >= self.lease_timeout
-                    and not (state.phase == "ready" and self._prefill_busy)
-                )
-                for state in leases
-            ],
-            torch.distributed.ReduceOp.MAX,
-        )
+        return [
+            int(
+                now - state.lease_started >= self.lease_timeout
+                and not (state.phase == "ready" and self._prefill_busy)
+            )
+            for state in leases
+        ]
+
+    def _apply_lease_expiry(self, leases: list[_Prefetch], expired: list[int]) -> None:
+        # A lease the query step already revoked keeps its first reason.
         for state, lapsed in zip(leases, expired):
             if lapsed and not state.revoke_reason:
                 self._fallback(state, "lease_expired")
@@ -1641,33 +1754,47 @@ class FlatMemoryCache:
         self.tree_linker.replace_pending_offload_node(ack_id, old_node_id, new_node_ids)
 
     def _poll_offloads(self) -> None:
-        source_count, durable_count = self._reduce(
+        self._apply_offloads(*self._fused_offload_flags())
+
+    def _fused_offload_flags(self) -> tuple[list[int], list[int]]:
+        counts, flags = self._offload_flags()
+        return self._reduce_fused(
             [
-                self.tree_linker.num_source_safe_offloads(),
-                self.tree_linker.num_completed_offloads(),
-            ],
-            torch.distributed.ReduceOp.MIN,
+                (counts, torch.distributed.ReduceOp.MIN),
+                (flags, torch.distributed.ReduceOp.MAX),
+            ]
         )
+
+    def _offload_flags(self) -> tuple[list[int], list[int]]:
+        counts = [
+            self.tree_linker.num_source_safe_offloads(),
+            self.tree_linker.num_completed_offloads(),
+        ]
+        # FLAT_MEMORY: Fixed-width slots let the outcome flags share the count
+        # collective; every rank holds at least the agreed MIN of completions.
+        results = self.cache_linker.peek_completed_offload_results(
+            _OFFLOAD_FLAG_SLOTS
+        )
+        flags = [0] * (4 * _OFFLOAD_FLAG_SLOTS)
+        for slot, result in enumerate(results):
+            flags[4 * slot : 4 * slot + 4] = (
+                int(not result.success),
+                int(result.capacity_rejected),
+                int(not result.success and not result.capacity_rejected),
+                int(result.unsafe),
+            )
+        return counts, flags
+
+    def _apply_offloads(self, counts: list[int], slot_flags: list[int]) -> None:
+        source_count, durable_count = counts
+        # Completions past the slot window retire on a later poll.
+        durable_count = min(durable_count, _OFFLOAD_FLAG_SLOTS)
         successes = []
         if durable_count:
-            results = [
+            for _ in range(durable_count):
                 self.cache_linker.pop_completed_offload_result()
-                for _ in range(durable_count)
-            ]
             # FLAT_MEMORY: Pressure on one rank must not mask another rank's I/O error.
-            flags = self._reduce(
-                [
-                    flag
-                    for result in results
-                    for flag in (
-                        int(not result.success),
-                        int(result.capacity_rejected),
-                        int(not result.success and not result.capacity_rejected),
-                        int(result.unsafe),
-                    )
-                ],
-                torch.distributed.ReduceOp.MAX,
-            )
+            flags = slot_flags[: 4 * durable_count]
             if any(flags[3::4]):
                 raise FlatUnsafeIOError(
                     "Flat offload did not quiesce on every TP rank; "
@@ -1733,6 +1860,9 @@ class FlatMemoryCache:
     def close(self) -> None:
         self.reset()
         self.tree_linker.close()
+        if self._control_reducer is not None:
+            self._control_reducer.close()
+            self._control_reducer = None
 
     def start_layer_wise_loading(self) -> int:
         # Flat loads complete before admission, so no forward-stream layer wait is needed.

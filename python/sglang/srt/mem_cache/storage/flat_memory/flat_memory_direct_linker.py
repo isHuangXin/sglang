@@ -306,6 +306,8 @@ class FlatMemoryDirectLinker(UnifiedCacheLinker):
                 # full instead of being split eight ways.
                 native_config.dram_shared = True
                 native_config.store_owner = self.offload_owner
+                # FLAT_MEMORY: pin after the handover, so the owner and peers pin at once.
+                native_config.defer_dram_gpu_registration = True
                 # Under memfd every rank maps the same pages, so they all share
                 # the owner's segment identity (0) and a GVA means the same
                 # thing everywhere. Under rdma a peer must distinguish the
@@ -327,6 +329,7 @@ class FlatMemoryDirectLinker(UnifiedCacheLinker):
                     dram_bytes=int(native_config.dram_capacity_gb * 1024**3),
                     owner=native_config.store_owner,
                     share_dram=native_config.dram_share_mode == "memfd",
+                    hugepages=str(config.get("dram_hugepages", "auto")),
                 )
                 native_config.dram_fd = self._segments.dram_fd
                 native_config.index_fd = self._segments.index_fd
@@ -422,6 +425,12 @@ class FlatMemoryDirectLinker(UnifiedCacheLinker):
         return identity
 
     def _create_manager(self):
+        manager = self._build_manager()
+        if self._native_config is not None and self._native_config.defer_dram_gpu_registration:
+            manager.register_dram_gpu_access()
+        return manager
+
+    def _build_manager(self):
         # The owner must have formatted the shared index, mapped the DRAM segment
         # and preallocated the pool file before any peer attaches to them, and
         # must not tear them down while a peer is still mapped. Barriering here

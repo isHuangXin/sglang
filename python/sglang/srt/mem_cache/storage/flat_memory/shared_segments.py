@@ -20,9 +20,12 @@ segment base address.
 """
 
 import fcntl
+import logging
 import mmap
 import os
 import socket
+
+logger = logging.getLogger(__name__)
 
 # Mirrors kSharedIndexSlots and SharedBlockIndex's 64-byte header plus 40-byte
 # slots in src/flat_memory/include/shared_block_index.h. The native side
@@ -32,6 +35,50 @@ _INDEX_SLOTS = 1 << 21
 _INDEX_BYTES = 64 + _INDEX_SLOTS * 40
 
 _CONNECT_TIMEOUT_S = 120.0
+
+# Pinning 512 GiB of 4 KiB pages takes each rank minutes; 2 MiB pages cut the
+# page count 512x. They come from the reserved pool (vm.nr_hugepages).
+_HUGE_PAGE_BYTES = 2 << 20
+_FREE_HUGE_PAGES = "/sys/kernel/mm/hugepages/hugepages-2048kB/free_hugepages"
+
+
+def _cgroup_huge_page_headroom() -> int:
+    # A Kubernetes pod without a hugepages-2Mi request has hugetlb.2MB.max = 0 on
+    # its pod slice, so free host pages are still unusable here (mmap ENOMEM).
+    try:
+        with open("/proc/self/cgroup") as f:
+            path = next(line.split(":", 2)[2].strip() for line in f if line.startswith("0::"))
+    except (OSError, StopIteration):
+        return 1 << 62
+    headroom = 1 << 62
+    while True:
+        base = "/sys/fs/cgroup" + (path if path != "/" else "")
+        # Both the usage and the reservation limit gate a MAP_SHARED hugetlb mmap.
+        for kind in ("", ".rsvd"):
+            try:
+                with open(f"{base}/hugetlb.2MB{kind}.max") as f:
+                    limit = f.read().strip()
+                with open(f"{base}/hugetlb.2MB{kind}.current") as f:
+                    current = int(f.read())
+                if limit != "max":
+                    headroom = min(headroom, max(int(limit) - current, 0))
+            except (OSError, ValueError):
+                pass
+        if path in ("", "/"):
+            return headroom
+        path = os.path.dirname(path)
+
+
+def _free_huge_page_bytes() -> int:
+    try:
+        with open(_FREE_HUGE_PAGES) as f:
+            free = int(f.read())
+        # Free pages still count the ones other mappings have reserved.
+        with open(_FREE_HUGE_PAGES.replace("free_hugepages", "resv_hugepages")) as f:
+            free = (free - int(f.read())) * _HUGE_PAGE_BYTES
+    except (OSError, ValueError):
+        return 0
+    return min(free, _cgroup_huge_page_headroom())
 
 
 class FlatSharedSegments:
@@ -45,12 +92,17 @@ class FlatSharedSegments:
         dram_bytes: int,
         owner: bool,
         share_dram: bool = True,
+        hugepages: str = "auto",
     ):
+        if hugepages not in ("auto", "on", "off"):
+            raise ValueError(f"dram_hugepages must be auto, on or off, got {hugepages!r}")
         # Abstract socket namespace (leading NUL): no filesystem entry, so a
         # crashed run leaves nothing behind for the next one to trip over.
         self._address = "\0" + token[:100]
         self._peers = peers
-        self._dram_bytes = dram_bytes
+        # Whole huge pages either way, so owner and peers agree on the size.
+        self._dram_bytes = -(-dram_bytes // _HUGE_PAGE_BYTES) * _HUGE_PAGE_BYTES
+        self._hugepages = hugepages
         self._owner = owner
         self._share_dram = share_dram
         self._listener: socket.socket | None = None
@@ -65,7 +117,7 @@ class FlatSharedSegments:
         # Owner-supplied text the peers need before they construct a manager.
         self.payload = ""
         if owner:
-            self._create(dram_bytes=dram_bytes)
+            self._create(dram_bytes=self._dram_bytes)
 
     def _create(self, *, dram_bytes: int) -> None:
         self.index_fd = os.memfd_create(
@@ -74,9 +126,10 @@ class FlatSharedSegments:
         os.ftruncate(self.index_fd, _INDEX_BYTES)
         fds = [self.index_fd]
         if self._share_dram:
-            self.dram_fd = os.memfd_create(
-                "flat_dram", os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING
-            )
+            flags = os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING
+            if self._use_hugepages(dram_bytes):
+                flags |= os.MFD_HUGETLB | os.MFD_HUGE_2MB
+            self.dram_fd = os.memfd_create("flat_dram", flags)
             os.ftruncate(self.dram_fd, dram_bytes)
             fds.append(self.dram_fd)
         # Sealing makes the size part of the handed-over object: a peer cannot
@@ -90,6 +143,26 @@ class FlatSharedSegments:
         self._listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self._listener.bind(self._address)
         self._listener.listen(max(self._peers, 1))
+
+    def _use_hugepages(self, dram_bytes: int) -> bool:
+        if self._hugepages == "off":
+            return False
+        free = _free_huge_page_bytes()
+        if free >= dram_bytes:
+            logger.info("Flat DRAM segment uses 2 MiB huge pages (%d GiB free)", free >> 30)
+            return True
+        if self._hugepages == "on":
+            raise RuntimeError(
+                f"dram_hugepages=on needs {dram_bytes >> 30} GiB of free 2 MiB huge pages "
+                f"but {free >> 30} GiB are usable; reserve them with vm.nr_hugepages "
+                f"(and, in a Kubernetes pod, request hugepages-2Mi)"
+            )
+        logger.warning(
+            "Flat DRAM segment uses 4 KiB pages: %d GiB of free 2 MiB huge pages, "
+            "%d GiB needed; startup pinning will be slow",
+            free >> 30, dram_bytes >> 30,
+        )
+        return False
 
     def rearm(self) -> None:
         """Allow a second handover of the payload after the managers are rebuilt.

@@ -198,6 +198,8 @@ class FlatMemoryCache:
         self._prefill_busy = False
         self._admission_candidate: str | None = None
         self._admission_states: list[_Prefetch] = []
+        # None outside a pass; inside one, only these requests may be admitted.
+        self._admission_rids: set[str] | None = None
         self._last_metrics_log = 0.0
         self._control_seconds = dict.fromkeys(_CONTROL_NAMES, 0.0)
         self._control_calls = dict.fromkeys(_CONTROL_NAMES, 0)
@@ -217,6 +219,12 @@ class FlatMemoryCache:
         self.max_dram_leases = int(config.get("restore_max_dram_leases", 4))
         if self.max_ssd_leases < 1 or self.max_dram_leases < 1:
             raise ValueError("Flat restore lease limits must be positive")
+        # FLAT_MEMORY: Unleased requests revalidated and admitted per pass, so a
+        # long waiting queue costs O(window) per pass. 0 disables the bound.
+        # Arbitrary; far above what one pass can admit.
+        self.admission_window = int(config.get("restore_admission_window", 128))
+        if self.admission_window < 0:
+            raise ValueError("Flat restore admission window must be non-negative")
         # FLAT_MEMORY: FC-GVA Table 2 write-time scope classification.
         self.scope_media_hints = bool(config.get("scope_media_hints", True))
         # Paper tau has no published value. 8192 is about 2.5x the ~3K mean per-turn
@@ -587,9 +595,8 @@ class FlatMemoryCache:
         # FLAT_MEMORY: This stage is shared by all ranks, before the local add loop.
         requests = self.order_ready_requests(requests)
         self._agree_requests(requests)
-        self._admission_states = [
-            self.prefetches[req.rid] for req in requests if req.rid in self.prefetches
-        ]
+        self._admission_states = self._admission_window_states(requests)
+        self._admission_rids = {state.req.rid for state in self._admission_states}
         self._admission_candidate = None
         for state in self._admission_states:
             state.admission_attempted = False
@@ -611,6 +618,21 @@ class FlatMemoryCache:
                     self._set_wait(state, "chunked_prefill")
         self.carry_reservation(adder)
         return self.order_ready_requests(requests)
+
+    def _admission_window_states(self, requests: list) -> list[_Prefetch]:
+        # FLAT_MEMORY: Leases are always kept; requests is rank-agreed, so every
+        # rank picks the same window.
+        states, unleased = [], 0
+        for req in requests:
+            state = self.prefetches.get(req.rid)
+            if state is None:
+                continue
+            if req.rid not in self._leases:
+                if self.admission_window and unleased >= self.admission_window:
+                    continue
+                unleased += 1
+            states.append(state)
+        return states
 
     def _select_restores(self, adder) -> None:
         # FLAT_MEMORY: FC-MAS. DRAM and SSD restores hold separate lease slots,
@@ -652,11 +674,15 @@ class FlatMemoryCache:
 
     def _revalidate_ready_unleased(self) -> None:
         # FLAT_MEMORY: Private allocation may evict another unleased ready hit.
-        for state in self._admission_states:
-            if self._is_unleased(state) and state.phase == "ready":
-                self._revalidate_unleased(state)
-                if state.phase == "allocate":
-                    self._set_wait(state, "candidate_queue")
+        targets = [
+            state
+            for state in self._admission_states
+            if self._is_unleased(state) and state.phase == "ready"
+        ]
+        self._revalidate_unleased_many(targets)
+        for state in targets:
+            if state.phase == "allocate":
+                self._set_wait(state, "candidate_queue")
 
     def _rank_restores(self, candidates: list[_Prefetch]) -> list[_Prefetch]:
         # FLAT_MEMORY: Eq. 1 HRRN on SSD bytes; values are MAX-reduced so every
@@ -726,15 +752,42 @@ class FlatMemoryCache:
             ],
             torch.distributed.ReduceOp.MAX,
         )
-        for state, refresh in zip(states, stale):
-            if not self._is_unleased(state):
-                continue
-            self._revalidate_unleased(state)
+        unleased = [
+            (state, refresh)
+            for state, refresh in zip(states, stale)
+            if self._is_unleased(state)
+        ]
+        self._revalidate_unleased_many([state for state, _ in unleased])
+        for state, refresh in unleased:
             if refresh and self._is_unleased(state) and state.phase == "ready":
                 self._refresh_query(state, state.result, reason="storage_generation")
 
     def _revalidate_unleased(self, state: _Prefetch) -> None:
-        result = self._rematch(state)
+        self._revalidate_unleased_many([state])
+
+    def _revalidate_unleased_many(self, states: list[_Prefetch]) -> None:
+        # FLAT_MEMORY: Three collectives per batch, independent of its size.
+        # Per-state handling only edits that state, so batching keeps the order.
+        if not states:
+            return
+        results = self._rematch(states)
+        now = time.monotonic()
+        timed_out = self._reduce(
+            [
+                int(
+                    bool(state.allocation_wait_deadline)
+                    and now >= state.allocation_wait_deadline
+                )
+                for state in states
+            ],
+            torch.distributed.ReduceOp.MAX,
+        )
+        for state, result, expired in zip(states, results, timed_out):
+            self._apply_revalidation(state, result, timed_out=bool(expired))
+
+    def _apply_revalidation(
+        self, state: _Prefetch, result: MatchResult, *, timed_out: bool
+    ) -> None:
         state.result = result
         device_tokens = len(result.device_indices)
         if device_tokens >= state.queried_endpoint:
@@ -743,13 +796,7 @@ class FlatMemoryCache:
             if state.queried_endpoint > state.query_start:
                 self._diagnose(state, reason="device_covers_restore")
             return
-        if (
-            state.allocation_wait_deadline
-            and self._reduce(
-                [int(time.monotonic() >= state.allocation_wait_deadline)],
-                torch.distributed.ReduceOp.MAX,
-            )[0]
-        ):
+        if timed_out:
             self._fallback(state, "allocation_wait_timeout")
             return
         was_ready = state.phase == "ready"
@@ -791,16 +838,19 @@ class FlatMemoryCache:
         return not exhausted
 
     @_timed_control
-    def _rematch(self, state: _Prefetch) -> MatchResult:
-        self._revalidated_requests += 1
+    def _rematch(self, states: list[_Prefetch]) -> list[MatchResult]:
+        self._revalidated_requests += len(states)
         # FLAT_MEMORY: A metadata-only query's original node/indices may be evicted.
-        result = self.cache.match_prefix(MatchPrefixParams(key=state.key))
-        size = [len(result.device_indices)]
-        minima = self._reduce(size, torch.distributed.ReduceOp.MIN)
-        maxima = self._reduce(size, torch.distributed.ReduceOp.MAX)
+        results = [
+            self.cache.match_prefix(MatchPrefixParams(key=state.key))
+            for state in states
+        ]
+        sizes = [len(result.device_indices) for result in results]
+        minima = self._reduce(sizes, torch.distributed.ReduceOp.MIN)
+        maxima = self._reduce(sizes, torch.distributed.ReduceOp.MAX)
         if minima != maxima:
             raise RuntimeError("Flat restore device anchor differs across TP ranks")
-        return result
+        return results
 
     def _refresh_query(
         self, state: _Prefetch, result: MatchResult, *, reason: str = "anchor_gap"
@@ -1241,7 +1291,12 @@ class FlatMemoryCache:
 
     def is_ready(self, rid: str) -> bool:
         state = self.prefetches.get(rid)
-        return state is None or state.phase == "ready"
+        if state is None:
+            return True
+        # FLAT_MEMORY: Outside this pass's window the state was not revalidated.
+        if self._admission_rids is not None and rid not in self._admission_rids:
+            return False
+        return state.phase == "ready"
 
     def before_admission(self, req: Req, adder) -> None:
         state = self.prefetches.get(req.rid)
@@ -1321,6 +1376,7 @@ class FlatMemoryCache:
                 )
                 self._fallback(state, reason)
         self._admission_states = []
+        self._admission_rids = None
         self._admission_candidate = None
         self.carry_reservation(adder)
 
@@ -1669,6 +1725,7 @@ class FlatMemoryCache:
         self.arrivals.clear()
         self._page_nodes.clear()
         self._admission_states = []
+        self._admission_rids = None
         self._admission_candidate = None
         self._leases = []
         self._prefill_busy = False

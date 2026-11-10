@@ -724,7 +724,7 @@ class TestFlatMemoryAdmission(CustomTestCase):
         self.runtime.finish_admission(adder, can_progress=False)
         deadline = state.allocation_wait_deadline
         self.assertGreater(deadline, 0)
-        result = self.runtime._rematch(state)
+        result = self.runtime._rematch([state])[0]
         self.runtime._refresh_query(state, result)
         self.assertEqual(state.phase, "query")
         self.assertEqual(state.allocation_wait_deadline, deadline)

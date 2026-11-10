@@ -27,12 +27,22 @@ import socket
 
 logger = logging.getLogger(__name__)
 
-# Mirrors kSharedIndexSlots and SharedBlockIndex's 64-byte header plus 40-byte
-# slots in src/flat_memory/include/shared_block_index.h. The native side
-# fstats the fd and refuses to bind a short region, so a drift here fails at
-# startup instead of corrupting the table.
-_INDEX_SLOTS = 1 << 21
-_INDEX_BYTES = 64 + _INDEX_SLOTS * 40
+# SharedBlockIndex's 64-byte header plus 40-byte slots
+# (src/flat_memory/include/shared_block_index.h). The native side derives the
+# slot count from the fd size, so only the owner decides it.
+_INDEX_HEADER_BYTES = 64
+_INDEX_SLOT_BYTES = 40
+# FLAT_MEMORY: one slot per 16 KiB of DRAM+SSD capacity, rounded up to a power
+# of two. V4-Flash keys are 18-60 KiB, so a full store stays under ~50% load
+# instead of the fixed 2M slots filling after a few minutes of Qwen replay.
+_INDEX_BYTES_PER_SLOT = 16 << 10
+_MIN_INDEX_SLOTS = 1 << 21
+_MAX_INDEX_SLOTS = 1 << 28
+
+
+def index_slots_for(capacity_bytes: int) -> int:
+    need = max(_MIN_INDEX_SLOTS, -(-capacity_bytes // _INDEX_BYTES_PER_SLOT))
+    return min(_MAX_INDEX_SLOTS, 1 << (need - 1).bit_length())
 
 _CONNECT_TIMEOUT_S = 120.0
 
@@ -93,6 +103,7 @@ class FlatSharedSegments:
         owner: bool,
         share_dram: bool = True,
         hugepages: str = "auto",
+        index_slots: int = _MIN_INDEX_SLOTS,
     ):
         if hugepages not in ("auto", "on", "off"):
             raise ValueError(f"dram_hugepages must be auto, on or off, got {hugepages!r}")
@@ -103,6 +114,9 @@ class FlatSharedSegments:
         # Whole huge pages either way, so owner and peers agree on the size.
         self._dram_bytes = -(-dram_bytes // _HUGE_PAGE_BYTES) * _HUGE_PAGE_BYTES
         self._hugepages = hugepages
+        if index_slots <= 0 or index_slots & (index_slots - 1):
+            raise ValueError(f"index_slots must be a power of two, got {index_slots}")
+        self._index_bytes = _INDEX_HEADER_BYTES + index_slots * _INDEX_SLOT_BYTES
         self._owner = owner
         self._share_dram = share_dram
         self._listener: socket.socket | None = None
@@ -123,7 +137,7 @@ class FlatSharedSegments:
         self.index_fd = os.memfd_create(
             "flat_index", os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING
         )
-        os.ftruncate(self.index_fd, _INDEX_BYTES)
+        os.ftruncate(self.index_fd, self._index_bytes)
         fds = [self.index_fd]
         if self._share_dram:
             flags = os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING
@@ -258,9 +272,10 @@ class FlatSharedSegments:
         if not self._owner:
             return
         chunk = b"\0" * (1 << 20)
-        with mmap.mmap(self.index_fd, _INDEX_BYTES) as region:
-            for start in range(0, _INDEX_BYTES, len(chunk)):
-                end = min(start + len(chunk), _INDEX_BYTES)
+        size = os.fstat(self.index_fd).st_size
+        with mmap.mmap(self.index_fd, size) as region:
+            for start in range(0, size, len(chunk)):
+                end = min(start + len(chunk), size)
                 region[start:end] = chunk[: end - start]
 
     def close(self) -> None:

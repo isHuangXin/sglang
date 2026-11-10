@@ -46,6 +46,7 @@ from sglang.srt.mem_cache.storage.flat_memory.payload import (
 )
 from sglang.srt.mem_cache.storage.flat_memory.shared_segments import (
     FlatSharedSegments,
+    index_slots_for,
 )
 from sglang.srt.mem_cache.storage.flat_memory.ssd_executor import SSDReadExecutor
 from sglang.srt.mem_cache.unified_cache.unified_cache_linker import UnifiedCacheLinker
@@ -330,6 +331,20 @@ class FlatMemoryDirectLinker(UnifiedCacheLinker):
                     owner=native_config.store_owner,
                     share_dram=native_config.dram_share_mode == "memfd",
                     hugepages=str(config.get("dram_hugepages", "auto")),
+                    # FLAT_MEMORY: size the node-shared key index from the store
+                    # capacity; extra-config shared_index_slots overrides it.
+                    index_slots=int(
+                        config.get("shared_index_slots")
+                        or index_slots_for(
+                            int(
+                                (
+                                    native_config.dram_capacity_gb
+                                    + native_config.ssd_capacity_gb
+                                )
+                                * 1024**3
+                            )
+                        )
+                    ),
                 )
                 native_config.dram_fd = self._segments.dram_fd
                 native_config.index_fd = self._segments.index_fd

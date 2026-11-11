@@ -387,7 +387,9 @@ class FlatMemoryCache:
                 if state.phase in ("query", "read")
                 else "unknown"
             )
-            self._set_wait(state, bucket, now=now)
+            # Same bucket: the open interval keeps accruing, nothing to close.
+            if state.wait_bucket != bucket:
+                self._set_wait(state, bucket, now=now)
 
     def observe_scheduler_gate(self, reason: str, requests=None) -> None:
         # FLAT_MEMORY: Query/read ownership outranks gates; admission_tail must not
@@ -403,6 +405,7 @@ class FlatMemoryCache:
         for state in states:
             if (
                 state is None
+                or state.wait_bucket == reason
                 or state.admitted
                 or state.cancelled
                 or state.wait_finalized
@@ -670,8 +673,11 @@ class FlatMemoryCache:
         leases = self._active_leases() if states else []
         now = time.monotonic()
         offload_counts, offload_flags = self._offload_flags()
-        query_flags, query_failures = self._query_flags(states, now=now)
-        reads = states + streams
+        # FLAT_MEMORY: Phases are rank-agreed; a queued request past its query
+        # flags only no-ops, so poll stays O(in-flight), not O(waiting queue).
+        queries = [s for s in states if s.phase in ("query", "allocate")]
+        query_flags, query_failures = self._query_flags(queries, now=now)
+        reads = [s for s in states if s.phase == "read" or s.streaming] + streams
         read_done, read_errors, read_nearly = self._read_flags(reads)
         # FLAT_MEMORY: All inputs are sampled before any transition, as the
         # sequential collectives did; transitions below keep their old order.
@@ -702,7 +708,7 @@ class FlatMemoryCache:
             return
         finished = []
         for state, ready, unexpired, refresh_unexpired, failed in zip(
-            states,
+            queries,
             query_flags[::3],
             query_flags[1::3],
             query_flags[2::3],

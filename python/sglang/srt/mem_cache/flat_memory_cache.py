@@ -86,6 +86,8 @@ _WAIT_BUCKETS = (
 _RECLAIM_SYNC_POLLS = 64
 # Arbitrary; caps durable offloads retired per poll, extra ones wait a poll.
 _OFFLOAD_FLAG_SLOTS = 64
+# Arbitrary; bounds the per-pass scan for prefetch candidates in a long queue.
+_PREFETCH_SCAN_REQUESTS = 512
 # Bound for the page -> node map; arbitrary, rebuilt from live nodes past it.
 _MAX_PAGE_NODES = 1 << 22
 
@@ -220,21 +222,29 @@ class FlatMemoryCache:
         )
         self.max_prefetch_tokens = int(config.get("prefetch_max_tokens", 65536))
         # FLAT_MEMORY: FC-MAS queues; GPU pages are still gated by plan_flat_restore.
-        # The linker sizes its SSD executor from the same key. 4 overlaps one
-        # restore's lookup/Python time with others' I/O now that reads skip
-        # staging; not tuned on a real run. DRAM default is arbitrary.
-        self.max_ssd_leases = int(config.get("restore_max_ssd_leases", 4))
-        self.max_dram_leases = int(config.get("restore_max_dram_leases", 4))
+        # In-flight restores, not I/O threads (restore_ssd/dram_io_workers): with
+        # 4 leases at 4 SSD readers the drive idled while 100+ restores waited.
+        # 16 is arbitrary; each lease pins one request's restored pages.
+        self.max_ssd_leases = int(config.get("restore_max_ssd_leases", 16))
+        self.max_dram_leases = int(config.get("restore_max_dram_leases", 16))
         if self.max_ssd_leases < 1 or self.max_dram_leases < 1:
             raise ValueError("Flat restore lease limits must be positive")
         # FLAT_MEMORY: Unleased requests revalidated and admitted per pass, so a
         # long waiting queue costs O(window) per pass. 0 disables the bound.
         # One pass admits at most chunked_prefill_size / page_size requests (32
-        # at 8192 / 256) and holds at most 8 leases; each windowed request costs
+        # at 8192 / 256); each windowed request costs
         # ~0.1 ms of radix rematch per pass, so 128 spent ~12 ms on spares.
         self.admission_window = int(config.get("restore_admission_window", 32))
         if self.admission_window < 0:
             raise ValueError("Flat restore admission window must be non-negative")
+        # FLAT_MEMORY: Queued requests past the window also start reads, into free
+        # GPU pages only; this share of the full pool caps their unadmitted pages.
+        # 0 disables it. 0.1 is arbitrary; the pool ran ~30% used under load.
+        self.prefetch_pool_fraction = float(
+            config.get("restore_prefetch_pool_fraction", 0.1)
+        )
+        if not 0.0 <= self.prefetch_pool_fraction <= 1.0:
+            raise ValueError("Flat restore_prefetch_pool_fraction must be in [0, 1]")
         # FLAT_MEMORY: FC-GVA Table 2 write-time scope classification.
         self.scope_media_hints = bool(config.get("scope_media_hints", True))
         # Paper tau has no published value. 8192 is about 2.5x the ~3K mean per-turn
@@ -656,6 +666,7 @@ class FlatMemoryCache:
         self._sync_reclaimed()
         if not states and not streams:
             return
+        finished = []
         for state, ready, unexpired, refresh_unexpired, failed in zip(
             states,
             query_flags[::3],
@@ -668,7 +679,8 @@ class FlatMemoryCache:
             elif not refresh_unexpired:
                 self._fallback(state, "query_refresh_timeout")
             elif ready:
-                self._finish_query(state, failed=bool(failed))
+                finished.append((state, bool(failed)))
+        self._finish_queries(finished)
         self._apply_lease_expiry(leases, lease_expired)
         self._apply_reads(reads, read_done, read_errors, read_nearly)
         for state in states:
@@ -694,22 +706,49 @@ class FlatMemoryCache:
             failures.append(int(done and s.future.exception() is not None))
         return flags, failures
 
-    def _finish_query(self, state: _Prefetch, *, failed: bool) -> None:
-        if state.cancelled:
-            state.phase = "ready"
+    def _finish_queries(self, finished: list[tuple[_Prefetch, bool]]) -> None:
+        # FLAT_MEMORY: One collective for every query this poll finished, in rank-agreed
+        # order; a per-query gloo reduce made poll cost grow with the arrival rate.
+        pending = []
+        for state, failed in finished:
+            if state.cancelled:
+                state.phase = "ready"
+                continue
+            restorable = []
+            try:
+                restorable = state.future.result()
+            except Exception:
+                self.io_errors += 1
+                logger.exception(
+                    "Flat storage lookup failed for request %s", state.req.rid
+                )
+            if failed:
+                self._fallback(state, "query_failed", count=False)
+                continue
+            pending.append((state, restorable))
+        if not pending:
             return
-        restorable = []
-        try:
-            restorable = state.future.result()
-        except Exception:
-            self.io_errors += 1
-            logger.exception("Flat storage lookup failed for request %s", state.req.rid)
-        if failed:
-            self._fallback(state, "query_failed", count=False)
-            return
-        pages = self.tree_linker._sync_restorable_prefix(
-            restorable, num_pages=len(state.tail_hashes), device_hit_pages=0
-        )
+        # A 0/1 mask per query; MIN is AND, so the reduction intersects the
+        # per-rank sets of restorable prefix lengths.
+        masks = []
+        for state, restorable in pending:
+            mask = [0] * (len(state.tail_hashes) + 1)
+            for pages in restorable:
+                if 0 < pages < len(mask):
+                    mask[pages] = 1
+            masks.extend(mask)
+        common = self._reduce(masks, torch.distributed.ReduceOp.MIN)
+        offset = 0
+        for state, _ in pending:
+            width = len(state.tail_hashes) + 1
+            segment = common[offset : offset + width]
+            offset += width
+            pages = max(
+                (length for length, shared in enumerate(segment) if shared), default=0
+            )
+            self._finish_query(state, pages=pages)
+
+    def _finish_query(self, state: _Prefetch, *, pages: int) -> None:
         state.query_generation = self.cache_linker.get_lookup_generation(state.req.rid)
         state.queried_endpoint = state.query_start + pages * self.cache.page_size
         state.phase = "allocate" if pages else "ready"
@@ -756,6 +795,7 @@ class FlatMemoryCache:
         self._prefill_busy = has_chunked_req
         if not has_chunked_req or adder.can_run_list:
             self._select_restores(adder)
+            self._prefetch_ahead(requests, adder)
         else:
             for state in self._admission_states:
                 if state.phase == "allocate":
@@ -818,6 +858,76 @@ class FlatMemoryCache:
                 # overtaking it, so a large old restore cannot starve.
                 self._admission_candidate = state.req.rid
                 blocked = True
+
+    def _prefetch_ahead(self, requests: list, adder) -> None:
+        # FLAT_MEMORY: Arrival-order prefetch past the admission window, storage
+        # straight into private GPU pages; a vetoed window restore is never overtaken.
+        if not self.prefetch_pool_fraction or self._admission_candidate is not None:
+            return
+        leases = self._active_leases()
+        slots = {
+            True: self.max_ssd_leases - sum(bool(s.ssd_pages) for s in leases),
+            False: self.max_dram_leases - sum(not s.ssd_pages for s in leases),
+        }
+        candidates = self._prefetch_candidates(
+            requests, limit=max(0, slots[True]) + max(0, slots[False])
+        )
+        if not candidates:
+            return
+        free = self._prefetch_free_tokens(adder, leases=leases)
+        if free is None:
+            return
+        self._revalidate_unleased_many(candidates)
+        candidates = [state for state in candidates if state.phase == "allocate"]
+        if not candidates:
+            return
+        for state in self._rank_restores(candidates):
+            ssd = bool(state.ssd_pages)
+            if slots[ssd] <= 0:
+                continue
+            self.carry_reservation(adder)
+            if not self._select_restore(state, adder, prefetch_free=free):
+                return
+            slots[ssd] -= 1
+            if self._note_evictions():
+                # Remaining anchors may have moved; they rematch on a later pass.
+                self._revalidate_ready_unleased()
+                return
+
+    def _prefetch_candidates(self, requests: list, *, limit: int) -> list[_Prefetch]:
+        # requests is rank-agreed, so every rank picks the same states in order.
+        candidates = []
+        for req in requests[:_PREFETCH_SCAN_REQUESTS]:
+            if len(candidates) >= limit:
+                break
+            if req.rid in self._admission_rids:
+                continue
+            state = self.prefetches.get(req.rid)
+            if (
+                state is not None
+                and state.phase == "allocate"
+                and not state.bypass
+                and not state.lease_started
+            ):
+                candidates.append(state)
+        return candidates
+
+    def _prefetch_free_tokens(self, adder, *, leases: list[_Prefetch]) -> list[int] | None:
+        # FLAT_MEMORY: Free pages only, net of what unadmitted leases still need,
+        # so a prefetch never evicts the HBM prefix cache. MIN-agreed across ranks.
+        allocator = adder.token_to_kv_pool_allocator
+        if adder.is_hybrid_swa:
+            full_free = allocator.full_available_size()
+            swa_free = allocator.swa_available_size()
+        else:
+            full_free, swa_free = allocator.available_size(), 0
+        unadmitted = [state for state in leases if not state.admitted]
+        held = sum(state.loaded_tokens for state in unadmitted)
+        cap = int(self.prefetch_pool_fraction * allocator.size_full) - held
+        full = min(full_free - sum(s.full_reservation for s in unadmitted), cap)
+        swa = swa_free - sum(s.swa_reservation for s in unadmitted)
+        full, swa = self._reduce([full, swa], torch.distributed.ReduceOp.MIN)
+        return [full, swa] if full > 0 else None
 
     def _note_evictions(self) -> bool:
         # FLAT_MEMORY: rank-agreed, so every rank skips or rematches the same states.
@@ -1083,8 +1193,12 @@ class FlatMemoryCache:
         )
         return True
 
-    def _select_restore(self, state: _Prefetch, adder) -> bool:
+    def _select_restore(
+        self, state: _Prefetch, adder, *, prefetch_free: list[int] | None = None
+    ) -> bool:
         # FLAT_MEMORY: The shared revalidation pass already refreshed this match.
+        # prefetch_free is the agreed [full, swa] free-page budget of a prefetch,
+        # spent on success; a prefetch veto leaves the state for the window.
         result = state.result
         device_tokens = len(result.device_indices)
         page = self.cache.page_size
@@ -1094,11 +1208,20 @@ class FlatMemoryCache:
             // page
         ]
         footprint = self.tree_linker.plan_load_tokens(keys)
-        supported = self._reduce(
-            [int(footprint is not None)], torch.distributed.ReduceOp.MIN
-        )[0]
+        fits = footprint is not None and (
+            prefetch_free is None
+            or (
+                footprint.get(PoolName.KV, 0) <= prefetch_free[0]
+                and footprint.get(PoolName.SWA, 0) <= prefetch_free[1]
+            )
+        )
+        supported, fits = self._reduce(
+            [int(footprint is not None), int(fits)], torch.distributed.ReduceOp.MIN
+        )
         if not supported:
             self._fallback(state, "unsupported_restore_footprint")
+            return False
+        if not fits:
             return False
         state.result = result
         state.hold_node = result.last_device_node
@@ -1113,6 +1236,10 @@ class FlatMemoryCache:
         state.allocation_plan_attempts += 1
         self._diagnose(state, allocation_plan_attempts=state.allocation_plan_attempts)
         can_restore, never_fits, wait_eligible, reservation = self._sync_plan(plan)
+        if not can_restore and prefetch_free is not None:
+            # A prefetch veto is not a deferral; the window path owns waits and fallbacks.
+            self._release_hold(state)
+            return False
         state.allocation_wait_eligible = wait_eligible
         if not can_restore:
             self._observe_plan_gate(state, plan)
@@ -1133,6 +1260,9 @@ class FlatMemoryCache:
             return False
         self._finish_allocation_wait(state, "budget_available")
         state.full_reservation, state.swa_reservation = reservation
+        if prefetch_free is not None:
+            prefetch_free[0] -= footprint.get(PoolName.KV, 0) + state.full_reservation
+            prefetch_free[1] -= footprint.get(PoolName.SWA, 0) + state.swa_reservation
         state.read_anchor_tokens = device_tokens
         state.read_endpoint = state.queried_endpoint
         state.loaded_tokens = state.read_endpoint - device_tokens
@@ -1337,6 +1467,7 @@ class FlatMemoryCache:
     ) -> None:
         if not nearly:
             nearly = [0] * len(states)
+        retired = []
         for state, ready, failed, near in zip(states, done, errors, nearly):
             if state.streaming:
                 if ready and failed:
@@ -1379,9 +1510,11 @@ class FlatMemoryCache:
                     state.restore_episode.observe_ready(
                         ready_ns=ready_ns, endpoint="flat_all_tp_ready"
                     )
-                self._record_read_metrics(state)
+                # The result must be taken before forget_request drops it.
+                retired.append((state, self.cache_linker.take_load_result(state.req.rid)))
                 state.phase = "ready"
             self.cache_linker.forget_request(state.req.rid)
+        self._record_read_metrics_many(retired)
 
     def _near_done(self, state: _Prefetch) -> bool:
         # FLAT_MEMORY: Admit only once the rest of the read is shorter than the
@@ -1451,23 +1584,47 @@ class FlatMemoryCache:
         )
 
     def _record_read_metrics(self, state: _Prefetch) -> None:
-        result = self.cache_linker.take_load_result(state.req.rid)
-        counts = [result.dram_pages, result.ssd_pages, result.mixed_pages]
-        # FLAT_MEMORY: Source validity rides existing TP reductions, independently of timing.
-        valid = int(
-            (result.dram_pages + result.ssd_pages) * self.cache.page_size
-            == state.loaded_tokens
-            and 0 <= result.mixed_pages <= result.ssd_pages
+        self._record_read_metrics_many(
+            [(state, self.cache_linker.take_load_result(state.req.rid))]
         )
-        minima = self._reduce([*counts, valid], torch.distributed.ReduceOp.MIN)
-        maxima = self._reduce([*counts, valid], torch.distributed.ReduceOp.MAX)
+
+    def _record_read_metrics_many(self, reads: list[tuple[_Prefetch, Any]]) -> None:
+        # FLAT_MEMORY: One fused collective for every read retired this poll,
+        # in rank-agreed order; it used to be three per read.
+        if not reads:
+            return
+        local, elapsed = [], []
+        for state, result in reads:
+            # FLAT_MEMORY: Source validity rides the TP reduction, independently of timing.
+            valid = int(
+                (result.dram_pages + result.ssd_pages) * self.cache.page_size
+                == state.loaded_tokens
+                and 0 <= result.mixed_pages <= result.ssd_pages
+            )
+            local += [result.dram_pages, result.ssd_pages, result.mixed_pages, valid]
+            elapsed.append(int(result.elapsed_seconds * 1_000_000))
+        minima, maxima, elapsed = self._reduce_fused(
+            [
+                (local, torch.distributed.ReduceOp.MIN),
+                (local, torch.distributed.ReduceOp.MAX),
+                (elapsed, torch.distributed.ReduceOp.MAX),
+            ]
+        )
+        for index, (state, _) in enumerate(reads):
+            self._apply_read_metrics(
+                state,
+                minima=minima[4 * index : 4 * index + 4],
+                maxima=maxima[4 * index : 4 * index + 4],
+                elapsed_us=elapsed[index],
+            )
+
+    def _apply_read_metrics(
+        self, state: _Prefetch, *, minima: list[int], maxima: list[int], elapsed_us: int
+    ) -> None:
         state.restore_source = RestoreSource(
             int(bool(maxima[0] or maxima[2])) | (int(bool(maxima[1])) << 1),
             bool(minima[3]),
         )
-        elapsed_us = self._reduce(
-            [int(result.elapsed_seconds * 1_000_000)], torch.distributed.ReduceOp.MAX
-        )[0]
         stats = state.req.flat_prefetch_stats
         for name, count in zip(("flat_dram", "flat_ssd", "flat_mixed"), minima):
             stats[name] = count * self.cache.page_size if minima == maxima else None

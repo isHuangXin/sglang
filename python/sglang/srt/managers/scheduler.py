@@ -3656,17 +3656,21 @@ class Scheduler(
         # as the space for the chunked requests has just been released.
         # In PP case, chunked requests (or dllm requests) can start in one microbatch and end in another microbatch, so the max_running_requests per microbatch should not be strict.
         # Instead, we should always allow chunked requests to be added, otherwise, there will be a memory leak.
+        # FLAT_MEMORY: Full request slots still start storage restores, so a read
+        # overlaps the wait for a slot instead of following it; nothing is admitted.
+        flat_restore_only = False
         if (
             self.get_num_allocatable_reqs(running_bs, running_batch=running_batch) <= 0
             and self.chunked_req is None
             and not self.enable_priority_preemption
         ):
             running_batch.batch_is_full = True
-            if self.flat_memory_cache is not None:
-                self.flat_memory_cache.observe_scheduler_gate(
-                    "request_slots", self.waiting_queue
-                )
-            return None, running_batch
+            if self.flat_memory_cache is None:
+                return None, running_batch
+            self.flat_memory_cache.observe_scheduler_gate(
+                "request_slots", self.waiting_queue
+            )
+            flat_restore_only = True
 
         # Get priority queue
         self.policy.calc_priority(self.waiting_queue, running_batch)
@@ -3735,6 +3739,9 @@ class Scheduler(
                     self.chunked_req is not None or bool(adder.can_run_list)
                 ),
             )
+            if flat_restore_only:
+                self.flat_memory_cache.finish_admission(adder, can_progress=True)
+                return None, running_batch
 
         if self.enable_lora:
             running_loras = {

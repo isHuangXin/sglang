@@ -389,17 +389,20 @@ class FlatMemoryDirectLinker(UnifiedCacheLinker):
             max_workers=max(1, int(config.get("lookup_workers", 4))),
             thread_name_prefix="flat-query",
         )
-        # FLAT_MEMORY: one worker per lease FlatMemoryCache may grant, so a
-        # granted lease never queues for a thread (same keys, same defaults).
-        ssd_leases = max(1, int(config.get("restore_max_ssd_leases", 4)))
-        dram_leases = max(1, int(config.get("restore_max_dram_leases", 4)))
+        # FLAT_MEMORY: one dispatch thread per lease FlatMemoryCache may grant
+        # (same keys, same defaults); media I/O threads are sized separately, so
+        # more leases than readers keep the age-per-byte SSD queue non-empty.
+        ssd_leases = max(1, int(config.get("restore_max_ssd_leases", 16)))
+        dram_leases = max(1, int(config.get("restore_max_dram_leases", 16)))
+        ssd_readers = max(1, int(config.get("restore_ssd_io_workers", 4)))
+        dram_readers = max(1, int(config.get("restore_dram_io_workers", 4)))
         self._dispatch_executor = ThreadPoolExecutor(
             max_workers=ssd_leases + dram_leases, thread_name_prefix="flat-dispatch"
         )
         self._dram_executor = ThreadPoolExecutor(
-            max_workers=dram_leases, thread_name_prefix="flat-dram"
+            max_workers=dram_readers, thread_name_prefix="flat-dram"
         )
-        self._ssd_executor = SSDReadExecutor(workers=ssd_leases)
+        self._ssd_executor = SSDReadExecutor(workers=ssd_readers)
         self._write_executor = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="flat-write"
         )

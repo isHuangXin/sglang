@@ -3770,6 +3770,7 @@ class Scheduler(
                 has_chunked_req=(
                     self.chunked_req is not None or bool(adder.can_run_list)
                 ),
+                slots_full=flat_restore_only,
             )
             if flat_restore_only:
                 self.flat_memory_cache.finish_admission(adder, can_progress=True)

@@ -826,9 +826,16 @@ class FlatMemoryCache:
 
     @_timed_control
     def prepare_admission(
-        self, requests: list, adder, *, has_chunked_req: bool
+        self,
+        requests: list,
+        adder,
+        *,
+        has_chunked_req: bool,
+        slots_full: bool = False,
     ) -> list:
         # FLAT_MEMORY: This stage is shared by all ranks, before the local add loop.
+        # slots_full (rank-agreed): no request is admitted this pass, so only restore
+        # selection runs; ready states and leases revalidate once a slot frees.
         requests = self.order_ready_requests(requests)
         self._agree_requests(requests)
         self._admission_states = self._admission_window_states(requests)
@@ -840,10 +847,20 @@ class FlatMemoryCache:
                 self._set_wait(state, "ready_admission")
         capacity = self._restore_capacity(adder)
         retry = self._note_evictions(capacity=capacity)
-        self._refresh_stale_queries(self._admission_states)
-        for lease in self._active_leases():
-            if lease.phase == "ready":
-                self._revalidate_lease(lease, adder)
+        if not slots_full:
+            self._refresh_stale_queries(self._admission_states)
+            for lease in self._active_leases():
+                if lease.phase == "ready":
+                    self._revalidate_lease(lease, adder)
+        elif retry:
+            # Selection plans on these anchors, so they must be current.
+            self._revalidate_unleased_many(
+                [
+                    s
+                    for s in self._admission_states
+                    if self._is_unleased(s) and s.phase == "allocate"
+                ]
+            )
         # FLAT_MEMORY: Reads start under chunked prefill too; plan_flat_restore
         # charges the admitted chunk's remaining input as running headroom.
         # A chunk the adder refused (SWA budget) is uncharged, so wait instead.

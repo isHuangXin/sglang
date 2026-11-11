@@ -1282,9 +1282,23 @@ if __name__ == "__main__":
 
 
 class TestLayerLoadCounter(CustomTestCase):
-    def test_batch_index_waits_for_every_member_and_fails_closed(self):
-        """A combined layer must not open until all restores reached it, and a
-        failed read must stop the forward rather than serve partial pages."""
+    def test_layer_pipelined_read_reports_progress_per_layer_group(self):
+        """One 64 MiB batch held a whole 30-40 MB restore, so progress came only
+        at its end and a streamed forward waited at layer 0 for the full read."""
+        segments = Mock(layers=list(range(43)))
+        transfer = Mock(read_batch_bytes=64 << 20, layer_batch_min_bytes=2 << 20)
+        split = GPUTransfer._read_plan_batch_bytes
+        # 36 MiB over 43 layers is ~0.84 MiB a layer; the 2 MiB floor holds.
+        self.assertEqual(split(transfer, segments, 36 << 20), 2 << 20)
+        big = 1400 << 20
+        self.assertLess(split(transfer, segments, big), big // 40)
+        self.assertGreaterEqual(split(transfer, segments, big), big // 43)
+        transfer.layer_batch_min_bytes = 0
+        self.assertEqual(split(transfer, segments, 36 << 20), 64 << 20)
+
+    def test_batch_index_waits_for_every_member_and_lets_a_failure_finish(self):
+        """A combined layer must not open until all restores reached it; a failed
+        read only unblocks the forward, whose owner FlatMemoryCache retracts."""
         counter = LayerLoadCounter(num_layers=3)
         first, second = counter.update_producer(), counter.update_producer()
         batch = counter.combine([first, second])
@@ -1297,8 +1311,8 @@ class TestLayerLoadCounter(CustomTestCase):
         self.assertFalse(layers[1].done())
         counter.wait_until(0)
         counter.complete(second, "injected read failure")
-        with self.assertRaises(FlatUnsafeIOError):
-            counter.wait_until(1)
+        counter.wait_until(1)
+        self.assertIsNotNone(layers[1].exception())
         counter.complete(first, None)
         self.assertTrue(counter.done(batch))
         counter.forget(batch)

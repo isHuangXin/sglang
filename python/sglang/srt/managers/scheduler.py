@@ -3492,6 +3492,8 @@ class Scheduler(
             new_batch = self.get_new_batch_dllm(running_batch)
         elif self._should_defer_prefill():
             if self.flat_memory_cache is not None:
+                # FLAT_MEMORY: A failed stream's owner must leave before it decodes.
+                self._poll_flat_memory(running_batch)
                 self.flat_memory_cache.observe_scheduler_gate(
                     "prefill_cadence", self.waiting_queue
                 )
@@ -3604,6 +3606,36 @@ class Scheduler(
 
         return NextBatchPlan(batch_to_run=ret, running_batch=running_batch)
 
+    def _poll_flat_memory(self, running_batch: ScheduleBatch) -> None:
+        """Poll Flat restores and retract owners of failed layer-wise restores."""
+        self.flat_memory_cache.poll()
+        failed = self.flat_memory_cache.take_failed_streams()
+        if failed:
+            self._retract_flat_failed_streams(running_batch, failed)
+
+    def _retract_flat_failed_streams(
+        self, running_batch: ScheduleBatch, failed: set[str]
+    ) -> None:
+        # FLAT_MEMORY: The owner prefilled on a failed read in one chunk and its
+        # result is not processed yet; retracting it drops that token and its KV,
+        # and it recomputes without storage. The set is rank-agreed.
+        retract = [i for i, req in enumerate(running_batch.reqs) if req.rid in failed]
+        if len(retract) != len(failed):
+            raise RuntimeError("Flat layer-wise restore owner is not in the running batch")
+        keep = [i for i in range(len(running_batch.reqs)) if i not in set(retract)]
+        retracted = [running_batch.reqs[i] for i in retract]
+        for position, index in enumerate(retract):
+            running_batch.release_req(index, len(keep) + len(retract) - position - 1)
+        running_batch.filter_batch(keep_indices=keep)
+        running_batch.batch_is_full = False
+        self.flat_memory_cache.finish_failed_streams(failed)
+        logger.warning(
+            "Flat layer-wise restore failed; retracted %d request(s) to recompute",
+            len(retracted),
+        )
+        for req in retracted:
+            self._add_request_to_queue(req, is_retracted=True)
+
     def _get_new_batch_prefill_raw(
         self,
         prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor],
@@ -3616,7 +3648,7 @@ class Scheduler(
                 self._add_request_to_queue(req)
 
         if self.flat_memory_cache is not None:
-            self.flat_memory_cache.poll()
+            self._poll_flat_memory(running_batch)
             # FLAT_MEMORY: Retry ready lease admission as running requests progress.
             running_batch.batch_is_full = False
         elif self.enable_hierarchical_cache or get_memory().enable_flexkv:
@@ -3794,7 +3826,9 @@ class Scheduler(
                     break
 
             if self.flat_memory_cache is not None:
-                if not self.flat_memory_cache.is_ready(req.rid):
+                if not self.flat_memory_cache.is_ready(
+                    req.rid, rem_chunk_tokens=adder.rem_chunk_tokens
+                ):
                     continue
             elif self.enable_hicache_storage:
                 prefetch_done = self.tree_cache.check_prefetch_progress(req.rid)
@@ -3947,9 +3981,11 @@ class Scheduler(
                 self.tree_cache.ready_to_load_host_cache()
             )
         elif self.flat_memory_cache is not None:
-            # FLAT_MEMORY: The forward waits per layer on every still-streaming restore.
+            # FLAT_MEMORY: The forward waits per layer on its members' streaming restores.
             new_batch.hicache_consumer_index = (
-                self.flat_memory_cache.layer_wise_consumer()
+                self.flat_memory_cache.layer_wise_consumer(
+                    [req.rid for req in can_run_list]
+                )
             )
 
         new_batch.prepare_for_extend()

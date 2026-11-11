@@ -56,6 +56,8 @@ logger = logging.getLogger(__name__)
 # Mirrors MAX_NODES in src/flat_memory/include/gva_encoder.h: the GVA packs the
 # segment id into bits [59:48], and Encode() throws above that.
 _MAX_GVA_NODES = 4096
+# A lookup generation no storage_generation reaches: the receipt is never re-probed.
+_NEVER_STALE_GENERATION = 1 << 62
 
 
 class FlatLoadResult(msgspec.Struct, frozen=True):
@@ -163,12 +165,10 @@ class LayerLoadCounter:
         layers = self._layers(self.consumer_index)
         if layers is None:
             return
-        error = layers[min(threshold, self.num_layers - 1)].exception()
-        if error is not None:
-            # FLAT_MEMORY: The pages are already published; never compute on them.
-            raise FlatUnsafeIOError(
-                f"Flat layer-wise restore failed before layer {threshold}: {error}"
-            ) from error
+        # FLAT_MEMORY: A failed layer only lets the forward finish; only the
+        # streaming owner reads these pages, and FlatMemoryCache retracts it before
+        # its first token is emitted, so its output is never served.
+        layers[min(threshold, self.num_layers - 1)].exception()
 
     def done(self, index: int) -> bool:
         layers = self._layers(index)
@@ -374,6 +374,12 @@ class FlatMemoryDirectLinker(UnifiedCacheLinker):
             staging_bytes=int(config.get("gpu_stage_bytes", 128 * 1024 * 1024)),
             batch_pages=int(config.get("gpu_batch_pages", 128)),
             native_page_copies=bool(config.get("native_page_copies", True)),
+            # FLAT_MEMORY: 2 MiB keeps each NVMe request large; arbitrary.
+            layer_batch_min_bytes=(
+                int(config.get("layer_wise_min_batch_bytes", 2 * 1024 * 1024))
+                if config.get("layer_wise_restore", False)
+                else 0
+            ),
         )
         self.backup_wait_seconds = float(config.get("backup_wait_seconds", 10.0))
         self.drain_timeout = float(config.get("drain_timeout", 30.0))
@@ -649,6 +655,11 @@ class FlatMemoryDirectLinker(UnifiedCacheLinker):
                 for job, records in offloads.items()
                 if not result.missing_records.isdisjoint(records)
             )
+            if self.backup_wait_seconds == 0:
+                # FLAT_MEMORY: Backups are never awaited, so no later write may extend
+                # this receipt. On Qwen, re-probes on the global generation found no
+                # hit in 5406 tries and held 54% of requests out of admission.
+                self._lookup_generations[rid] = _NEVER_STALE_GENERATION
             if (
                 final_probe
                 or time.monotonic() >= query.deadline
@@ -887,6 +898,17 @@ class FlatMemoryDirectLinker(UnifiedCacheLinker):
             result.set_result(value)
         # The batch index combines its members' counters, so it follows on its own.
         self.layer_done_counter.complete(counter_index, value.error)
+
+    def wait_load(self, rid: str, timeout: float) -> None:
+        # FLAT_MEMORY: An admitted stream's forward already waited every layer, so
+        # only the read's bookkeeping remains; a timeout is left to load_ready.
+        with self._lock:
+            future = self._loads.get(rid)
+        if future is not None:
+            try:
+                future.exception(timeout=timeout)
+            except TimeoutError:
+                pass
 
     def load_ready(self, rid: str) -> bool:
         with self._lock:

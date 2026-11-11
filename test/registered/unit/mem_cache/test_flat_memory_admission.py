@@ -114,6 +114,9 @@ class _Storage:
     def fail(self, rid):
         self.loads[rid].set_result(NS(error="injected read failure"))
 
+    def wait_load(self, rid, timeout):
+        pass
+
     def load_progress(self, rid):
         return self.progress.get(rid, (0, 0))
 
@@ -522,6 +525,7 @@ class TestFlatMemoryAdmission(CustomTestCase):
     def _streaming(self):
         self.runtime.layer_wise_restore = True
         self.runtime.layer_wise_admit_lead = 1.0
+        self.runtime.layer_wise_prefill_tokens_per_s = 0.0
         req = self._req()
         self.runtime.poll()
         self.runtime.prepare_admission([req], self._adder(), has_chunked_req=False)
@@ -539,7 +543,8 @@ class TestFlatMemoryAdmission(CustomTestCase):
         loaded = state.loaded_tokens
         self.assertEqual(state.phase, "ready")
         self.assertTrue(state.streaming and self.runtime.is_ready(req.rid))
-        self.assertEqual(self.runtime.layer_wise_consumer(), 7)
+        self.assertEqual(self.runtime.layer_wise_consumer(["other"]), -1)
+        self.assertEqual(self.runtime.layer_wise_consumer([req.rid, "other"]), 7)
         self.assertEqual(self.storage.consumers[-1], [req.rid])
         adder = self._adder()
         self.runtime.prepare_admission([req], adder, has_chunked_req=False)
@@ -563,7 +568,7 @@ class TestFlatMemoryAdmission(CustomTestCase):
         self.storage.complete(req.rid)
         self.runtime.poll()
         self.assertFalse(self.runtime._streaming)
-        self.assertEqual(self.runtime.layer_wise_consumer(), -1)
+        self.assertEqual(self.runtime.layer_wise_consumer([req.rid]), -1)
         self.cache.evict(EvictParams(swa_num_tokens=64, num_tokens=64))
         self.assertLess(self._match_len(req), loaded)
 
@@ -585,12 +590,77 @@ class TestFlatMemoryAdmission(CustomTestCase):
         _register_layer_wise_restore(ctx, pool=pool, counter="counter")
         self.assertEqual(registered, ["counter", "counter"])
 
-    def test_layer_wise_read_failure_after_publish_fails_closed(self):
-        req, state = self._streaming()
+    def test_layer_wise_admits_only_when_the_read_fits_the_owner_prefill(self):
+        """An early admit whose remaining read outlasts the owner's own prefill
+        would stall every batch member on storage, so it must keep waiting."""
+        self.runtime.layer_wise_restore = True
+        self.runtime.layer_wise_admit_lead = 1.0
+        req = self._req()
+        self.runtime.poll()
+        self.runtime.prepare_admission([req], self._adder(), has_chunked_req=False)
+        state = self.runtime.prefetches[req.rid]
+        # One token to prefill at 20 tok/s: a 0.05 s compute window.
+        self.runtime.layer_wise_prefill_tokens_per_s = 20.0
+        self.storage.bandwidth = 100.0
+        self.storage.progress[req.rid] = (50, 100)  # 0.5 s left: inside the lead
+        self.runtime.poll()
+        self.assertEqual((state.phase, state.streaming), ("read", False))
+        self.storage.progress[req.rid] = (99, 100)  # 0.01 s left
+        self.runtime.poll()
         self.assertTrue(state.streaming)
+
+    def test_layer_wise_pages_are_private_to_their_owner(self):
+        """Another request must not compute on a still-streaming restore."""
+        req, state = self._streaming()
+        self.assertGreater(self._match_len(req), state.read_anchor_tokens)
+        other = self._req(rid="other")
+        self.assertEqual(len(other.prefix_indices), state.read_anchor_tokens)
+        req.init_next_round_input(self.cache)
+        self.assertGreater(len(req.prefix_indices), state.read_anchor_tokens)
+
+    def test_layer_wise_read_failure_before_admission_recomputes(self):
+        """A failed stream nobody consumed drops its pages and recomputes."""
+        req, state = self._streaming()
         self.storage.fail(req.rid)
-        with self.assertRaises(FlatUnsafeIOError):
-            self.runtime.poll()
+        self.runtime.poll()
+        self.assertFalse(self.runtime._streaming)
+        self.assertEqual((state.phase, state.bypass), ("ready", True))
+        self.assertEqual(self._match_len(req), state.read_anchor_tokens)
+        self.assertEqual(self.runtime.layer_wise_fallbacks, 1)
+        self.assertFalse(self.runtime.take_failed_streams())
+
+    def test_layer_wise_read_failure_after_admission_retracts_the_owner(self):
+        """An admitted owner of a failed stream is retracted, its pages are
+        dropped, and it recomputes without storage instead of failing closed."""
+        req, state = self._streaming()
+        self.assertEqual(self.runtime.layer_wise_consumer([req.rid]), 7)
+        adder = self._adder()
+        self.runtime.prepare_admission([req], adder, has_chunked_req=False)
+        req.init_next_round_input(self.cache)
+        self.runtime.before_admission(req, adder)
+        adder.add_one_req(req, has_chunked_req=False, truncation_align_size=None)
+        self.runtime.after_admission(req, adder)
+        self.runtime.finish_admission(adder, can_progress=True)
+        self.storage.fail(req.rid)
+        self.runtime.poll()
+        self.assertEqual(self.runtime.take_failed_streams(), {req.rid})
+        self.runtime.poll()  # a pending retraction is not failed twice
+        self.assertEqual(self.runtime.layer_wise_fallbacks, 1)
+        # The scheduler's retraction releases the request's own lock.
+        self.cache.dec_lock_ref(
+            req.last_node,
+            DecLockRefParams(
+                swa_uuid_for_lock=req.swa_uuid_for_lock,
+                skip_lock_node_ids=req.skip_lock_node_ids,
+            ),
+        )
+        self.runtime.finish_failed_streams({req.rid})
+        self.assertFalse(self.runtime._streaming)
+        self.assertFalse(self.runtime.take_failed_streams())
+        self.assertEqual(self._match_len(req), state.read_anchor_tokens)
+        retried = self._req(rid=req.rid)
+        self.assertTrue(self.runtime.prefetches[retried.rid].bypass)
+        self.assertNotIn(req.rid, self.runtime._no_restore_rids)
 
     def test_reclaimed_page_lets_its_node_back_up_again(self):
         """After native reclamation, a node still marked stored would never be

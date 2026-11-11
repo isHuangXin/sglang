@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import collections
 import hashlib
 import json
 import logging
@@ -164,6 +165,10 @@ class _Prefetch(msgspec.Struct, kw_only=True):
     # stream_hold keeps the published pages from eviction until it does.
     streaming: bool = False
     stream_hold: Any = None
+    # Leaf of the early-published restore, dropped if the stream fails.
+    stream_leaf_id: Any = None
+    # A forward pass of the owner waited on this stream's layers.
+    stream_consumed: bool = False
     admission_attempted: bool = False
     admitted: bool = False
     allocation_wait_started: float = 0.0
@@ -269,17 +274,35 @@ class FlatMemoryCache:
             raise ValueError("Flat scope_agent_context_tokens must be nonnegative")
         self._write_scope_hint = MEDIA_HINT_ANY
         self.scope_hint_tokens = {"dram": 0, "ssd": 0, "any": 0}
-        # FLAT_MEMORY: FC-CIO layer-pipelined restore. Off: a published page whose
-        # read later fails can only fail closed, and an early admit stalls the
-        # forward pass on storage. The lead bounds that stall; it is arbitrary.
+        # FLAT_MEMORY: FC-CIO layer-pipelined restore. Early-published pages are
+        # private to their owner until the read ends; a failed read retracts the
+        # owner and recomputes it. The lead bounds a forward stall; it is arbitrary.
         self.layer_wise_restore = bool(config.get("layer_wise_restore", False))
         self.layer_wise_admit_lead = (
             float(config.get("layer_wise_admit_lead_ms", 200.0)) / 1000
         )
         if self.layer_wise_admit_lead < 0:
             raise ValueError("Flat layer_wise_admit_lead_ms must be nonnegative")
+        # Streams only a restore whose remaining input is one prefill chunk, so the
+        # owner's whole forward ends before its result is processed; must not
+        # exceed --chunked-prefill-size.
+        self.layer_wise_max_extend_tokens = int(
+            config.get("layer_wise_max_extend_tokens", 8192)
+        )
+        # Prefill rate that sizes an owner's compute window; 0 uses the lead only.
+        # ~35K tok/s was measured HBM-only on V4-Flash (README_hbm.md); 30K is slack.
+        self.layer_wise_prefill_tokens_per_s = float(
+            config.get("layer_wise_prefill_tokens_per_s", 30000.0)
+        )
+        if self.layer_wise_prefill_tokens_per_s < 0:
+            raise ValueError("Flat layer_wise_prefill_tokens_per_s must be nonnegative")
         self._streaming: dict[str, _Prefetch] = {}
         self.layer_wise_commits = 0
+        self.layer_wise_fallbacks = 0
+        # Admitted owners of failed streams, retracted by the scheduler.
+        self._failed_streams: dict[str, _Prefetch] = {}
+        # Requests whose stream failed recompute without storage once.
+        self._no_restore_rids: set[str] = set()
         # FLAT_MEMORY: page key -> (node id, page hash) of the node that backed it up.
         self._page_nodes: dict[str, tuple[int, str]] = {}
         self._polls = 0
@@ -500,6 +523,7 @@ class FlatMemoryCache:
 
     def match(self, key: RadixKey, req: Req, result: MatchResult) -> MatchResult:
         self.register_request(req)
+        result = self._clip_streams(key, result, owner=req.rid)
         if (
             req.rid in self.prefetches
             or (req.kv is not None and req.kv.req_pool_idx is not None)
@@ -553,7 +577,9 @@ class FlatMemoryCache:
         if state.restore_episode is not None:
             state.restore_episode.outcome = "miss"
         transfers = self._lookup_transfers(tail_hashes)
-        if not transfers:
+        if not transfers or req.rid in self._no_restore_rids:
+            # A request whose layer-wise restore failed recomputes once instead.
+            self._no_restore_rids.discard(req.rid)
             state.phase, state.bypass = "ready", True
             self._set_wait(state, "ready_admission")
             return result
@@ -627,8 +653,13 @@ class FlatMemoryCache:
         streams = [
             state
             for rid, state in self._streaming.items()
-            if rid not in self.prefetches
+            if rid not in self.prefetches and rid not in self._failed_streams
         ]
+        for state in streams:
+            if state.stream_consumed:
+                # FLAT_MEMORY: The owner's forward already waited every layer; settle
+                # the read so a failure retracts it before its result is processed.
+                self.cache_linker.wait_load(state.req.rid, timeout=self.drain_timeout)
         if not states and not streams and not self.pending_offloads:
             # FLAT_MEMORY: All three are rank-consistent, so every rank skips alike.
             self._sync_reclaimed()
@@ -1133,9 +1164,53 @@ class FlatMemoryCache:
         # FLAT_MEMORY: A metadata-only query's original node/indices may be evicted.
         # The caller agrees the anchor sizes across ranks.
         return [
-            self.cache.match_prefix(MatchPrefixParams(key=state.key))
+            self._clip_streams(
+                state.key,
+                self.cache.match_prefix(MatchPrefixParams(key=state.key)),
+                owner=state.req.rid,
+            )
             for state in states
         ]
+
+    def _clip_streams(self, key, result: MatchResult, *, owner: str) -> MatchResult:
+        # FLAT_MEMORY: A still-streaming restore's pages are private to its owner;
+        # another match stops at that restore's anchor, so a failed read never
+        # reaches a second request. Rank-agreed: streams and matches are.
+        if not self._streaming:
+            return result
+        matched = len(result.device_indices)
+        anchor = matched
+        for state in self._streaming.values():
+            if state.req.rid == owner or matched <= state.read_anchor_tokens:
+                continue
+            if self._shares_path(key, state.key, state.read_anchor_tokens):
+                anchor = min(anchor, state.read_anchor_tokens)
+        if anchor == matched:
+            return result
+        from sglang.srt.mem_cache.radix_cache import RadixKey
+
+        clipped = RadixKey(
+            key.token_ids,
+            extra_key=key.extra_key,
+            is_bigram=key.is_bigram,
+            limit=anchor,
+            cache_salt=key.cache_salt,
+        )
+        return self.cache.match_prefix(MatchPrefixParams(key=clipped))
+
+    def _shares_path(self, key, other, anchor: int) -> bool:
+        # Equal through the first restored page means the match walked that restore.
+        end = anchor + self.cache.page_size
+        if (
+            key.extra_key != other.extra_key
+            or key.cache_salt != other.cache_salt
+            or len(key) < end
+            or len(other) < end
+        ):
+            return False
+        return key.token_ids[anchor:end] == other.token_ids[anchor:end] and (
+            key.token_ids[:anchor] == other.token_ids[:anchor]
+        )
 
     def _refresh_query(
         self, state: _Prefetch, result: MatchResult, *, reason: str = "anchor_gap"
@@ -1470,12 +1545,14 @@ class FlatMemoryCache:
         retired = []
         for state, ready, failed, near in zip(states, done, errors, nearly):
             if state.streaming:
-                if ready and failed:
+                if ready and failed == 2:
                     raise FlatUnsafeIOError(
-                        "Flat layer-wise restore failed after its pages were "
-                        "published; refusing to serve them"
+                        "Flat layer-wise restore did not quiesce on every TP rank; "
+                        "its published pages may still be written"
                     )
-                if ready:
+                if ready and failed:
+                    self._fail_stream(state)
+                elif ready:
                     self._finish_stream(state)
                 continue
             if not ready:
@@ -1517,21 +1594,37 @@ class FlatMemoryCache:
         self._record_read_metrics_many(retired)
 
     def _near_done(self, state: _Prefetch) -> bool:
-        # FLAT_MEMORY: Admit only once the rest of the read is shorter than the
-        # lead, so the forward pass waits at most about that long on storage.
-        if not self.layer_wise_restore or state.phase != "read":
+        # FLAT_MEMORY: Admit once the rest of the read takes no longer than the
+        # owner's own prefill, so layer-major I/O stays ahead of the forward and
+        # no batch member waits on storage; the lead caps a wrong estimate.
+        extend = self._owner_extend(state)
+        if (
+            not self.layer_wise_restore
+            or state.phase != "read"
+            or extend > self.layer_wise_max_extend_tokens
+        ):
             return False
         done, total = self.cache_linker.load_progress(state.req.rid)
         bandwidth = self.cache_linker.read_bandwidth()
         if total <= 0 or bandwidth is None:
             return False
-        return (total - done) / bandwidth <= self.layer_wise_admit_lead
+        budget = self.layer_wise_admit_lead
+        if self.layer_wise_prefill_tokens_per_s > 0:
+            budget = min(budget, extend / self.layer_wise_prefill_tokens_per_s)
+        return (total - done) / bandwidth <= budget
+
+    @staticmethod
+    def _owner_extend(state: _Prefetch) -> int:
+        # Tokens the owner prefills after its restore; the radix key omits the last.
+        req = state.req
+        return len(req.origin_input_ids) + len(req.output_ids) - state.read_endpoint
 
     def _stream_commit(self, state: _Prefetch) -> None:
         done, total = self.cache_linker.load_progress(state.req.rid)
         self._commit(state)
         node = state.hold_node
         state.stream_hold = (node, self.cache.inc_lock_ref(node).to_dec_params())
+        state.stream_leaf_id = self.cache.resolve_node_handle(node).id
         state.streaming = True
         state.phase = "ready"
         self._streaming[state.req.rid] = state
@@ -1548,19 +1641,92 @@ class FlatMemoryCache:
                 ready_ns=ready_ns, endpoint="flat_all_tp_ready"
             )
         self._record_read_metrics(state)
-        node, params = state.stream_hold
-        self.cache.dec_lock_ref(node, params)
-        state.stream_hold = None
+        self._release_stream_hold(state)
         state.streaming = False
         self._streaming.pop(state.req.rid, None)
         self.cache_linker.forget_request(state.req.rid)
 
-    def layer_wise_consumer(self) -> int:
-        # FLAT_MEMORY: Every streaming restore, not just the batch's own: another
-        # request may already have matched a published, still-loading node.
-        if not self._streaming:
+    def _release_stream_hold(self, state: _Prefetch) -> None:
+        if state.stream_hold is not None:
+            node, params = state.stream_hold
+            self.cache.dec_lock_ref(node, params)
+            state.stream_hold = None
+
+    def _fail_stream(self, state: _Prefetch) -> None:
+        # FLAT_MEMORY: Rank-agreed (read errors are MAX-reduced). Only the owner
+        # can hold these pages (_clip_streams), so dropping them and recomputing
+        # the owner serves nothing computed from a failed read.
+        rid = state.req.rid
+        self.io_errors += 1
+        self.layer_wise_fallbacks += 1
+        logger.warning("Flat layer-wise restore failed; recomputing request %s", rid)
+        self._release_stream_hold(state)
+        if rid not in self.prefetches:
+            # Admitted: the scheduler retracts the owner, then finish_failed_streams.
+            if state.restore_episode is not None:
+                state.restore_episode.close("failed")
+            self._failed_streams[rid] = state
+            return
+        self._release_hold(state)
+        self._drop_stream_pages(state)
+        self._end_stream(state)
+        self._restore_request(state)
+        self._fallback(state, "stream_read_failed", count=False)
+        # The match named the dropped pages; admission must rematch.
+        state.validated_epoch = -1
+
+    def take_failed_streams(self) -> set[str]:
+        return set(self._failed_streams)
+
+    def finish_failed_streams(self, rids) -> None:
+        # FLAT_MEMORY: After the owners are retracted their locks are gone, so the
+        # pages are unshared device leaves again. Called in rank-agreed order.
+        for rid in sorted(rids):
+            state = self._failed_streams.pop(rid)
+            self._drop_stream_pages(state)
+            self._end_stream(state)
+            self._no_restore_rids.add(rid)
+
+    def _end_stream(self, state: _Prefetch) -> None:
+        state.streaming = False
+        self._streaming.pop(state.req.rid, None)
+        self.cache_linker.forget_request(state.req.rid)
+
+    def _drop_stream_pages(self, state: _Prefetch) -> None:
+        # Restored nodes sit wholly below the anchor; a split only cuts them further.
+        tree = self.cache.tree_core
+        node = tree.try_node_by_id(state.stream_leaf_id)
+        tracker = collections.defaultdict(int)
+        while (
+            node is not None
+            and node is not self.cache.root_node
+            and self._node_depth(node) > state.read_anchor_tokens
+        ):
+            if not tree._is_device_leaf(node):
+                raise FlatUnsafeIOError(
+                    "Flat layer-wise restore failed but another request holds its "
+                    "pages; refusing to serve them"
+                )
+            parent = node.parent
+            self.cache._evict_device_leaf(node.id, tracker)
+            node = parent
+
+    def _node_depth(self, node) -> int:
+        depth = 0
+        while node is not None and node is not self.cache.root_node:
+            depth += len(node.key)
+            node = node.parent
+        return depth
+
+    def layer_wise_consumer(self, rids: list[str]) -> int:
+        # FLAT_MEMORY: Only a stream's owner reads its pages (_clip_streams), so a
+        # batch waits on its own members' streams and no one else's.
+        owners = [rid for rid in rids if rid in self._streaming]
+        if not owners:
             return -1
-        return self.cache_linker.layer_counter_for(list(self._streaming))
+        for rid in owners:
+            self._streaming[rid].stream_consumed = True
+        return self.cache_linker.layer_counter_for(owners)
 
     def _commit(self, state: _Prefetch) -> None:
         # FLAT_MEMORY: All required components and ranks completed before tree insertion.
@@ -1643,12 +1809,20 @@ class FlatMemoryCache:
             state.req.kv.swa_evicted_seqlen = state.swa_evicted_before
         state.loaded_tokens = 0
 
-    def is_ready(self, rid: str) -> bool:
+    def is_ready(self, rid: str, *, rem_chunk_tokens: int | None = None) -> bool:
         state = self.prefetches.get(rid)
         if state is None:
             return True
         # FLAT_MEMORY: Outside this pass's window the state was not revalidated.
         if self._admission_rids is not None and rid not in self._admission_rids:
+            return False
+        if (
+            state.streaming
+            and rem_chunk_tokens is not None
+            and self._owner_extend(state) > rem_chunk_tokens
+        ):
+            # A stream's owner prefills in one chunk, so a failed read is known
+            # before its result; it waits for a pass with that much budget.
             return False
         return state.phase == "ready"
 

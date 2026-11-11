@@ -509,8 +509,13 @@ class GPUTransfer:
         staging_bytes: int,
         batch_pages: int = 128,
         native_page_copies: bool = False,
+        layer_batch_min_bytes: int = 0,
     ):
         self.layout = layout
+        # FLAT_MEMORY: FC-CIO layer pipelining. Nonzero cuts a native read into
+        # about one layer per batch (never below this), so progress reaches the
+        # forward layer by layer; 0 keeps the largest batches.
+        self.layer_batch_min_bytes = layer_batch_min_bytes
         self.manager = manager
         self.device = torch.device(device)
         # FLAT_MEMORY: FC-CIO. Fragments are enumerated natively from a
@@ -662,10 +667,9 @@ class GPUTransfer:
         plan = self._make_plan(segments)
         total_bytes = sum(n * p for n, p in zip(segments.counts(), segments.padded))
         done_bytes = 0
+        batch_bytes = self._read_plan_batch_bytes(segments, total_bytes)
         with self._context(), self._stream_context():
-            for batch in self._plan_batches(
-                plan, segments, batch_bytes=self.read_batch_bytes
-            ):
+            for batch in self._plan_batches(plan, segments, batch_bytes=batch_bytes):
                 # Native streams must wait for earlier users of the destination
                 # pages; the pages are private until commit, so a failed read
                 # leaves nothing visible.
@@ -680,6 +684,15 @@ class GPUTransfer:
                         else batch.last_layer
                     )
                     on_progress(done_bytes, total_bytes, through)
+
+    def _read_plan_batch_bytes(self, segments: PlanSegments, total_bytes: int) -> int:
+        # A 64 MiB batch held a whole 30-40 MB restore, so progress came once at
+        # the end and a streamed forward stalled at layer 0 for the full read.
+        if not self.layer_batch_min_bytes:
+            return self.read_batch_bytes
+        per_layer = total_bytes // max(1, len(set(segments.layers)))
+        target = align_up(max(self.layer_batch_min_bytes, per_layer))
+        return min(self.read_batch_bytes, target)
 
     def _make_plan(self, segments: PlanSegments):
         return self.manager.make_plan(

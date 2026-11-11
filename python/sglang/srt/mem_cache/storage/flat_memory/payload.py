@@ -614,11 +614,15 @@ class GPUTransfer:
         *,
         on_source_consumed: Callable[[], None] | None = None,
         media_hint: int = MEDIA_HINT_ANY,
+        anchor_page: str = "",
     ) -> None:
         self.raise_if_unsafe()
         with self._context(), self._stream_context():
             self._write_transfers(
-                transfers, on_source_consumed=on_source_consumed, media_hint=media_hint
+                transfers,
+                on_source_consumed=on_source_consumed,
+                media_hint=media_hint,
+                anchor_page=anchor_page,
             )
 
     def read(
@@ -759,7 +763,23 @@ class GPUTransfer:
             raise RuntimeError("Flat GPU write did not complete every payload fragment")
         return results
 
-    def _write_transfers(self, transfers, *, on_source_consumed, media_hint) -> None:
+    def _first_key(self, batch) -> str:
+        if isinstance(batch, PlanBatch):
+            return batch.plan.keys(batch.begin, batch.begin + 1)[0]
+        return batch[0].key
+
+    def _anchor_key(self, batch, anchor_page: str) -> str:
+        # FLAT_MEMORY: The anchor page's fragment under this batch's first prefix;
+        # any block of the session's previous batch identifies its extent.
+        if not anchor_page:
+            return ""
+        key = self._first_key(batch)
+        page = self.layout.page_key_of(key)
+        return key[: len(key) - len(page)] + anchor_page if page else ""
+
+    def _write_transfers(
+        self, transfers, *, on_source_consumed, media_hint, anchor_page=""
+    ) -> None:
         whole_bytes = self.layout.padded_bytes(transfers)
         remaining = whole_bytes
         # A group that fits is exactly one batch; only an oversized page splits.
@@ -790,8 +810,13 @@ class GPUTransfer:
                 ]
             )
         attempted_snapshot = False
+        anchor = None  # previous batch's first key, once one exists
         for batch, total in batches:
             remaining -= total
+            anchor_key = ""
+            if anchor_page:  # session extents on: chain each batch to the previous
+                anchor_key = self._anchor_key(batch, anchor_page) if anchor is None else anchor
+                anchor = self._first_key(batch)
             if self._duplicate_batch(batch):
                 self._record_batch(batch, write=True)
                 continue
@@ -810,6 +835,7 @@ class GPUTransfer:
                             stage=stage,
                             on_source_consumed=on_source_consumed,
                             media_hint=media_hint,
+                            anchor_key=anchor_key,
                         ),
                         reserved=True,
                     )
@@ -825,6 +851,7 @@ class GPUTransfer:
                     write=True,
                     on_source_consumed=(on_source_consumed if remaining == 0 else None),
                     media_hint=media_hint,
+                    anchor_key=anchor_key,
                 ),
             )
             self._record_batch(batch, write=True)
@@ -845,7 +872,7 @@ class GPUTransfer:
         return all(self._write_results(admission, count=len(batch), complete=False))
 
     def _write_snapshot(
-        self, *, first, batches, stage, on_source_consumed, media_hint
+        self, *, first, batches, stage, on_source_consumed, media_hint, anchor_key=""
     ) -> None:
         owned_batches = [first, *batches]
         offset = 0
@@ -857,10 +884,15 @@ class GPUTransfer:
             on_source_consumed()
         offset = 0
         for index, (batch, total) in enumerate(owned_batches):
+            if index and anchor_key:
+                anchor_key = self._first_key(owned_batches[index - 1][0])
             # FLAT_MEMORY: Admission remains per native batch, never one storage extent.
             if index == 0 or not self._duplicate_batch(batch):
                 self._write_staged_batch(
-                    batch, stage.narrow(0, offset, total), media_hint=media_hint
+                    batch,
+                    stage.narrow(0, offset, total),
+                    media_hint=media_hint,
+                    anchor_key=anchor_key,
                 )
             self._record_batch(batch, write=True)
             offset += total
@@ -917,10 +949,11 @@ class GPUTransfer:
             view[: source.numel()].copy_(source)
             offset += fragment.padded_length
 
-    def _write_staged_batch(self, batch, stage, *, media_hint) -> None:
+    def _write_staged_batch(self, batch, stage, *, media_hint, anchor_key="") -> None:
+        anchor = {"anchor_key": anchor_key} if anchor_key else {}
         if isinstance(batch, PlanBatch):
             result = self.manager.put_plan(
-                batch.plan, batch.begin, batch.end, stage.data_ptr(), media_hint
+                batch.plan, batch.begin, batch.end, stage.data_ptr(), media_hint, **anchor
             )
             self._write_results(result, count=len(batch), complete=True)
             return
@@ -936,6 +969,7 @@ class GPUTransfer:
             pointers,
             [fragment.padded_length for fragment in batch],
             **({"media_hint": media_hint} if media_hint != MEDIA_HINT_ANY else {}),
+            **anchor,
         )
         self._write_results(result, count=len(batch), complete=True)
 
@@ -947,13 +981,16 @@ class GPUTransfer:
         write: bool,
         on_source_consumed=None,
         media_hint: int = MEDIA_HINT_ANY,
+        anchor_key: str = "",
     ) -> None:
         if write:
             self._pack_batch(batch, stage)
             self._sync()
             if on_source_consumed is not None:
                 on_source_consumed()
-            self._write_staged_batch(batch, stage, media_hint=media_hint)
+            self._write_staged_batch(
+                batch, stage, media_hint=media_hint, anchor_key=anchor_key
+            )
             return
         views, pointers, sizes, keys = [], [], [], []
         offset = 0

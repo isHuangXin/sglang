@@ -979,7 +979,11 @@ class FlatMemoryDirectLinker(UnifiedCacheLinker):
         return [result.rid for result in results]
 
     def offload(
-        self, transfers: list[PoolTransfer], *, media_hint: int = MEDIA_HINT_ANY
+        self,
+        transfers: list[PoolTransfer],
+        *,
+        media_hint: int = MEDIA_HINT_ANY,
+        anchor_page: str = "",
     ) -> bool:
         self._check_open()
         expanded = self.pool_group.resolve_transfers(
@@ -1014,7 +1018,7 @@ class FlatMemoryDirectLinker(UnifiedCacheLinker):
         with self._lock:
             source_consumed = Future()
             future = self._write_executor.submit(
-                self._write, expanded, ready_event, source_consumed, media_hint
+                self._write, expanded, ready_event, source_consumed, media_hint, anchor_page
             )
             self._offloads.append(_Offload(future, source_consumed))
             self._offload_coverage[future] = coverage
@@ -1031,7 +1035,12 @@ class FlatMemoryDirectLinker(UnifiedCacheLinker):
                     query.eligible = True
 
     def _write(
-        self, transfers, ready_event, source_consumed=None, media_hint=MEDIA_HINT_ANY
+        self,
+        transfers,
+        ready_event,
+        source_consumed=None,
+        media_hint=MEDIA_HINT_ANY,
+        anchor_page="",
     ) -> FlatWriteResult:
         started = time.perf_counter()
         try:
@@ -1044,6 +1053,7 @@ class FlatMemoryDirectLinker(UnifiedCacheLinker):
                     else None
                 ),
                 **({"media_hint": media_hint} if media_hint != MEDIA_HINT_ANY else {}),
+                **({"anchor_page": anchor_page} if anchor_page else {}),
             )
             pages = len({key for transfer in transfers for key in transfer.keys or []})
             with self._lock:

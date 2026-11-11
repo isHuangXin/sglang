@@ -274,6 +274,8 @@ class FlatMemoryCache:
         self.scope_media_hints = bool(config.get("scope_media_hints", True))
         # Paper tau has no published value. 8192 is about 2.5x the ~3K mean per-turn
         # growth estimated from the CC replay statistics; not tuned on a real run.
+        # FLAT_MEMORY: FC-CIO session extents; writes carry an anchor only when on.
+        self.session_extents = int(config.get("session_reserve_bytes", 0)) > 0
         self.scope_short_turn_tokens = int(config.get("scope_short_turn_tokens", 8192))
         if self.scope_short_turn_tokens < 0:
             raise ValueError("Flat scope_short_turn_tokens must be nonnegative")
@@ -2249,8 +2251,15 @@ class FlatMemoryCache:
                 {MEDIA_HINT_DRAM: "dram", MEDIA_HINT_SSD: "ssd"}.get(hint, "any")
             ] += len(node.key)
             namespace = request_storage_namespace(node.key)
+            # FLAT_MEMORY: FC-CIO session extents append after the parent's last page.
+            parent = node.parent
+            anchor = (
+                namespace + parent.hash_value[-1]
+                if self.session_extents and parent is not None and parent.hash_value
+                else ""
+            )
             self.tree_linker._offload_node(
-                node_id, key_namespace=namespace, media_hint=hint
+                node_id, key_namespace=namespace, media_hint=hint, anchor_page=anchor
             )
             for page_hash in node.hash_value or ():
                 self._page_nodes[namespace + page_hash] = (node.id, page_hash)

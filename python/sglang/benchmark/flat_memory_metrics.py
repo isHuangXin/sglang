@@ -691,9 +691,11 @@ def summarize_flat_io(
         try:
             values.update(zip(names, compute(), strict=True))
         except (ValueError, KeyError, TypeError) as exc:
+            # Our own ValueErrors already read as a reason; others keep their type.
+            reason = str(exc) if type(exc) is ValueError else f"{type(exc).__name__}: {exc}"
             for name in names:
                 values[name] = None
-                errors[name] = f"{type(exc).__name__}: {exc}"
+                errors[name] = reason
 
     totals = _flat_window_totals(last)  # _validate_flat_window checked these
     values.update(

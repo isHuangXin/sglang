@@ -760,9 +760,8 @@ def format_hicache_io_report(
     result: Mapping, *, enabled: bool = True, request_prefetch_ms: float | None = None
 ) -> str:
     # FLAT_MEMORY: one line per metric; its qualifier lives in the label, the
-    # full semantics stay in the result's *_semantics fields.
-    if not enabled:
-        return ""
+    # full semantics stay in the result's *_semantics fields. The section is
+    # always printed; a run that does not use HiCache shows every row as "--".
     lines = [f"{'HiCache / Mooncake I/O':-^50}"]
     statuses = result["hicache_io_metadata"]["metric_status"]
     labels = (
@@ -777,7 +776,7 @@ def format_hicache_io_report(
         value, state = result.get(field), statuses[field]
         # A value read while transfers were still queued is partial; say so here.
         partial = "pending_at_boundary" if state["status"] == "pending_at_boundary" else None
-        if state["status"] == "not_tested":
+        if not enabled or state["status"] == "not_tested":
             text = "--"
         elif value is None:
             reason = "; ".join(filter(None, (partial, state["reason"])))
@@ -788,13 +787,15 @@ def format_hicache_io_report(
                 text += f" ({partial})"
         lines.append(f"  {label}: {text}")
     # Server-side, per request: storage prefetch start to its result on the host.
-    text = (
-        "-- (no request was served from storage)"
-        if request_prefetch_ms is None
-        else f"{request_prefetch_ms:.6g}"
-    )
+    if not enabled:
+        text = "--"
+    elif request_prefetch_ms is None:
+        text = "-- (no request was served from storage)"
+    else:
+        text = f"{request_prefetch_ms:.6g}"
     lines.append(f"  Storage -> Host prefetch latency, mean per storage-read request (ms): {text}")
     return "\n".join(lines)
+
 
 class HiCacheIOCollector:
     def __init__(

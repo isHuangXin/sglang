@@ -60,7 +60,7 @@ def format_storage_restore_report(report: Mapping) -> str:
     # the section does not apply to it, so it is omitted rather than shown empty.
     if report["tp_size"] is None:
         return ""
-    lines = [f"{'Storage restore to all-TP GPU ready, first per request':-^50}"]
+    lines = [f"{'Storage Restore to Observed All-TP GPU Ready':-^50}"]
     for name in _restore_contract.FIELDS.values():
         field = report["fields"][name]
         if field["status"] == "measured":

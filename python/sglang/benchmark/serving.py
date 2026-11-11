@@ -1838,8 +1838,8 @@ async def benchmark(
     if accept_length:
         print("{:<40} {:<10.2f}".format("Accept length:", accept_length))
     if args.cache_report or flat_mode or hicache_io.enabled:
-        # FLAT_MEMORY: sections that do not apply to this system render empty
-        # and are skipped.
+        # FLAT_MEMORY: the Flat prefetch/restore sections render empty on a
+        # system without them and are skipped; the I/O sections always print.
         for section in (
             format_cache_reports(cache_report),
             format_storage_restore_report(restore_report),

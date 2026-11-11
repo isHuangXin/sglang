@@ -18,6 +18,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+from sglang.srt.observability.flat_memory_metrics import finalize_flat_cache_accounting
 from sglang.srt.mem_cache.flat_memory_cache import (
     _RECLAIM_SYNC_POLLS,
     FlatMemoryCache,
@@ -565,8 +566,12 @@ class TestFlatMemoryAdmission(CustomTestCase):
         self.cache.evict(EvictParams(swa_num_tokens=64, num_tokens=64))
         self.assertEqual(self._match_len(req), loaded)
         self.assertFalse(self.runtime.is_idle())
+        # The first extend settles cache sources before the stream's counts exist.
+        finalize_flat_cache_accounting(req, prefix_len=len(req.prefix_indices))
+        req._cache_breakdown_computed = True
         self.storage.complete(req.rid)
         self.runtime.poll()
+        self.assertEqual(req.flat_cached_tokens["flat_dram"], loaded)
         self.assertFalse(self.runtime._streaming)
         self.assertEqual(self.runtime.layer_wise_consumer([req.rid]), -1)
         self.cache.evict(EvictParams(swa_num_tokens=64, num_tokens=64))

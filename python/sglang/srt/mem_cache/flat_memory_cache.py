@@ -36,7 +36,10 @@ from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
     PreparedLinkerLoad,
     UnifiedCacheLinkerWrapper,
 )
-from sglang.srt.observability.flat_memory_metrics import initialize_flat_request
+from sglang.srt.observability.flat_memory_metrics import (
+    finalize_flat_cache_accounting,
+    initialize_flat_request,
+)
 from sglang.srt.observability.storage_restore import RestoreEpisode, RestoreSource
 
 if TYPE_CHECKING:
@@ -1641,6 +1644,13 @@ class FlatMemoryCache:
                 ready_ns=ready_ns, endpoint="flat_all_tp_ready"
             )
         self._record_read_metrics(state)
+        req = state.req
+        if req._cache_breakdown_computed:
+            # FLAT_MEMORY: The owner's first extend settled its cache sources before
+            # this stream's DRAM/SSD counts existed; settle again on the same prefix.
+            finalize_flat_cache_accounting(
+                req, prefix_len=req.cached_tokens_device + req.cached_tokens_storage
+            )
         self._release_stream_hold(state)
         state.streaming = False
         self._streaming.pop(state.req.rid, None)

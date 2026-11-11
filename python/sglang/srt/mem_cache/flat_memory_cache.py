@@ -92,6 +92,9 @@ _RECLAIM_SYNC_POLLS = 64
 _OFFLOAD_FLAG_SLOTS = 64
 # Arbitrary; bounds the per-pass scan for prefetch candidates in a long queue.
 _PREFETCH_SCAN_REQUESTS = 512
+# Passes a vetoed window head waits before re-planning with unchanged capacity;
+# arbitrary, it bounds how late a restore starts once decode headroom shrinks.
+_VETO_RETRY_PASSES = 8
 # Bound for the page -> node map; arbitrary, rebuilt from live nodes past it.
 _MAX_PAGE_NODES = 1 << 22
 
@@ -325,6 +328,11 @@ class FlatMemoryCache:
         # matched in the current epoch needs no rematch.
         self._evict_epoch = 0
         self._evictions_seen = cache.evicted_tokens_total
+        # FLAT_MEMORY: local (full, swa, leases) when the window head was vetoed;
+        # selection waits for capacity to grow instead of re-planning every pass.
+        self._veto_capacity: tuple[int, ...] | None = None
+        self._veto_rid: str | None = None
+        self._veto_passes = 0
         # FLAT_MEMORY: periodic rank-0 summary of the control counters above, so a
         # serving run shows where scheduler time goes. 0 disables it.
         self.control_log_seconds = float(config.get("control_log_seconds", 30.0))
@@ -675,7 +683,13 @@ class FlatMemoryCache:
         offload_counts, offload_flags = self._offload_flags()
         # FLAT_MEMORY: Phases are rank-agreed; a queued request past its query
         # flags only no-ops, so poll stays O(in-flight), not O(waiting queue).
-        queries = [s for s in states if s.phase in ("query", "allocate")]
+        # An allocate state matters only once a common veto armed its deadline.
+        queries = [
+            s
+            for s in states
+            if s.phase == "query"
+            or (s.phase == "allocate" and s.allocation_wait_deadline)
+        ]
         query_flags, query_failures = self._query_flags(queries, now=now)
         reads = [s for s in states if s.phase == "read" or s.streaming] + streams
         read_done, read_errors, read_nearly = self._read_flags(reads)
@@ -824,7 +838,8 @@ class FlatMemoryCache:
             state.admission_attempted = False
             if state.phase == "ready":
                 self._set_wait(state, "ready_admission")
-        self._note_evictions()
+        capacity = self._restore_capacity(adder)
+        retry = self._note_evictions(capacity=capacity)
         self._refresh_stale_queries(self._admission_states)
         for lease in self._active_leases():
             if lease.phase == "ready":
@@ -834,8 +849,19 @@ class FlatMemoryCache:
         # A chunk the adder refused (SWA budget) is uncharged, so wait instead.
         self._prefill_busy = has_chunked_req
         if not has_chunked_req or adder.can_run_list:
-            self._select_restores(adder)
-            self._prefetch_ahead(requests, adder)
+            if retry:
+                self._veto_capacity = self._veto_rid = None
+                self._select_restores(adder)
+                self._prefetch_ahead(requests, adder)
+                if self._admission_candidate is not None:
+                    self._veto_capacity = capacity
+                    self._veto_rid = self._admission_candidate
+                    self._veto_passes = 0
+            else:
+                # FLAT_MEMORY: Nothing that could fit the vetoed head changed; keep
+                # it watched as the candidate, so its wait and fallback still run.
+                self._veto_passes += 1
+                self._admission_candidate = self._veto_rid
         else:
             for state in self._admission_states:
                 if state.phase == "allocate":
@@ -969,16 +995,43 @@ class FlatMemoryCache:
         full, swa = self._reduce([full, swa], torch.distributed.ReduceOp.MIN)
         return [full, swa] if full > 0 else None
 
-    def _note_evictions(self) -> bool:
+    def _note_evictions(
+        self, *, capacity: tuple[int, ...] | None = None
+    ) -> bool:
         # FLAT_MEMORY: rank-agreed, so every rank skips or rematches the same states.
+        # With capacity, returns instead whether restore selection should run.
         current = self.cache.evicted_tokens_total
-        evicted = self._reduce(
-            [int(current != self._evictions_seen)], torch.distributed.ReduceOp.MAX
-        )[0]
+        values = [int(current != self._evictions_seen)]
+        if capacity is not None:
+            values.append(int(self._capacity_changed(capacity)))
+        evicted, *retry = self._reduce(values, torch.distributed.ReduceOp.MAX)
         self._evictions_seen = current
         if evicted:
             self._evict_epoch += 1
-        return bool(evicted)
+        return bool(retry[0]) if capacity is not None else bool(evicted)
+
+    def _restore_capacity(self, adder) -> tuple[int, ...]:
+        swa = adder.rem_swa_tokens if adder.is_hybrid_swa else 0
+        running = len(adder.running_batch.reqs) if adder.running_batch is not None else 0
+        return (
+            adder.rem_total_tokens,
+            swa,
+            running,
+            len(self._leases),
+            self.tree_linker.source_lock_count,
+        )
+
+    def _capacity_changed(self, capacity: tuple[int, ...]) -> bool:
+        # A veto clears only when free+evictable pages grow, a running request
+        # leaves (its decode headroom goes), the lease or backup-lock set changes
+        # (both feed the plan and its wait eligibility), or a retry is due.
+        if self._veto_capacity is None or self._veto_passes >= _VETO_RETRY_PASSES:
+            return True
+        if self._veto_rid not in self.prefetches or self._veto_rid in self._leases:
+            return True
+        full, swa, running, *locks = capacity
+        old_full, old_swa, old_running, *old_locks = self._veto_capacity
+        return full > old_full or swa > old_swa or running < old_running or locks != old_locks
 
     def _revalidate_ready_unleased(self) -> None:
         # FLAT_MEMORY: Private allocation may evict another unleased ready hit.
@@ -1026,7 +1079,8 @@ class FlatMemoryCache:
     def _agree_requests(self, requests: list) -> None:
         # A rid containing NUL could alias another list; that only weakens this
         # cross-rank check, and json.dumps cost ~2x as much at a 6K queue.
-        identity = "\0".join([req.rid for req in requests])
+        # Only the scanned head picks windows and prefetches; the rest is counted.
+        identity = "\0".join([req.rid for req in requests[:_PREFETCH_SCAN_REQUESTS]])
         digest = int.from_bytes(hashlib.sha256(identity.encode()).digest()[:4], "big")
         signature = [len(requests), digest & 0x7FFFFFFF]
         minima, maxima = self._reduce_fused(

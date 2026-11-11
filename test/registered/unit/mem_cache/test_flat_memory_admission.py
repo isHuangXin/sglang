@@ -21,6 +21,7 @@ from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.observability.flat_memory_metrics import finalize_flat_cache_accounting
 from sglang.srt.mem_cache.flat_memory_cache import (
     _RECLAIM_SYNC_POLLS,
+    _VETO_RETRY_PASSES,
     FlatMemoryCache,
     request_storage_namespace,
 )
@@ -773,6 +774,24 @@ class TestFlatMemoryAdmission(CustomTestCase):
             req.flat_prefetch_stats["flat_restore_reason"], "full_decode_headroom"
         )
         return req, state, adder
+
+    def test_vetoed_head_is_not_replanned_until_capacity_changes(self):
+        """A vetoed head must not re-plan (lock, plan, two reduces) on every pass while
+        capacity is unchanged; at a 2K queue that made control cost ~150 ms/pass."""
+        req, state, adder = self._blocked_by_backup()
+        self.runtime.finish_admission(adder, can_progress=True)
+        attempts = state.allocation_plan_attempts
+        for _ in range(_VETO_RETRY_PASSES):
+            adder = self._adder()
+            self.runtime.prepare_admission([req], adder, has_chunked_req=False)
+            self.runtime.finish_admission(adder, can_progress=True)
+        self.assertEqual(state.allocation_plan_attempts, attempts)
+        self.assertEqual(state.phase, "allocate")
+        adder = self._adder()
+        self.runtime.prepare_admission([req], adder, has_chunked_req=False)
+        self.runtime.finish_admission(adder, can_progress=True)
+        self.assertEqual(state.allocation_plan_attempts, attempts + 1)
+        self.runtime.release_request(req.rid)
 
     def test_pending_backup_retirement_enables_restore_without_recompute(self):
         """An idle compute pass must wait for backup-owned capacity before recomputing."""

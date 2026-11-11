@@ -383,6 +383,9 @@ class UnifiedRadixCache(BasePrefixCache):
         self.ongoing_load_back: dict[int, _OngoingLoadBack] = {}
         self.enable_storage = False
         self.prefetch_loaded_tokens_by_reqid: dict[str, int] = {}
+        # FLAT_MEMORY: rid -> (storage-to-host prefetch ms, completed tokens), the
+        # per-request latency HiRadixCache already reports; popped at admission.
+        self._prefetch_latency_by_reqid: dict[str, tuple[float, int]] = {}
         self.ongoing_prefetch: dict[str, _OngoingPrefetch] = {}
         self.completed_prefetch_holds: dict[str, _CompletedPrefetchHold] = {}
         # Rids whose storage prefetch resolved without a usable result;
@@ -2031,6 +2034,12 @@ class UnifiedRadixCache(BasePrefixCache):
         req_id = operation.request_id
         completed_tokens = operation.completed_tokens
         hash_value = operation.hash_value
+        # FLAT_MEMORY: completed_tokens is rank-agreed, so every rank records the
+        # same pair; a discarded hybrid result still spent this fetch time.
+        self._prefetch_latency_by_reqid[req_id] = (
+            (time.monotonic() - operation.start_time) * 1000,
+            completed_tokens,
+        )
 
         (
             last_host_node_id,
@@ -2263,6 +2272,10 @@ class UnifiedRadixCache(BasePrefixCache):
         self.dec_host_lock_ref(hold.node_id, hold.host_lock_params)
         self.cache_controller.prefetch_tokens_occupied -= hold.reserved_tokens
 
+    def pop_prefetch_latency(self, req_id: str) -> tuple[float, int]:
+        """(latency_ms, completed_tokens) of the request's finished prefetch; (0.0, 0) if none."""
+        return self._prefetch_latency_by_reqid.pop(req_id, (0.0, 0))
+
     def pop_prefetch_loaded_tokens(self, req_id: str) -> int:
         # The request is being scheduled; a still-unserved miss marker is moot.
         self._storage_prefetch_missed_rids.discard(req_id)
@@ -2304,6 +2317,7 @@ class UnifiedRadixCache(BasePrefixCache):
         if self.linker is not None:
             self.linker.release_request(rid)
         self.prefetch_loaded_tokens_by_reqid.pop(rid, None)
+        self._prefetch_latency_by_reqid.pop(rid, None)
         self._storage_prefetch_missed_rids.discard(rid)
         self._storage_prefetch_deferred_rids.discard(rid)
         self.release_prefetch_hold(rid)

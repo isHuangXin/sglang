@@ -3769,6 +3769,7 @@ class Scheduler(
                     continue
                 # Pop the number of tokens loaded from storage (L3 hits)
                 from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
+                from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
                 loaded_tokens = self.tree_cache.pop_prefetch_loaded_tokens(req.rid)
                 if loaded_tokens > 0:
@@ -3780,6 +3781,20 @@ class Scheduler(
                     req.kvcache_bytes_per_page = (
                         self.tree_cache.token_to_kv_pool_host.get_size_per_token()
                         * self.tree_cache.page_size
+                    )
+                elif isinstance(self.tree_cache, UnifiedRadixCache):
+                    # FLAT_MEMORY: the v0.5.19 default cache also fetches from
+                    # storage; report its per-request latency the same way.
+                    req.storage_read_latency_ms, req.storage_read_tokens = (
+                        self.tree_cache.pop_prefetch_latency(req.rid)
+                    )
+                    # HostPoolGroup (hybrid layouts) and single host pools both
+                    # expose size_per_token. A hybrid group's anchor is a logical
+                    # pool (0 bytes) and its pools differ per page, so there is
+                    # no single page size to report: send None, never a fake 0.
+                    size = self.tree_cache.cache_controller.mem_pool_host.size_per_token
+                    req.kvcache_bytes_per_page = (
+                        size * self.tree_cache.page_size if size else None
                     )
 
             req.init_next_round_input(self.tree_cache)

@@ -65,12 +65,16 @@ def snapshot_unified_hicache(cache) -> dict:
     # This leaf reads live scheduler-owned queues, not worker events or Prometheus.
     result = cache.hicache_io_counters.snapshot()
     cc = cache.cache_controller
-    if cc is None or cache.host_memory_mode != "cache":
+    # FLAT_MEMORY: buffer_only still moves every hit and backup through the host
+    # pool (as staging), and the same ACKs are accounted, so its H2D/D2H bytes
+    # and the Mooncake fetch stats are measured too.
+    if cc is None:
         return {
             "epoch": result["epoch"],
             "status": "unavailable",
             "error": "HiCache L2 host cache is not enabled",
         }
+    result["host_memory_mode"] = cache.host_memory_mode
     result["pending"] = {
         "h2d": len(cc.load_queue) + len(cc.ack_load_queue),
         "d2h": len(cc.write_queue) + len(cc.ack_write_queue),

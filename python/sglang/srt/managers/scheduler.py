@@ -3707,6 +3707,9 @@ class Scheduler(
         # Get priority queue
         self.policy.calc_priority(self.waiting_queue, running_batch)
         if self.flat_memory_cache is not None:
+            self.flat_memory_cache.set_admission_pressure(
+                running=running_bs, capacity=self.max_running_requests
+            )
             self.waiting_queue = self.flat_memory_cache.order_ready_requests(
                 self.waiting_queue
             )

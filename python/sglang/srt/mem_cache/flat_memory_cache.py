@@ -95,6 +95,8 @@ _PREFETCH_SCAN_REQUESTS = 512
 # Passes a vetoed window head waits before re-planning with unchanged capacity;
 # arbitrary, it bounds how late a restore starts once decode headroom shrinks.
 _VETO_RETRY_PASSES = 8
+# Prefill tokens one HRRN service unit stands for (one default chunk); arbitrary.
+_PRESSURE_SERVICE_TOKENS = 8192
 # Bound for the page -> node map; arbitrary, rebuilt from live nodes past it.
 _MAX_PAGE_NODES = 1 << 22
 
@@ -208,6 +210,11 @@ class FlatMemoryCache:
         self.prefetches: dict[str, _Prefetch] = {}
         self.arrivals: dict[str, int] = {}
         self._next_arrival = 0
+        # FLAT_MEMORY: scheduler passes are rank-agreed, so waits counted in passes
+        # order the queue identically on every TP rank (wall clocks do not).
+        self._pass_index = 0
+        self._arrival_pass: dict[str, int] = {}
+        self._pressured = False
         self.io_errors = 0
         self.capacity_pressure_offloads = 0
         self.lease_fallbacks = 0
@@ -251,6 +258,13 @@ class FlatMemoryCache:
         # FLAT_MEMORY: Queued requests past the window also start reads, into free
         # GPU pages only; this share of the full pool caps their unadmitted pages.
         # 0 disables it. 0.1 is arbitrary; the pool ran ~30% used under load.
+        # FLAT_MEMORY: FC-MAS under pressure. Once running requests reach this share
+        # of the slots, cheap (cached/restored) prefills go first, HRRN-aged.
+        self.admission_pressure_fraction = float(
+            config.get("admission_pressure_fraction", 0.75)
+        )
+        if not 0 <= self.admission_pressure_fraction <= 1:
+            raise ValueError("Flat admission_pressure_fraction must be in [0, 1]")
         self.prefetch_pool_fraction = float(
             config.get("restore_prefetch_pool_fraction", 0.1)
         )
@@ -377,6 +391,7 @@ class FlatMemoryCache:
         if req.rid not in self.arrivals:
             self.arrivals[req.rid] = self._next_arrival
             self._next_arrival += 1
+            self._arrival_pass[req.rid] = self._pass_index
         if not req.flat_storage_backend:
             initialize_flat_request(
                 req, page_size=self.cache.page_size, bytes_per_page=None
@@ -384,6 +399,7 @@ class FlatMemoryCache:
 
     def begin_scheduler_pass(self) -> None:
         # FLAT_MEMORY: Close prior observations before making new scheduling decisions.
+        self._pass_index += 1
         now = time.monotonic()
         if self._logs_control and now - self._control_log_at >= self.control_log_seconds:
             self._log_control(now)
@@ -506,15 +522,24 @@ class FlatMemoryCache:
         self._publish_wait(state, scope="wait", seconds=state.wait_seconds)
         self._diagnose(state, wait_outcome=outcome, wait_finalized=1)
 
+    def set_admission_pressure(self, *, running: int, capacity: int) -> None:
+        # FLAT_MEMORY: Both inputs are rank-agreed scheduler state.
+        self._pressured = bool(
+            self.admission_pressure_fraction
+            and capacity > 0
+            and running >= self.admission_pressure_fraction * capacity
+        )
+
     def order_ready_requests(self, requests: list) -> list:
         # FLAT_MEMORY: A ready lease gets the first real admission attempt; the add
         # loop stops at the first NO_TOKEN, and a lease behind it would keep its
         # pinned pages, the very pages that made the earlier request not fit.
-        ordered = (
-            sorted(requests, key=lambda req: self.arrivals[req.rid])
-            if self.ready_fcfs
-            else requests
-        )
+        if not self.ready_fcfs:
+            ordered = requests
+        elif self._pressured:
+            ordered = self._order_under_pressure(requests)
+        else:
+            ordered = sorted(requests, key=lambda req: self.arrivals[req.rid])
         ready = {
             state.req.rid for state in self._active_leases() if state.phase == "ready"
         }
@@ -523,6 +548,25 @@ class FlatMemoryCache:
                 req for req in ordered if req.rid not in ready
             ]
         return ordered
+
+    def _order_under_pressure(self, requests: list) -> list:
+        # FLAT_MEMORY: Near full slots every prefill step runs eager with the whole
+        # decode batch, so short prefills (large cached or restored prefix) go first.
+        # HRRN (Eq. 1) on recompute tokens: waiting raises priority, nothing starves.
+        def priority(req) -> tuple:
+            service = 1.0 + self._extend_tokens(req) / _PRESSURE_SERVICE_TOKENS
+            waited = self._pass_index - self._arrival_pass.get(req.rid, self._pass_index)
+            return (-(1.0 + waited / service), self.arrivals[req.rid])
+
+        return sorted(requests, key=priority)
+
+    def _extend_tokens(self, req) -> int:
+        # Rank-agreed: device matches come from identical trees, endpoints from MIN reduces.
+        covered = len(req.prefix_indices)
+        state = self.prefetches.get(req.rid)
+        if state is not None:
+            covered = max(covered, len(state.result.device_indices), state.queried_endpoint)
+        return max(len(req.origin_input_ids) - covered, 0)
 
     def _active_leases(self) -> list[_Prefetch]:
         return [self.prefetches[rid] for rid in self._leases]
@@ -2115,6 +2159,7 @@ class FlatMemoryCache:
         state = self.prefetches.get(rid)
         if state is None:
             self.arrivals.pop(rid, None)
+            self._arrival_pass.pop(rid, None)
             return
         state.cancelled = True
         if state.restore_episode is not None:
@@ -2142,6 +2187,7 @@ class FlatMemoryCache:
         self._drop_lease(state.req.rid)
         if not keep_arrival:
             self.arrivals.pop(state.req.rid, None)
+            self._arrival_pass.pop(state.req.rid, None)
 
     def _classify_scope(self, *, cached_tokens: int, input_tokens: int) -> int:
         # FLAT_MEMORY: Table 2: nothing cached at arrival is turn 1 (SSD); a short
@@ -2352,6 +2398,7 @@ class FlatMemoryCache:
             )
         self.tree_linker.reset()
         self.arrivals.clear()
+        self._arrival_pass.clear()
         self._page_nodes.clear()
         self._admission_states = []
         self._admission_rids = None

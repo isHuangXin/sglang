@@ -775,6 +775,25 @@ class TestFlatMemoryAdmission(CustomTestCase):
         )
         return req, state, adder
 
+    def test_pressure_orders_waiting_queue_by_recompute_hrrn(self):
+        """Near full slots, a waiting request with little left to prefill overtakes an
+        older full-recompute one (HRRN on recompute tokens); below the threshold, FCFS."""
+        rt = self.runtime
+        long_req = self._req("long", length=60, start=200)
+        rt.begin_scheduler_pass()
+        short_req = self._req("short", length=60, start=400)
+        short_req.prefix_indices = torch.arange(56)
+        for _ in range(5):
+            rt.begin_scheduler_pass()
+        queue = [short_req, long_req]
+        with patch("sglang.srt.mem_cache.flat_memory_cache._PRESSURE_SERVICE_TOKENS", 8):
+            rt.set_admission_pressure(running=10, capacity=100)
+            self.assertEqual([r.rid for r in rt.order_ready_requests(queue)], ["long", "short"])
+            rt.set_admission_pressure(running=80, capacity=100)
+            self.assertEqual([r.rid for r in rt.order_ready_requests(queue)], ["short", "long"])
+        for req in (long_req, short_req):
+            rt.release_request(req.rid)
+
     def test_vetoed_head_is_not_replanned_until_capacity_changes(self):
         """A vetoed head must not re-plan (lock, plan, two reduces) on every pass while
         capacity is unchanged; at a 2K queue that made control cost ~150 ms/pass."""

@@ -428,8 +428,8 @@ class TestHiCacheIODeltas(CustomTestCase):
     def test_report_distinguishes_missing_from_zero_and_labels_units(self):
         result = summarize_hicache_io(_sample(), _sample())
         report = format_hicache_io_report(result)
-        self.assertRegex(report, r"Average SSD --> Host Latency \(ms\):\s+N/A")
-        self.assertRegex(report, r"SSD write operations \(data-synced buckets\):\s+0")
+        self.assertRegex(report, r"SSD -> Host fetch latency, per batch \(ms\): -- ")
+        self.assertRegex(report, r"SSD data-synced buckets \(buckets\): 0\n")
         self.assertEqual(result["hicache_io_units"]["dram_read_bw_gbps"], "GB/s")
 
 
@@ -447,7 +447,6 @@ class TestSSDCompletionWindow(CustomTestCase):
         self.assertEqual(deltas["ssd_kv_io_read"]["bytes"], 375_000_000)
         self.assertEqual(deltas["ssd_kv_io_write"]["bytes"], 650_000_000)
         self.assertFalse(result["hicache_io_metadata"]["drain"])
-        self.assertIn("userspace CQE observation", format_hicache_io_report(result))
         for direction in ("read", "write"):
             self.assertEqual(
                 result[f"ssd_{direction}_peak_bw_semantics"],
@@ -465,7 +464,7 @@ class TestSSDCompletionWindow(CustomTestCase):
         self.assertEqual(result["ssd_write_peak_bw_gbps"], 0.0)
         self.assertRegex(
             format_hicache_io_report(result),
-            r"SSD Write peak bandwidth, 100 ms \(GB/s\):\s+0\.000",
+            r"(?m)SSD write 100ms peak bandwidth \(GB/s\): 0$",
         )
 
     def test_exact_bucket_boundaries_keep_baseline_subtraction(self):

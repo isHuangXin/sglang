@@ -20,11 +20,7 @@ from sglang.srt.mem_cache.storage.flat_memory.flat_memory_direct_linker import (
     FlatMemoryDirectLinker,
 )
 from sglang.srt.mem_cache.storage.flat_memory.io_result import FlatCapacityError
-from sglang.srt.mem_cache.storage.flat_memory.payload import (
-    ALIGNMENT,
-    PAGE_FOUND,
-    PAGE_ON_DRAM,
-)
+from sglang.srt.mem_cache.storage.flat_memory.payload import ALIGNMENT
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -153,29 +149,29 @@ class TestFlatLookupDependencies(CustomTestCase):
         linker._lookup_executor.run_next()
 
     def test_dispatch_reuses_probe_media_and_falls_back_without_it(self):
-        """Restore dispatch takes media from the probe; a key it never saw is looked up."""
+        """Restore dispatch takes media per pool from the probe.
+
+        SWA keeps only trailing pages, so its absence on early pages must not
+        fail a restore that reads just the tail from it; a missing page it does
+        read still fails, and a key the probe never saw is looked up.
+        """
         linker = self.make_linker(
             sources={PoolName.KV: PoolName.KV, PoolName.SWA: PoolName.SWA}
         )
         keys = ["m0", "m1", "m2"]
         self.publish(linker, keys)
-        self.publish(linker, keys[:2], name=PoolName.SWA)
+        self.publish(linker, keys[2:], name=PoolName.SWA)
         linker.submit_lookup("media", _request(keys, trailing_pages=3))
         self.run_probe(linker)
-        found, dram = PAGE_FOUND, PAGE_ON_DRAM
-        # m2 lacks its SWA page, so it is not found although its KV page is.
-        self.assertEqual(
-            linker._lookup_media["media"], {"m0": found | dram, "m1": found | dram, "m2": dram}
-        )
         with patch.object(
             linker.transfer, "page_states", side_effect=AssertionError("looked up")
         ):
             self.assertEqual(
-                linker._media_counts("media", _request(keys[:2], trailing_pages=2)),
-                ("dram", 2, 0, 0),
+                linker._media_counts("media", _request(keys, trailing_pages=1)),
+                ("dram", 3, 0, 0),
             )
             with self.assertRaisesRegex(RuntimeError, "lost a required payload"):
-                linker._media_counts("media", _request(keys, trailing_pages=3))
+                linker._media_counts("media", _request(keys, trailing_pages=2))
         with patch.object(
             linker.transfer, "page_states", wraps=linker.transfer.page_states
         ) as lookup:

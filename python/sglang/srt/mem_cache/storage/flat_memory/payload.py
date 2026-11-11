@@ -31,9 +31,10 @@ class LookupProbeResult(msgspec.Struct, frozen=True):
     missing_records: frozenset[PageRecord] = frozenset()
     # FLAT_MEMORY: Per probed page, whether any fragment's GVA is SSD (>= 2^60).
     ssd_pages: tuple[bool, ...] = ()
-    # Per probed page, page_states bits combined over every pool: PAGE_FOUND only
-    # if all pools hold it, OR of the media bits. Empty if a pool went unprobed.
-    page_media: tuple[int, ...] = ()
+    # Per pool, its page_states bits for every probed page. Kept per pool: a
+    # trailing-policy pool (SWA) lacks early pages a restore never reads from it.
+    # Empty if a pool went unprobed.
+    page_media: tuple[tuple[PoolName, tuple[int, ...]], ...] = ()
 
 
 # FLAT_MEMORY: Must match MediaHint in flat_memory_manager.h.
@@ -995,17 +996,13 @@ class GPUTransfer:
         possible = set(candidates)
         pools = []
         ssd_pages = [False] * len(keys)
-        found = [True] * len(keys)
-        media = [0] * len(keys)
-        probed = 0
+        page_media = []
         for transfer in transfers:
             states = self.page_states(name=transfer.name, keys=keys)
-            probed += 1
+            page_media.append((transfer.name, tuple(states)))
             exists = [bool(state & PAGE_FOUND) for state in states]
             for index, state in enumerate(states):
                 ssd_pages[index] |= bool(state & PAGE_ON_SSD)
-                found[index] = found[index] and bool(state & PAGE_FOUND)
-                media[index] |= state & ~PAGE_FOUND
             records = [
                 self.layout.page_record(name=transfer.name, page_key=key)
                 for key in keys
@@ -1047,11 +1044,7 @@ class GPUTransfer:
             tuple(sorted(candidates)),
             frozenset(missing),
             tuple(ssd_pages),
-            (
-                tuple(bits | (PAGE_FOUND if ok else 0) for bits, ok in zip(media, found))
-                if probed == len(transfers)
-                else ()
-            ),
+            tuple(page_media) if len(page_media) == len(transfers) else (),
         )
 
     def page_states(self, *, name: PoolName, keys: list[str]) -> list[int]:

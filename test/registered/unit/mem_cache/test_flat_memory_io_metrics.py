@@ -11,6 +11,7 @@ import aiohttp
 from sglang.benchmark.flat_memory_metrics import (
     FlatIOBucketAccumulator,
     FlatMemoryIOWindow,
+    summarize_cache_usage,
     summarize_flat_io,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -100,6 +101,31 @@ def _stream_chunk(previous, begin, end, records, *, end_ns=0):
 
 
 class TestFlatMemoryIOMetrics(CustomTestCase):
+    def test_storage_latency_mean_ignores_requests_that_never_read_storage(self):
+        """Regression: requests with no storage read carry no latency, which used to
+        void the mean for every Mooncake run; a missing one among readers still does."""
+
+        def output(tokens, latency):
+            fields = dict.fromkeys(
+                (
+                    "server_prompt_tokens", "server_cached_tokens",
+                    "server_cached_tokens_device", "server_cached_tokens_host",
+                    "server_cached_tokens_storage", "kvcache_page_size",
+                    "kvcache_bytes_per_page", "d2h_tokens", "storage_write_tokens",
+                )
+            )
+            return SimpleNamespace(
+                success=True,
+                storage_read_tokens=tokens,
+                storage_read_latency_ms=latency,
+                **fields,
+            )
+
+        outputs = [output(None, None), output(768, 8000.0), output(7168, 1000.0)]
+        self.assertEqual(summarize_cache_usage(outputs)["avg_storage_read_latency_ms"], 4500.0)
+        outputs.append(output(256, None))
+        self.assertIsNone(summarize_cache_usage(outputs)["avg_storage_read_latency_ms"])
+
     def test_common_pressure_is_not_summed_across_replicated_ranks(self):
         """Three rejected offloads are not 24 rejections merely because TP is eight."""
         before = _snapshot(active=True, pressure=5)
@@ -114,28 +140,66 @@ class TestFlatMemoryIOMetrics(CustomTestCase):
         result = summarize_flat_io(before, after, "window", expected_tp_size=8)
         self.assertIsNone(result["flat_capacity_pressure_offloads"])
 
-    def test_pressure_does_not_hide_real_io_errors(self):
-        """Either a native or scheduler I/O error still invalidates the benchmark."""
-        for native in (False, True):
-            with self.subTest(native=native):
-                before = _snapshot(active=True, pressure=0)
-                after = _snapshot(active=False, pressure=3)
-                rank = after["ranks"][4]
-                if native:
-                    rank["io_window"]["io_errors"] = 1
-                else:
-                    rank["flat_io_errors"] = 1
-                with self.assertRaisesRegex(ValueError, "I/O errors"):
-                    summarize_flat_io(before, after, "window", expected_tp_size=8)
+    def test_io_errors_are_counted_without_voiding_the_window(self):
+        """A failed op is counted apart from pressure; the window's bandwidth stays measured.
 
-    def test_inconsistent_or_reset_common_counters_are_rejected(self):
+        Native errors are per-rank ops and sum; scheduler fallbacks are TP-agreed,
+        so eight ranks reporting the same two are two, not sixteen.
+        """
+        before = _snapshot(active=True, pressure=0)
+        after = _snapshot(active=False, pressure=3)
+        after["ranks"][4]["io_window"]["io_errors"] = 1
+        after["ranks"][5]["io_window"]["io_errors"] = 2
+        for rank in after["ranks"]:
+            rank["flat_io_errors"] = 2
+        result = summarize_flat_io(before, after, "window", expected_tp_size=8)
+        self.assertEqual(result["flat_native_io_errors"], 3)
+        self.assertEqual(result["flat_restore_io_errors"], 2)
+        self.assertEqual(result["flat_capacity_pressure_offloads"], 3)
+        self.assertEqual(result["flat_io_window_seconds"], 1)
+
+    def test_overflowed_end_window_loses_only_its_peaks(self):
+        """A full server bucket buffer truncates the 100 ms series, never the counters."""
+        before = _snapshot(active=True, pressure=0)
+        after = _snapshot(active=False, pressure=0)
+        for rank in after["ranks"]:
+            rank["io_window"].update(
+                overflowed=True, read_completed_ops=1, read_completed_bytes=1000
+            )
+        result = summarize_flat_io(before, after, "window", expected_tp_size=8)
+        self.assertEqual(result["flat_ssd_read_io_count"], 8)
+        self.assertAlmostEqual(result["flat_ssd_read_bw_gbps"], 8000 / 1e9)
+        self.assertIsNone(result["flat_ssd_read_peak_bw_gbps"])
+        self.assertIn(
+            "overflowed", result["flat_io_field_errors"]["flat_ssd_read_peak_bw_gbps"]
+        )
+        before["ranks"][0]["io_window"]["overflowed"] = True
+        with self.assertRaises(ValueError):
+            summarize_flat_io(before, after, "window", expected_tp_size=8)
+
+    def test_begin_window_with_errors_is_rejected(self):
+        """Errors before the benchmark started would be charged to it."""
+        before = _snapshot(active=True, pressure=0)
+        before["ranks"][0]["io_window"]["io_errors"] = 1
+        with self.assertRaisesRegex(ValueError, "Nonempty begin"):
+            summarize_flat_io(
+                before, _snapshot(active=False, pressure=0), "window", expected_tp_size=8
+            )
+
+    def test_inconsistent_or_reset_common_counters_void_only_that_field(self):
+        """A disagreeing or reset counter is never reported, and costs no other field."""
         for pressure in (4, 9):
             with self.subTest(pressure=pressure):
                 before = _snapshot(active=True, pressure=5)
                 after = _snapshot(active=False, pressure=8)
                 after["ranks"][3]["flat_capacity_pressure_offloads"] = pressure
-                with self.assertRaises(ValueError):
-                    summarize_flat_io(before, after, "window", expected_tp_size=8)
+                result = summarize_flat_io(before, after, "window", expected_tp_size=8)
+                self.assertIsNone(result["flat_capacity_pressure_offloads"])
+                self.assertIn(
+                    "flat_capacity_pressure_offloads", result["flat_io_field_errors"]
+                )
+                self.assertEqual(result["flat_ssd_read_io_count"], 0)
+                self.assertEqual(result["flat_restore_io_errors"], 0)
 
     def test_long_window_merges_tp_peaks_without_retaining_history(self):
         """Long windows must preserve max-of-TP-sums, not sum-of-rank-maxima."""
@@ -163,16 +227,24 @@ class TestFlatMemoryIOMetrics(CustomTestCase):
         )
         self.assertLess(len(json.dumps(summary)), 3000)
         self.assertEqual(summary["collections"], 3)
+        # A summary that lost bytes voids the peaks, never the averages.
         broken = copy.deepcopy(summary)
         broken["rank_bytes"][0]["read_bytes"] -= 1
-        with self.assertRaisesRegex(ValueError, "cumulative bytes"):
-            summarize_flat_io(before, after, "window", 8, bucket_summary=broken)
+        result = summarize_flat_io(before, after, "window", 8, bucket_summary=broken)
+        self.assertIsNone(result["flat_ssd_read_peak_bw_gbps"])
+        self.assertIn(
+            "cumulative bytes",
+            result["flat_io_field_errors"]["flat_dram_read_peak_bw_gbps"],
+        )
+        self.assertAlmostEqual(
+            result["flat_ssd_read_bw_gbps"], 315 / 16208.485088052 / 1e9
+        )
 
     def test_incremental_collection_rejects_gaps_duplicates_and_lost_bytes(self):
         """A missing chunk must never become a measured zero or an underestimated peak."""
         before = _stream_before()
         first = _stream_chunk(before, 0, 10, [(0, 2, 100)])
-        for failure in ("gap", "duplicate", "rank_boundary", "lost_bytes", "io_error"):
+        for failure in ("gap", "duplicate", "rank_boundary", "lost_bytes"):
             with self.subTest(failure=failure):
                 collector = FlatIOBucketAccumulator(before, "window", 8)
                 collector.add(first)
@@ -184,10 +256,8 @@ class TestFlatMemoryIOMetrics(CustomTestCase):
                     after = first
                 elif failure == "rank_boundary":
                     after["ranks"][1]["io_window"]["bucket_end"] = 19
-                elif failure == "lost_bytes":
-                    after["ranks"][0]["io_window"]["read_completed_bytes"] += 1
                 else:
-                    after["ranks"][0]["io_window"]["io_errors"] = 1
+                    after["ranks"][0]["io_window"]["read_completed_bytes"] += 1
                 with self.assertRaises(ValueError):
                     collector.add(after, final=failure != "duplicate")
 
@@ -239,8 +309,14 @@ class TestFlatMemoryIOMetrics(CustomTestCase):
 
         asyncio.run(exercise())
 
-    def test_periodic_failure_keeps_requests_but_invalidates_metrics(self):
-        """Telemetry failure must stop consuming buckets, not cancel the request workload."""
+    def test_periodic_failure_loses_only_the_peaks(self):
+        """A failed bucket collection must not cancel the workload or the window.
+
+        Only the 100 ms peaks need every chunk; the whole-window counters are
+        still measured, and each peak row carries the collection failure.
+        """
+        before = _stream_before()
+        after = _stream_chunk(before, 0, 11, [(0, 2, 100)], end_ns=1_000_000_001)
 
         async def exercise():
             window = FlatMemoryIOWindow("http://unused", True, expected_tp_size=8)
@@ -253,15 +329,19 @@ class TestFlatMemoryIOMetrics(CustomTestCase):
                 calls.append(action)
                 if action == "collect":
                     raise ValueError("missing rank")
-                return _stream_before() if action == "begin" else {}
+                return before if action == "begin" else after
 
             window._request = request
             with self.assertWarnsRegex(UserWarning, "missing rank"):
                 async with window:
                     await window._collector
-            self.assertEqual(calls, ["begin", "collect", "abort"])
-            self.assertEqual(window.result["flat_io_status"], "unavailable")
-            self.assertIsNone(window.result["flat_ssd_read_peak_bw_gbps"])
+            self.assertEqual(calls, ["begin", "collect", "end"])
+            result = window.result
+            self.assertEqual(result["flat_io_status"], "ok")
+            self.assertAlmostEqual(result["flat_ssd_read_bw_gbps"], 100 / 1e9)
+            for field in ("flat_ssd_read_peak_bw_gbps", "flat_dram_write_peak_bw_gbps"):
+                self.assertIsNone(result[field])
+                self.assertIn("missing rank", result["flat_io_field_errors"][field])
 
         asyncio.run(exercise())
 

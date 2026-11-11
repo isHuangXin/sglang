@@ -51,6 +51,24 @@ _IO_RESULT_FIELDS = (
     "flat_ssd_durable_write_batches",
     "flat_ssd_new_kv_blocks",
     "flat_capacity_pressure_offloads",
+    "flat_native_io_errors",
+    "flat_restore_io_errors",
+)
+# FLAT_MEMORY: TP-agreed scheduler counters reported as per-window deltas;
+# result field -> snapshot counter.
+_REPLICATED_COUNTERS = {
+    "flat_capacity_pressure_offloads": "flat_capacity_pressure_offloads",
+    "flat_restore_fallbacks": "flat_restore_lease_fallbacks",
+    "flat_restore_deferrals": "flat_restore_deferrals",
+    "flat_restore_ready_dropped_tokens": "flat_restore_ready_dropped_tokens",
+    "flat_restore_admission_dropped_tokens": "flat_restore_admission_dropped_tokens",
+    "flat_reclaim_invalidated_nodes": "flat_reclaim_invalidated_nodes",
+    "flat_placed_dram_tokens": "flat_scope_hint_dram_tokens",
+    "flat_placed_ssd_tokens": "flat_scope_hint_ssd_tokens",
+    "flat_placed_any_tokens": "flat_scope_hint_any_tokens",
+}
+_IO_RESULT_FIELDS += tuple(
+    name for name in _REPLICATED_COUNTERS if name not in _IO_RESULT_FIELDS
 )
 
 
@@ -218,8 +236,10 @@ def summarize_cache_usage(outputs):
         )
     for name in ("storage_read_tokens", "d2h_tokens", "storage_write_tokens"):
         result[f"total_{name}"] = _flat_optional_sum(successful, name)
-    latency = _flat_optional_sum(successful, "storage_read_latency_ms", False)
+    # FLAT_MEMORY: only requests that read from storage carry a latency; a
+    # missing one among them makes the mean unavailable, not partial.
     reads = [output for output in successful if output.storage_read_tokens]
+    latency = _flat_optional_sum(reads, "storage_read_latency_ms", False)
     result["avg_storage_read_latency_ms"] = (
         latency / len(reads) if latency is not None and reads else None
     )
@@ -266,12 +286,15 @@ def _validate_flat_window(snapshot, window_id, active, expected_tp_size=None):
         window = rank.get("io_window")
         version = _flat_window_schema_version(window)
         versions.add(version)
+        # FLAT_MEMORY: overflow truncates only the bucket series (native counters
+        # are updated first), so an overflowed end window loses just its peaks.
         if (
             window.get("enabled") is not True
             or window.get("window_id") != window_id
             or window.get("active") is not active
             or window.get("aborted") is not False
-            or window.get("overflowed") is not False
+            or (active and window.get("overflowed") is not False)
+            or type(window.get("overflowed")) is not bool
             or _flat_counter(window.get("bucket_ns")) != 100_000_000
         ):
             raise ValueError("Disabled, mismatched, aborted or overflowed Flat window")
@@ -283,17 +306,19 @@ def _validate_flat_window(snapshot, window_id, active, expected_tp_size=None):
         boundaries.add((start, end))
         counters = _WINDOW_COUNTERS + (_DRAM_WINDOW_COUNTERS if version >= 2 else ())
         for name in counters:
+            # FLAT_MEMORY: errors are counted, not fatal; the byte counters only
+            # cover completed/durable I/O, so the bandwidth stays valid.
             value = _flat_counter(window.get(name))
-            if (active or name == "io_errors") and value:
-                raise ValueError("Nonempty begin window or Flat I/O errors")
+            if active and value:
+                raise ValueError("Nonempty begin Flat I/O window")
         if not isinstance(window.get("buckets"), list) or (
             active and window["buckets"]
         ):
             raise ValueError("Invalid Flat I/O buckets")
+        # An undrained end still counts what completed; only the begin must be idle.
         for name in ("pending_backups", "pending_prefetches"):
-            if _flat_counter(rank[name]):
+            if _flat_counter(rank[name]) and active:
                 raise ValueError("Flat pipeline was not drained")
-        _flat_counter(rank["flat_io_errors"])
     if len(boundaries) != 1:
         raise ValueError("TP ranks do not share Flat window boundaries")
     if len(versions) != 1:
@@ -427,8 +452,6 @@ class FlatIOBucketAccumulator:
                 raise ValueError("Invalid incremental Flat I/O window")
             for name in _WINDOW_COUNTERS + _DRAM_WINDOW_COUNTERS:
                 _flat_counter(window.get(name))
-            if window["io_errors"] or rank["flat_io_errors"] != prior["flat_io_errors"]:
-                raise ValueError("Flat pipeline reported I/O errors")
             begin, end, end_ns = (
                 _flat_counter(window.get(name))
                 for name in ("bucket_begin", "bucket_end", "end_ns")
@@ -593,9 +616,63 @@ def _flat_transfer_spans(first, last):
     return spans
 
 
+def _flat_window_totals(last):
+    return {
+        name: sum(rank["io_window"][name] for rank in last.values())
+        for name in _WINDOW_COUNTERS
+    }
+
+
+def _flat_bandwidth_delta(first, last, name):
+    return sum(
+        _flat_counter(
+            _flat_counter(rank["bandwidth"][name])
+            - _flat_counter(first[tp_rank]["bandwidth"][name])
+        )
+        for tp_rank, rank in last.items()
+    )
+
+
+def _flat_restore_errors(first, last):
+    # Most scheduler failures are TP-agreed, so take the max, not the sum.
+    return max(
+        _flat_counter(
+            _flat_counter(rank["flat_io_errors"])
+            - _flat_counter(first[tp_rank]["flat_io_errors"])
+        )
+        for tp_rank, rank in last.items()
+    )
+
+
+def _flat_active_bandwidth(first, last, direction):
+    # Nanoseconds and decimal GB cancel in bytes/ns == GB/s, matching the divisor
+    # hicache_io_metrics.py uses for its L2 rows. The spans come from host clocks
+    # around each transfer, not CUDA events, and a mixed-tier ReadGPU batch times
+    # its SSD transfer inside the DRAM span, so the read ratio is a lower bound.
+    spans = _flat_transfer_spans(first, last)
+    if spans is None:
+        raise ValueError("no DRAM transfer span telemetry")
+    span = spans[f"dram_{direction}_ns"]
+    if not span:
+        raise ValueError(f"no DRAM {direction} transfers in the window")
+    return _flat_bandwidth_delta(first, last, f"dram_{direction}_total_bytes") / span
+
+
 def summarize_flat_io(
-    before, after, window_id, expected_tp_size=None, *, bucket_summary=None
+    before,
+    after,
+    window_id,
+    expected_tp_size=None,
+    *,
+    bucket_summary=None,
+    bucket_error=None,
 ):
+    """Measure every field that can be measured.
+
+    Only a window whose identity cannot be trusted (ranks, window id, boundaries,
+    schema) raises. Any other failure leaves just the fields it feeds as None,
+    with the reason in ``flat_io_field_errors``.
+    """
     first, (start, _) = _validate_flat_window(before, window_id, True, expected_tp_size)
     last, (end_start, end) = _validate_flat_window(after, window_id, False, len(first))
     if start != end_start:
@@ -603,64 +680,101 @@ def summarize_flat_io(
     schema_version = _flat_window_schema_version(first[0]["io_window"])
     if schema_version != _flat_window_schema_version(last[0]["io_window"]):
         raise ValueError("Flat begin/end I/O window schema version mismatch")
-    seconds = (end - start) / 1e9
-    totals = dict.fromkeys(_WINDOW_COUNTERS, 0)
-    deltas = dict.fromkeys(
-        ("dram_read_total_bytes", "dram_write_total_bytes", "ssd_write_count"), 0
-    )
-    spans = _flat_transfer_spans(first, last)
     for tp_rank, rank in last.items():
-        prior = first[tp_rank]
-        if any(rank[name] != prior[name] for name in ("pid", "gpu_id", "gds_mode")):
+        if any(rank[name] != first[tp_rank][name] for name in ("pid", "gpu_id", "gds_mode")):
             raise ValueError("Flat TP identity changed during collection")
-        if _flat_counter(rank["flat_io_errors"] - prior["flat_io_errors"]):
-            raise ValueError("Flat pipeline reported I/O errors")
-        for name in deltas:
-            delta = _flat_counter(rank["bandwidth"][name]) - _flat_counter(
-                prior["bandwidth"][name]
-            )
-            deltas[name] += _flat_counter(delta)
-        for name in totals:
-            totals[name] += rank["io_window"][name]
-    peaks = (
-        _flat_streamed_peaks(last, bucket_summary)
-        if schema_version == 3
-        else _flat_bucket_peaks(
-            last, duration_ns=end - start, schema_version=schema_version
-        )
+    seconds = (end - start) / 1e9
+    values = {"flat_io_window_seconds": seconds}
+    errors = {}
+
+    def measure(names, compute):
+        try:
+            values.update(zip(names, compute(), strict=True))
+        except (ValueError, KeyError, TypeError) as exc:
+            for name in names:
+                values[name] = None
+                errors[name] = f"{type(exc).__name__}: {exc}"
+
+    totals = _flat_window_totals(last)  # _validate_flat_window checked these
+    values.update(
+        flat_ssd_read_bw_gbps=totals["read_completed_bytes"] / seconds / 1e9,
+        flat_ssd_write_bw_gbps=totals["durable_write_bytes"] / seconds / 1e9,
+        flat_ssd_read_io_count=totals["read_completed_ops"],
+        flat_ssd_write_io_count=totals["write_completed_ops"],
+        flat_ssd_durable_write_batches=totals["durable_write_batches"],
+        # Failed native ops, summed over ranks.
+        flat_native_io_errors=totals["io_errors"],
     )
-    # Nanoseconds and decimal GB cancel in bytes/ns == GB/s, matching the divisor
-    # hicache_io_metrics.py uses for its L2 rows. The spans come from host clocks
-    # around each transfer, not CUDA events, and a mixed-tier ReadGPU batch times
-    # its SSD transfer inside the DRAM span, so the read ratio is a lower bound.
-    active = {
-        f"flat_dram_{direction}_active_bw_gbps": (
-            deltas[f"dram_{direction}_total_bytes"] / spans[f"dram_{direction}_ns"]
-            if spans and spans[f"dram_{direction}_ns"]
-            else None
+    for direction in ("read", "write"):
+        measure(
+            (f"flat_dram_{direction}_bw_gbps",),
+            lambda direction=direction: (
+                _flat_bandwidth_delta(first, last, f"dram_{direction}_total_bytes")
+                / seconds
+                / 1e9,
+            ),
         )
-        for direction in ("read", "write")
-    }
-    return {
-        "flat_io_window_seconds": seconds,
-        "flat_dram_read_bw_gbps": deltas["dram_read_total_bytes"] / seconds / 1e9,
-        "flat_dram_write_bw_gbps": deltas["dram_write_total_bytes"] / seconds / 1e9,
-        **active,
-        "flat_dram_read_peak_bw_gbps": peaks.get("dram_read_bytes"),
-        "flat_dram_write_peak_bw_gbps": peaks.get("dram_write_bytes"),
-        "flat_ssd_read_bw_gbps": totals["read_completed_bytes"] / seconds / 1e9,
-        "flat_ssd_write_bw_gbps": totals["durable_write_bytes"] / seconds / 1e9,
-        "flat_ssd_read_peak_bw_gbps": peaks["read_bytes"],
-        "flat_ssd_write_peak_bw_gbps": peaks["write_bytes"],
-        "flat_ssd_read_io_count": totals["read_completed_ops"],
-        "flat_ssd_write_io_count": totals["write_completed_ops"],
-        "flat_ssd_durable_write_batches": totals["durable_write_batches"],
-        "flat_ssd_new_kv_blocks": deltas["ssd_write_count"],
+        measure(
+            (f"flat_dram_{direction}_active_bw_gbps",),
+            lambda direction=direction: (
+                _flat_active_bandwidth(first, last, direction),
+            ),
+        )
+    measure(
+        ("flat_ssd_new_kv_blocks",),
+        lambda: (_flat_bandwidth_delta(first, last, "ssd_write_count"),),
+    )
+
+    found = {}
+
+    def peaks():
+        if bucket_error is not None:
+            raise ValueError(f"bucket collection failed: {bucket_error}")
+        if any(rank["io_window"]["overflowed"] for rank in last.values()):
+            raise ValueError("server bucket buffer overflowed")
+        found.update(
+            _flat_streamed_peaks(last, bucket_summary)
+            if schema_version == 3
+            else _flat_bucket_peaks(
+                last, duration_ns=end - start, schema_version=schema_version
+            )
+        )
+        return found["read_bytes"], found["write_bytes"]
+
+    measure(("flat_ssd_read_peak_bw_gbps", "flat_ssd_write_peak_bw_gbps"), peaks)
+    if "flat_ssd_read_peak_bw_gbps" in errors:
+        for direction in ("read", "write"):
+            values[f"flat_dram_{direction}_peak_bw_gbps"] = None
+            errors[f"flat_dram_{direction}_peak_bw_gbps"] = errors[
+                "flat_ssd_read_peak_bw_gbps"
+            ]
+    else:
+
+        def dram_peaks():
+            if "dram_read_bytes" not in found:
+                raise ValueError("window schema has SSD buckets only")
+            return found["dram_read_bytes"], found["dram_write_bytes"]
+
+        measure(
+            ("flat_dram_read_peak_bw_gbps", "flat_dram_write_peak_bw_gbps"),
+            dram_peaks,
+        )
+
+    def replicated(counter):
         # FLAT_MEMORY: TP-common outcomes are replicated, not additive per-rank I/O.
-        "flat_capacity_pressure_offloads": _flat_replicated_delta(
-            first, last, "flat_capacity_pressure_offloads"
-        ),
-    }
+        delta = _flat_replicated_delta(first, last, counter)
+        if delta is None:
+            raise KeyError(f"{counter} not exported by this server")
+        return (delta,)
+
+    for name, counter in _REPLICATED_COUNTERS.items():
+        measure((name,), lambda counter=counter: replicated(counter))
+    # Restores, backups and lookups the scheduler fell back from, counted once.
+    measure(
+        ("flat_restore_io_errors",), lambda: (_flat_restore_errors(first, last),)
+    )
+    values["flat_io_field_errors"] = errors
+    return values
 
 
 class FlatMemoryIOWindow:
@@ -680,6 +794,7 @@ class FlatMemoryIOWindow:
             flat_io_status="unavailable",
             flat_io_error="Flat I/O collection was not requested",
             flat_io_metadata={"before": None, "after": None},
+            flat_io_field_errors={},
         )
 
     async def _request(self, action=None):
@@ -725,8 +840,10 @@ class FlatMemoryIOWindow:
                 if not self._stop_collection.is_set():
                     self._accumulator.add(await self._request("collect"))
         except Exception as exc:
+            # FLAT_MEMORY: only the 100 ms peaks need every chunk; the window
+            # still ends and measures its whole-window counters.
             self._collection_error = exc
-            self._unavailable(exc)
+            warnings.warn(f"Flat I/O peak collection failed: {exc}")
 
     async def _stop_collector(self):
         self._stop_collection.set()
@@ -807,23 +924,33 @@ class FlatMemoryIOWindow:
     async def __aexit__(self, exc_type, exc, tb):
         try:
             await self._stop_collector()
-            if self.ready and exc_type is None and self._collection_error is None:
+            if self.ready and exc_type is None:
                 try:
-                    await self._wait_idle()
-                    after = await self._request("end")
                     metadata = self.result["flat_io_metadata"]
+                    try:
+                        await self._wait_idle()
+                    except TimeoutError as error:
+                        # Completed/durable counters stay exact; work still in
+                        # flight is simply not in the window.
+                        metadata["drain_error"] = str(error)
+                        warnings.warn(f"Flat I/O window ends undrained: {error}")
+                    after = await self._request("end")
                     metadata["after"] = after
-                    bucket_summary = None
-                    if self._accumulator is not None:
-                        self._accumulator.add(after, final=True)
-                        bucket_summary = self._accumulator.summary()
-                        metadata["bucket_summary"] = bucket_summary
+                    bucket_summary, bucket_error = None, self._collection_error
+                    if self._accumulator is not None and bucket_error is None:
+                        try:
+                            self._accumulator.add(after, final=True)
+                            bucket_summary = self._accumulator.summary()
+                            metadata["bucket_summary"] = bucket_summary
+                        except ValueError as error:
+                            bucket_error = error
                     metrics = summarize_flat_io(
                         metadata["before"],
                         after,
                         self.window_id,
                         self.expected_tp_size,
                         bucket_summary=bucket_summary,
+                        bucket_error=bucket_error,
                     )
                     self.result.update(metrics, flat_io_status="ok", flat_io_error=None)
                     self.begin_attempted = False

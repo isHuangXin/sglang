@@ -18,7 +18,8 @@ _FETCH_CAPABILITY = "ssd_to_host_fetch_v1"
 _SSD_PEAK_SEMANTICS = "bucket_data_cqe_observed_100ms_v1"
 _SSD_WINDOW_PREFIX = "mooncake_ssd_kv_io_"
 _SSD_BUCKET_NS = 100_000_000
-_SSD_MAX_BUCKETS = 16_384
+# FLAT_MEMORY: matches the Mooncake owner ring (io_metrics.h kCapacity).
+_SSD_MAX_BUCKETS = 131_072
 _SSD_WINDOW_SCALARS = (
     "bucket_width_ns",
     "capacity_buckets",
@@ -755,42 +756,45 @@ def mark_not_tested(result: dict, *, owner_configured: bool, native_mooncake: bo
     return result
 
 
-def format_hicache_io_report(result: Mapping, *, enabled: bool = True) -> str:
-    lines = ["----------------HiCache / Mooncake I/O----------------"]
+def format_hicache_io_report(
+    result: Mapping, *, enabled: bool = True, request_prefetch_ms: float | None = None
+) -> str:
+    # FLAT_MEMORY: one line per metric; its qualifier lives in the label, the
+    # full semantics stay in the result's *_semantics fields.
+    if not enabled:
+        return ""
+    lines = [f"{'HiCache / Mooncake I/O':-^50}"]
     statuses = result["hicache_io_metadata"]["metric_status"]
     labels = (
-        ("Average SSD --> Host Latency (ms):", "avg_ssd_to_host_latency_ms"),
-        ("DRAM Read bandwidth (GB/s):", "dram_read_bw_gbps"),
-        ("DRAM Write bandwidth (GB/s):", "dram_write_bw_gbps"),
-        ("SSD write operations (data-synced buckets):", "ssd_write_ops"),
-        ("SSD Read peak bandwidth, 100 ms (GB/s):", "ssd_read_peak_bw_gbps"),
-        ("SSD Write peak bandwidth, 100 ms (GB/s):", "ssd_write_peak_bw_gbps"),
+        ("SSD -> Host fetch latency, per batch (ms)", "avg_ssd_to_host_latency_ms"),
+        ("DRAM read bandwidth, Host->GPU active time (GB/s)", "dram_read_bw_gbps"),
+        ("DRAM write bandwidth, GPU->Host active time (GB/s)", "dram_write_bw_gbps"),
+        ("SSD data-synced buckets (buckets)", "ssd_write_ops"),
+        ("SSD read 100ms peak bandwidth (GB/s)", "ssd_read_peak_bw_gbps"),
+        ("SSD write 100ms peak bandwidth (GB/s)", "ssd_write_peak_bw_gbps"),
     )
     for label, field in labels:
-        value = result.get(field)
-        if not enabled or statuses[field]["status"] == "not_tested":
+        value, state = result.get(field), statuses[field]
+        # A value read while transfers were still queued is partial; say so here.
+        partial = "pending_at_boundary" if state["status"] == "pending_at_boundary" else None
+        if state["status"] == "not_tested":
             text = "--"
         elif value is None:
-            text = "N/A"
+            reason = "; ".join(filter(None, (partial, state["reason"])))
+            text = f"-- ({reason})" if reason else "--"
         else:
-            text = str(value) if field == "ssd_write_ops" else f"{value:.3f}"
-        lines.append(f"{label:<44} {text}")
-    lines.extend(
-        (
-            "DRAM: Host->GPU / GPU->Host, active-time weighted across TP ranks.",
-            "SSD latency: successful owner fetch batches to Host, not per-request latency.",
-            "SSD writes: data-synced buckets with metadata write success, not keys or NVMe commands.",
-            "Metadata is not additionally synced; crash durability is not implied.",
-            "SSD peaks: owner KV data-file bytes per fixed 100 ms, counted once across I/O threads.",
-            "Completion time is userspace CQE observation, not device time; alignment bytes are included.",
-            "Scope: completed/accounted snapshot interval; no drain or request ownership.",
-        )
+            text = str(value) if field == "ssd_write_ops" else f"{value:.6g}"
+            if partial:
+                text += f" ({partial})"
+        lines.append(f"  {label}: {text}")
+    # Server-side, per request: storage prefetch start to its result on the host.
+    text = (
+        "-- (no request was served from storage)"
+        if request_prefetch_ms is None
+        else f"{request_prefetch_ms:.6g}"
     )
-    for name, state in statuses.items():
-        if enabled and state["status"] not in ("ok", "not_tested"):
-            lines.append(f"{name}: {state['status']} ({state['reason']})")
+    lines.append(f"  Storage -> Host prefetch latency, mean per storage-read request (ms): {text}")
     return "\n".join(lines)
-
 
 class HiCacheIOCollector:
     def __init__(

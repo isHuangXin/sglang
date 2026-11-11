@@ -56,22 +56,17 @@ def project_storage_restore_report(
 
 def format_storage_restore_report(report: Mapping) -> str:
     """Render validated request-restore timing without relabeling legacy Flat means."""
-    lines = [
-        "Storage Restore to Observed All-TP GPU Ready".center(64, "-"),
-        f"  Scope: {report['scope']}",
-        f"  Sample: {report['sample_unit']}; TP size: {report['tp_size']}",
-    ]
-    fields = [report["fields"][name] for name in _restore_contract.FIELDS.values()]
-    # FLAT_MEMORY: no restore sample at all means this run has no instrumented restore path.
-    untested = all(field["status"] != "measured" and not field["sample_count"] for field in fields)
+    # FLAT_MEMORY: a server without restore instrumentation reports no TP size;
+    # the section does not apply to it, so it is omitted rather than shown empty.
+    if report["tp_size"] is None:
+        return ""
+    lines = [f"{'Storage restore to all-TP GPU ready, first per request':-^50}"]
     for name in _restore_contract.FIELDS.values():
         field = report["fields"][name]
-        if untested:
-            lines.append(f"  {name}: --")
-            continue
-        text = (f"{field['value']:.6g}" if field["status"] == "measured"
-                else f"N/A ({field['reason']})")
-        lines.append(f"  {name}: {text} ms (samples: {field['sample_count']})")
+        if field["status"] == "measured":
+            lines.append(f"  {name}: {field['value']:.6g} ms (samples: {field['sample_count']})")
+        else:
+            lines.append(f"  {name}: -- ({field['reason']}; samples: {field['sample_count']})")
     return "\n".join(lines)
 
 
@@ -130,11 +125,29 @@ REPORT_FIELDS = (
         for direction in ("read", "write")
         for kind, label in (("", "average bandwidth"), ("peak_", "100ms peak bandwidth"))
     ),
+    *(
+        _field(
+            f"flat_dram_{direction}_active_bw_gbps", "io",
+            f"DRAM {direction} active-time bandwidth", "GB/s",
+        )
+        for direction in ("read", "write")
+    ),
     _field("flat_ssd_read_io_count", "io", "SSD completed reads", "ops"),
     _field("flat_ssd_write_io_count", "io", "SSD completed writes", "ops"),
     _field("flat_ssd_durable_write_batches", "io", "SSD durable write batches", "batches"),
     _field("flat_ssd_new_kv_blocks", "io", "SSD new KV blocks", "blocks"),
     _field("flat_capacity_pressure_offloads", "io", "Capacity-pressure offloads", "ops"),
+    _field("flat_native_io_errors", "io", "SSD backend I/O errors", "ops"),
+    _field("flat_restore_io_errors", "io", "Failed restores/backups/lookups (any layer)", "ops"),
+    _field("flat_restore_fallbacks", "io", "Restores abandoned for recompute", "ops"),
+    _field("flat_restore_deferrals", "io", "Restores deferred for GPU pages", "ops"),
+    _field("flat_restore_ready_dropped_tokens", "io", "Restored tokens dropped before admission", "tokens"),
+    _field("flat_restore_admission_dropped_tokens", "io", "Restored tokens dropped at admission", "tokens"),
+    _field("flat_reclaim_invalidated_nodes", "io", "Tree nodes invalidated by reclaim", "nodes"),
+    *(
+        _field(f"flat_placed_{medium}_tokens", "io", f"Tokens written with {label} hint", "tokens")
+        for medium, label in (("dram", "DRAM"), ("ssd", "SSD"), ("any", "no medium"))
+    ),
 )
 REPORT_FIELD_NAMES = tuple(sorted(
     name for field in REPORT_FIELDS for name in (field["name"], *field["aliases"])
@@ -144,7 +157,7 @@ _MODE_KEYS = (
 )
 REPORT_METADATA_FIELDS = (
     "cache_report_schema_version", *_MODE_KEYS, "cache_report_metadata",
-    "cache_report", "flat_io_status", "flat_io_error",
+    "cache_report", "flat_io_status", "flat_io_error", "flat_io_field_errors",
 )
 _RAW_FIELDS = (
     "server_prompt_tokens", "server_cached_tokens", "cached_tokens_details",
@@ -394,7 +407,7 @@ def _derived_cache(values):
 def _project_field(field, *, values, metadata, selected, versioned, cache_error, io_error, reasons):
     name = field["name"]
     prior = deepcopy(dict(_mapping(metadata.get(name))))
-    value = _number(values.get(name), integer=field["unit"] in ("tokens", "ops", "batches", "blocks"))
+    value = _number(values.get(name), integer=field["unit"] in ("tokens", "ops", "batches", "blocks", "nodes"))
     status, reason = "measured", None
     if selected == "unknown":
         status, reason = "unavailable", "mode_unresolved"
@@ -448,6 +461,8 @@ def project_cache_reports(result: Mapping, *, mode: Mapping | str | None = None)
         if all(type(result.get(f"flat_prefetch_{medium}_ops")) is int and result[f"flat_prefetch_{medium}_ops"] == 0 for medium in ("dram", "ssd")):
             values["flat_prefetch_latency_ms"] = None
             reasons["flat_prefetch_latency_ms"] = "no_samples"
+    # FLAT_MEMORY: a field the collector could not measure carries its own reason.
+    reasons.update(_mapping(result.get("flat_io_field_errors", io.get("flat_io_field_errors"))))
     io_status = result.get("flat_io_status", io.get("flat_io_status"))
     io_error = result.get("flat_io_error", io.get("flat_io_error"))
     io_error = (io_error or "flat_io_collection_unavailable") if io_status != "ok" or io_error not in (None, "") else None
@@ -466,6 +481,7 @@ def project_cache_reports(result: Mapping, *, mode: Mapping | str | None = None)
     report.update(mode, cache_report_schema_version=version, cache_report_metadata=metadata)
     report["flat_io_status"] = "not_applicable" if selected == "native" else ("ok" if selected == "flat" and io_error is None else "unavailable")
     report["flat_io_error"] = io_error if selected == "flat" else (None if selected == "native" else "mode_unresolved")
+    report["flat_io_field_errors"] = deepcopy(dict(_mapping(result.get("flat_io_field_errors", io.get("flat_io_field_errors"))))) if selected == "flat" else {}
     report["cache_report"] = deepcopy(dict(_mapping(result.get("cache_report"))))
     report["cache_report"].update({
         name: report[name] for field in REPORT_FIELDS if field["group"] == "cache"
@@ -475,49 +491,39 @@ def project_cache_reports(result: Mapping, *, mode: Mapping | str | None = None)
 
 
 def format_cache_reports(report: Mapping) -> str:
-    """Render one mode line, legend and the three shared report sections."""
+    """Render one mode line, legend and the sections that apply to this system."""
     report = project_cache_reports(report)
     lines = [
         f"Metrics mode: {report['metrics_mode']} ({report['metrics_mode_status']})",
         "Legend".center(50, "-"),
-        "  --  : not tested here",
-        "  N/A : unavailable (see reason)",
+        "  --  : not measured in this run (reason in parentheses if it should have been)",
         "  0   : measured zero",
     ]
-    for group, title in (
-        ("cache", "Cache Hit Statistics"),
-        ("prefetch", "Legacy Flat Prefetch Worker Elapsed Time"),
-        ("io", "Flat Completed/Durable I/O Window"),
+    # FLAT_MEMORY: rows of the other system's mode are omitted, and so is a
+    # section left without rows, except the I/O window: it is always printed,
+    # its rows "--" where they do not apply, so every report has that section.
+    for group, title, always in (
+        ("cache", "Cache Hit Statistics", False),
+        ("prefetch", "Legacy Flat Prefetch Worker Elapsed Time", False),
+        ("io", "Flat Completed/Durable I/O Window", True),
     ):
-        lines.append(f"{title:-^50}")
-        if group == "cache":
-            lines.append("  Hit-rate denominator: all successful server prompt tokens.")
-        if group == "prefetch":
-            lines.append("  Legacy operation means: TP-max worker elapsed, not scheduler-to-GPU-ready.")
-            lines.append("  flat_restore_ready_ms is a separate cache-match diagnostic.")
-        if group == "io":
-            lines.append(f"  Flat I/O status: {report['flat_io_status']}")
+        rows = [f"  Flat I/O status: {report['flat_io_status']}"] if group == "io" else []
         for field in REPORT_FIELDS:
             if field["group"] != group:
                 continue
-            if group == "cache" and report["metrics_mode"] == "native" and field["applicability"] == "flat":
-                continue
             value, meta = report[field["name"]], report["cache_report_metadata"][field["name"]]
             if meta["status"] == "not_applicable":
-                text = "--"
-            elif value is None:
-                text = f"N/A ({meta['reason']})"
+                if always:
+                    rows.append(f"  {field['label']} ({field['unit']}): --")
+                continue
+            if value is None:
+                text = f"-- ({meta['reason']})"
             else:
                 text = f"{value:,}" if type(value) is int else f"{value:.6g}"
-            lines.append(f"  {field['label']} ({field['unit']}): {text}")
-        if group == "cache" and report["metrics_mode"] == "flat":
-            lines.append("  Mixed is an SSD subset, already included; not a third tier.")
-        if group == "io":
-            lines.extend((
-                "  Bandwidth: node aggregates in decimal GB/s (1 GB = 1e9 bytes).",
-                "  Averages: bytes / I/O window; DRAM counter deltas, SSD completed reads / durable writes.",
-                "  Peaks: max of summed-rank completion buckets / 100 ms; not physical device maxima.",
-            ))
+            rows.append(f"  {field['label']} ({field['unit']}): {text}")
+        if rows:
+            lines.append(f"{title:-^50}")
+            lines.extend(rows)
     return "\n".join(lines)
 
 

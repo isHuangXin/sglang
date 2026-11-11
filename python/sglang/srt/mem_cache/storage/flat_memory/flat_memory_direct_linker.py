@@ -409,8 +409,8 @@ class FlatMemoryDirectLinker(UnifiedCacheLinker):
         self._queries: dict[str, _LookupQuery] = {}
         self._lookup_generations: dict[str, int] = {}
         self._lookup_ssd_pages: dict[str, tuple[bool, ...]] = {}
-        # FLAT_MEMORY: page key -> combined page_states bits from the last probe.
-        self._lookup_media: dict[str, dict[str, int]] = {}
+        # FLAT_MEMORY: rid -> pool -> page key -> page_states bits from the last probe.
+        self._lookup_media: dict[str, dict[PoolName, dict[str, int]]] = {}
         self._physical_query_jobs: dict[str, Future[LookupProbeResult]] = {}
         self._storage_generation = 0
         self._offload_coverage: dict[Future, frozenset[PageRecord]] = {}
@@ -635,7 +635,10 @@ class FlatMemoryDirectLinker(UnifiedCacheLinker):
             self._lookup_generations[rid] = generation
             self._lookup_ssd_pages[rid] = result.ssd_pages
             if result.page_media:
-                self._lookup_media[rid] = dict(zip(query.keys, result.page_media))
+                self._lookup_media[rid] = {
+                    name: dict(zip(query.keys, states))
+                    for name, states in result.page_media
+                }
             else:
                 self._lookup_media.pop(rid, None)
             query.dependencies = frozenset(
@@ -779,10 +782,11 @@ class FlatMemoryDirectLinker(UnifiedCacheLinker):
         # skip one lookup (and master RPC) per restore. read_plan still resolves
         # current addresses, so a key reclaimed since the probe fails that read.
         with self._lock:
-            known = self._lookup_media.get(rid)
+            probed = self._lookup_media.get(rid, {})
         media: dict[str, int] = {}
         for transfer in transfers:
             keys = transfer.keys or []
+            known = probed.get(transfer.name)
             if known is not None and all(key in known for key in keys):
                 states = [known[key] for key in keys]
             else:

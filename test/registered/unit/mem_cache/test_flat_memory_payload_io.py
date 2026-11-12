@@ -1318,3 +1318,52 @@ class TestLayerLoadCounter(CustomTestCase):
         counter.forget(batch)
         counter.set_consumer(batch)
         counter.wait_until(2)  # a forgotten, finished index never blocks
+
+    def test_gpu_wait_never_blocks_and_every_layer_flag_rises(self):
+        """The forward must not block the launching thread on a streamed layer, and
+        each layer flag, a failed one included, must rise or the stream hangs."""
+
+        class _Signals:
+            slots = 2
+
+            def __init__(self):
+                self.waits, self.raised = [], set()
+
+            def slot_address(self, slot):
+                return 1000 * slot
+
+            def can_wait(self):
+                return True
+
+            def wait(self, *, slot, layer, value):
+                self.waits.append((slot, layer, value))
+
+            def signal(self, *, slot, layer, value):
+                self.raised.add((slot, layer, value))
+
+            def timed_out(self, *, slot, value):
+                return (slot, value) in self.expired
+
+        signals = _Signals()
+        signals.expired = set()
+        counter = LayerLoadCounter(num_layers=2, signals=signals)
+        first, second = counter.update_producer(), counter.update_producer()
+        address, value, layers = counter.attach_signal(first)
+        self.assertEqual(layers, 2)
+        batch = counter.combine([first])
+        counter.set_consumer(batch)
+        counter.wait_until(0)  # returns at once: enqueued, not awaited
+        self.assertEqual(counter.blocked_waits, 0)
+        self.assertEqual(signals.waits, [(address // 1000, 0, value)])
+        counter.complete(first, "injected read failure")
+        self.assertEqual(signals.raised, {(address // 1000, 0, value), (address // 1000, 1, value)})
+        self.assertFalse(counter.timed_out(first))
+        signals.expired.add((address // 1000, value))  # the spin kernel gave up
+        self.assertTrue(counter.timed_out(first))
+        # A member without flags keeps the CPU wait; a busy slot is never reused.
+        self.assertIsNotNone(counter.attach_signal(counter.update_producer()))  # free slot
+        self.assertIsNone(counter.attach_signal(counter.update_producer()))  # first's slot
+        counter.set_consumer(counter.combine([second]))
+        threading.Timer(0.01, lambda: counter.complete(second, None)).start()
+        counter.wait_until(1)
+        self.assertEqual(counter.blocked_waits, 1)

@@ -631,12 +631,14 @@ class GPUTransfer:
         *,
         medium: str = "ssd",
         on_progress: Callable[[int, int, int], None] | None = None,
+        signal: tuple[int, int, int] | None = None,
     ) -> None:
         # FLAT_MEMORY: on_progress(done_bytes, total_bytes, layers_done_through)
         # runs after each batch, once its bytes are in place in the device pages.
+        # signal = (layer-0 flag address, value, layers): read_plan stores it per layer.
         self.raise_if_unsafe()
         if self._plan_mode:
-            self._read_plan(transfers, on_progress=on_progress)
+            self._read_plan(transfers, on_progress=on_progress, signal=signal)
             return
         budget = self.dram_read_budget if medium == "dram" else self.budget
         fragments = list(self.layout.fragments(transfers))
@@ -666,11 +668,12 @@ class GPUTransfer:
                     )
                     on_progress(done_bytes, total_bytes, through)
 
-    def _read_plan(self, transfers, *, on_progress) -> None:
+    def _read_plan(self, transfers, *, on_progress, signal=None) -> None:
         segments = self.layout.plan_segments(transfers)
         plan = self._make_plan(segments)
         total_bytes = sum(n * p for n, p in zip(segments.counts(), segments.padded))
         done_bytes = 0
+        flagged = 0  # first layer whose flag is not raised yet
         batch_bytes = self._read_plan_batch_bytes(segments, total_bytes)
         with self._context(), self._stream_context():
             for batch in self._plan_batches(plan, segments, batch_bytes=batch_bytes):
@@ -678,15 +681,31 @@ class GPUTransfer:
                 # pages; the pages are private until commit, so a failed read
                 # leaves nothing visible.
                 self._sync()
-                self.manager.read_plan(plan, batch.begin, batch.end)
+                through = (
+                    batch.next_layer - 1
+                    if batch.next_layer is not None
+                    else batch.last_layer
+                )
+                if signal is None:
+                    self.manager.read_plan(plan, batch.begin, batch.end)
+                else:
+                    # The last batch, or a failure, raises every remaining flag.
+                    num_layers = signal[2]
+                    last = through if batch.next_layer is not None else num_layers - 1
+                    self.manager.read_plan(
+                        plan,
+                        batch.begin,
+                        batch.end,
+                        signal_address=signal[0],
+                        signal_value=signal[1],
+                        signal_first=flagged,
+                        signal_last=last,
+                        signal_last_on_error=num_layers - 1,
+                    )
+                    flagged = last + 1
                 self._record_batch(batch, write=False)
                 done_bytes += batch.padded_bytes
                 if on_progress is not None:
-                    through = (
-                        batch.next_layer - 1
-                        if batch.next_layer is not None
-                        else batch.last_layer
-                    )
                     on_progress(done_bytes, total_bytes, through)
 
     def _read_plan_batch_bytes(self, segments: PlanSegments, total_bytes: int) -> int:
@@ -735,6 +754,11 @@ class GPUTransfer:
                 last_layer = layer
         if at > begin:
             yield PlanBatch(plan, begin, at, padded, logical, None, last_layer)
+
+    @property
+    def plan_mode(self) -> bool:
+        """Reads go through native read_plan, which can raise layer flags."""
+        return self._plan_mode
 
     def raise_if_unsafe(self) -> None:
         if self._unsafe_error is not None:

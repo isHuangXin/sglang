@@ -27,6 +27,10 @@ from sglang.srt.mem_cache.storage.flat_memory.io_result import (
     FlatUnsafeIOError,
     FlatWriteResult,
 )
+from sglang.srt.mem_cache.storage.flat_memory.layer_signal import (
+    LayerSignals,
+    create_layer_signals,
+)
 from sglang.srt.mem_cache.storage.flat_memory.master_bootstrap import (
     AUTO,
     DEFAULT_MASTER_PORT,
@@ -96,12 +100,22 @@ class LayerLoadCounter:
     completes once every member's layer l has.
     """
 
-    def __init__(self, num_layers: int):
+    def __init__(self, num_layers: int, signals: LayerSignals | None = None):
         self.num_layers = num_layers
         self.producer_index = -1
         self.consumer_index = -1
         self.futures: dict[int, list[Future]] = {}
         self._lock = threading.Lock()
+        self.blocked_waits = 0
+        self.blocked_seconds = 0.0
+        self.gpu_waits = 0
+        # FLAT_MEMORY: restore index -> (slot, value) of its GPU flags. Values never
+        # repeat (they survive reset), so a reused slot cannot satisfy a stale wait.
+        self._signals = signals
+        self._signal_slots: dict[int, tuple[int, int]] = {}
+        self._members: dict[int, list[int]] = {}
+        self._slot_owner: dict[int, int] = {}
+        self._next_value = 0
 
     def update_producer(self) -> int:
         with self._lock:
@@ -159,7 +173,40 @@ class LayerLoadCounter:
 
             for part in parts:
                 part.add_done_callback(finished)
+        with self._lock:
+            self._members[combined] = [index for index in indices if index in self.futures]
         return combined
+
+    @property
+    def has_signals(self) -> bool:
+        return self._signals is not None
+
+    def attach_signal(self, index: int) -> tuple[int, int, int] | None:
+        """Give a restore GPU flags: (layer-0 flag address, value to store, layers).
+
+        read_plan stores the value natively, without the GIL, after each layer is
+        in place (and through the last layer on failure).
+        """
+        if self._signals is None:
+            return None
+        with self._lock:
+            layers = self.futures.get(index)
+            self._next_value += 1
+            value = self._next_value
+            slot = value % self._signals.slots
+            owner = self._slot_owner.get(slot)
+            if layers is None or (owner is not None and owner in self._signal_slots):
+                return None  # slot still in use; this restore keeps the CPU wait
+            self._slot_owner[slot] = index
+            self._signal_slots[index] = (slot, value)
+        for layer, future in enumerate(layers):
+            # Backup for completions that never reach read_plan.
+            future.add_done_callback(
+                lambda _, layer=layer: self._signals.signal(
+                    slot=slot, layer=layer, value=value
+                )
+            )
+        return self._signals.slot_address(slot), value, self.num_layers
 
     def wait_until(self, threshold: int) -> None:
         layers = self._layers(self.consumer_index)
@@ -168,7 +215,42 @@ class LayerLoadCounter:
         # FLAT_MEMORY: A failed layer only lets the forward finish; only the
         # streaming owner reads these pages, and FlatMemoryCache retracts it before
         # its first token is emitted, so its output is never served.
-        layers[min(threshold, self.num_layers - 1)].exception()
+        layer_id = min(threshold, self.num_layers - 1)
+        layer = layers[layer_id]
+        if layer.done():
+            return
+        if self._wait_on_gpu(layer_id):
+            return
+        # FLAT_MEMORY: The launching thread blocks here, so the whole batch (decodes
+        # included) stalls; counted for the control log.
+        started = time.perf_counter()
+        layer.exception()
+        self.blocked_waits += 1
+        self.blocked_seconds += time.perf_counter() - started
+
+    def timed_out(self, index: int) -> bool:
+        """A forward stopped waiting on this restore before its data arrived."""
+        with self._lock:
+            signal = self._signal_slots.get(index)
+        return signal is not None and self._signals.timed_out(slot=signal[0], value=signal[1])
+
+    def _wait_on_gpu(self, layer_id: int) -> bool:
+        # FLAT_MEMORY: The forward stream waits on each pending member's flag; the CPU
+        # keeps queueing kernels. False when any pending member has no flags.
+        if self._signals is None or not self._signals.can_wait():
+            return False
+        with self._lock:
+            pending = [
+                self._signal_slots.get(index)
+                for index in self._members.get(self.consumer_index, ())
+                if index in self.futures and not self.futures[index][layer_id].done()
+            ]
+        if None in pending:
+            return False
+        for slot, value in pending:
+            self._signals.wait(slot=slot, layer=layer_id, value=value)
+        self.gpu_waits += len(pending)
+        return True
 
     def done(self, index: int) -> bool:
         layers = self._layers(index)
@@ -179,11 +261,20 @@ class LayerLoadCounter:
             layers = self.futures.get(index)
             if layers is not None and all(future.done() for future in layers):
                 self.futures.pop(index)
+                self._signal_slots.pop(index, None)
+                self._members.pop(index, None)
 
     def reset(self) -> None:
         with self._lock:
+            # Their slots stay owned: a late flag write must never land on a reused slot.
+            pending = list(self._signal_slots.values())
             self.futures.clear()
+            self._members.clear()
             self.producer_index = self.consumer_index = -1
+        # FLAT_MEMORY: Release any forward still queued behind a dropped flag.
+        for slot, value in pending:
+            for layer in range(self.num_layers):
+                self._signals.signal(slot=slot, layer=layer, value=value)
 
 
 def _resolve(future: Future) -> None:
@@ -387,7 +478,20 @@ class FlatMemoryDirectLinker(UnifiedCacheLinker):
             raise ValueError(
                 "Flat backup wait must be nonnegative and drain timeout positive"
             )
-        self.layer_done_counter = LayerLoadCounter(self.num_layers)
+        self.layer_done_counter = LayerLoadCounter(
+            self.num_layers,
+            signals=(
+                create_layer_signals(
+                    device=self.device,
+                    num_layers=self.num_layers,
+                    # Above any healthy layer read under load (p90 ~0.5 s); arbitrary.
+                    timeout_ms=float(config.get("layer_wise_gpu_wait_timeout_ms", 2000.0)),
+                )
+                if config.get("layer_wise_restore", False)
+                and config.get("layer_wise_gpu_wait", False)
+                else None
+            ),
+        )
         # FLAT_MEMORY: probes are independent per request and release the GIL in
         # the native lookup and its master RPC; one worker queued them for
         # 0.2-4 s at 6 QPS. 4 is arbitrary; not tuned on a real run.
@@ -426,6 +530,7 @@ class FlatMemoryDirectLinker(UnifiedCacheLinker):
         self._load_batches: deque[tuple[int, dict[str, Future]]] = deque()
         # FLAT_MEMORY: per-restore layer counter index and (done, total) bytes.
         self._rid_counters: dict[str, int] = {}
+        self._rid_signals: dict[str, tuple[int, int, int] | None] = {}
         self._consumer_indices: list[int] = []
         self._read_progress: dict[str, tuple[int, int]] = {}
         self._offloads: deque[_Offload] = deque()
@@ -729,6 +834,10 @@ class FlatMemoryDirectLinker(UnifiedCacheLinker):
             pending, self._pending_loads = self._pending_loads, {}
             for rid in pending:
                 self._rid_counters[rid] = self.layer_done_counter.update_producer()
+                if self.layer_done_counter.has_signals and self.transfer.plan_mode:
+                    self._rid_signals[rid] = self.layer_done_counter.attach_signal(
+                        self._rid_counters[rid]
+                    )
                 self._read_progress[rid] = (0, 0)
             counter_index = self.layer_done_counter.combine(
                 [self._rid_counters[rid] for rid in pending]
@@ -861,12 +970,15 @@ class FlatMemoryDirectLinker(UnifiedCacheLinker):
         unsafe = False
         try:
             self._wait_ready(ready_event)
+            with self._lock:
+                signal = self._rid_signals.get(rid)
             self.transfer.read(
                 transfers,
                 medium=medium,
                 on_progress=lambda done, total, layer: self._progress(
                     rid, counter_index, done, total, layer
                 ),
+                signal=signal,
             )
         except Exception as error:
             failure = f"{type(error).__name__}: {error}"
@@ -892,6 +1004,11 @@ class FlatMemoryDirectLinker(UnifiedCacheLinker):
         )
 
     def _finish_read(self, value, result, counter_index, batch) -> None:
+        if value.error is None and self.layer_done_counter.timed_out(counter_index):
+            # FLAT_MEMORY: A forward read these pages before they were in place.
+            value = msgspec.structs.replace(
+                value, error="Flat layer-wise GPU wait timed out before the read finished"
+            )
         with self._lock:
             if value.unsafe:
                 self._unsafe_error = FlatUnsafeIOError(value.error)
@@ -935,6 +1052,7 @@ class FlatMemoryDirectLinker(UnifiedCacheLinker):
             result = future.result()
             self._loads.pop(rid)
             self._read_progress.pop(rid, None)
+            self._rid_signals.pop(rid, None)
             if (index := self._rid_counters.pop(rid, None)) is not None:
                 self.layer_done_counter.forget(index)
             kept = deque()
@@ -1219,6 +1337,7 @@ class FlatMemoryDirectLinker(UnifiedCacheLinker):
             self._offloads.clear()
             self._load_batches.clear()
             self._rid_counters.clear()
+            self._rid_signals.clear()
             self._consumer_indices.clear()
             self._read_progress.clear()
             self.layer_done_counter.reset()

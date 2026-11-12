@@ -359,6 +359,7 @@ class FlatMemoryCache:
         )
         self._control_log_at = time.monotonic()
         self._control_logged = self._control_counters()
+        self._layer_logged = (0, 0.0, 0, 0)
 
     def _create_control_reducer(self, config: dict) -> ShmControlReducer | None:
         # FLAT_MEMORY: Collective at construction, which every TP rank reaches in
@@ -478,8 +479,36 @@ class FlatMemoryCache:
             len(self.prefetches),
             len(self._leases),
         )
+        self._log_layer_waits()
         self._control_log_at = now
         self._control_logged = (seconds, calls, revalidated)
+
+    def _log_layer_waits(self) -> None:
+        # FLAT_MEMORY: Time the launching thread blocked on streamed layers, i.e.
+        # how long whole batches (decodes included) stalled on storage.
+        from sglang.srt.mem_cache.storage.flat_memory.flat_memory_direct_linker import (
+            LayerLoadCounter,
+        )
+
+        counter = self.layer_done_counter
+        if not isinstance(counter, LayerLoadCounter):
+            return
+        current = (
+            counter.blocked_waits,
+            counter.blocked_seconds,
+            self.layer_wise_commits,
+            counter.gpu_waits,
+        )
+        old_waits, old_seconds, old_commits, old_gpu_waits = self._layer_logged
+        logger.info(
+            "Flat layer-wise: %d early commits, forward blocked %d times for %.1f ms, "
+            "%d GPU-side waits",
+            current[2] - old_commits,
+            current[0] - old_waits,
+            (current[1] - old_seconds) * 1000,
+            current[3] - old_gpu_waits,
+        )
+        self._layer_logged = current
 
     def record_control_time(self, name: str, elapsed_seconds: float) -> None:
         # FLAT_MEMORY: Rank-local inclusive times overlap; never sum parent and child.

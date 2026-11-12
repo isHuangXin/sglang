@@ -80,6 +80,12 @@ def create_flat_memory_cache(ctx):
     )
 
     config = validate_flat_memory_direct(resolving_view(ctx.server_args))
+    if config.get("layer_wise_gpu_wait") and get_schedule().disable_overlap_schedule:
+        # FLAT_MEMORY: A GPU-side wait leaves the read running past the launch; only
+        # the overlap loop polls it (and retracts a failed owner) before the
+        # forward's result is processed, so without overlap keep the CPU wait.
+        logger.warning("Flat layer_wise_gpu_wait needs the overlap scheduler; using the CPU wait")
+        config = {**config, "layer_wise_gpu_wait": False}
     if (
         envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.get() != "python"
         or envs.SGLANG_EXPERIMENTAL_CPP_RADIX_TREE.get()

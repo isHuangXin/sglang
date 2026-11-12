@@ -70,7 +70,21 @@ def validate_flat_memory_direct(cfg: Any) -> dict:
     num_segments = cfg.tp_size * cfg.nnodes
     _validate_remote_dram(config, num_segments=num_segments)
     _validate_remote_ssd(config, num_segments=num_segments)
-    return config
+    return _resolve_layer_wise_media(config)
+
+
+def _resolve_layer_wise_media(config: dict) -> dict:
+    # FLAT_MEMORY: per-medium layer-wise restore; the legacy layer_wise_restore
+    # enables both. Downstream, layer_wise_restore means "the machinery is on".
+    legacy = bool(config.get("layer_wise_restore", False))
+    dram = bool(config.get("layer_wise_restore_dram", legacy))
+    ssd = bool(config.get("layer_wise_restore_ssd", legacy))
+    return {
+        **config,
+        "layer_wise_restore": dram or ssd,
+        "layer_wise_restore_dram": dram,
+        "layer_wise_restore_ssd": ssd,
+    }
 
 
 def _validate_remote_dram(config: dict, *, num_segments: int) -> None:

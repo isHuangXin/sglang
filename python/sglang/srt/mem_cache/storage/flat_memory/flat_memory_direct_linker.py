@@ -533,6 +533,13 @@ class FlatMemoryDirectLinker(UnifiedCacheLinker):
         self._rid_signals: dict[str, tuple[int, int, int] | None] = {}
         self._consumer_indices: list[int] = []
         self._read_progress: dict[str, tuple[int, int]] = {}
+        # FLAT_MEMORY: "dram" or "ssd" per dispatched restore; mixed counts as ssd.
+        self._read_media: dict[str, str] = {}
+        # (bytes, seconds) of recent successful restores per medium; 16 is arbitrary.
+        self._read_rates: dict[str, deque[tuple[int, float]]] = {
+            "dram": deque(maxlen=16),
+            "ssd": deque(maxlen=16),
+        }
         self._offloads: deque[_Offload] = deque()
         self._prefetch_samples = []
         self._backup_samples = []
@@ -862,12 +869,17 @@ class FlatMemoryDirectLinker(UnifiedCacheLinker):
         with self._lock:
             return self._read_progress.get(rid, (0, 0))
 
-    def read_bandwidth(self) -> float | None:
-        # FLAT_MEMORY: bytes/second over the recent restores; None before any.
+    def load_medium(self, rid: str) -> str | None:
+        # FLAT_MEMORY: None until the restore is dispatched.
         with self._lock:
-            samples = self._prefetch_samples[-16:]
-        seconds = sum(sample[2] for sample in samples)
-        return sum(sample[1] for sample in samples) / seconds if seconds > 0 else None
+            return self._read_media.get(rid)
+
+    def read_bandwidth(self, medium: str) -> float | None:
+        # FLAT_MEMORY: bytes/second over this medium's recent restores; None before any.
+        with self._lock:
+            samples = list(self._read_rates[medium])
+        seconds = sum(sample[1] for sample in samples)
+        return sum(sample[0] for sample in samples) / seconds if seconds > 0 else None
 
     def layer_counter_for(self, rids: list[str]) -> int:
         # FLAT_MEMORY: the batch's consumer index; -1 when no member still streams.
@@ -934,6 +946,8 @@ class FlatMemoryDirectLinker(UnifiedCacheLinker):
     def _dispatch_read(self, rid, transfers, ready_event, result, counter_index, batch):
         try:
             medium, dram, ssd, mixed = self._media_counts(rid, transfers)
+            with self._lock:
+                self._read_media[rid] = medium
             args = (rid, transfers, ready_event, medium, dram, ssd, mixed, counter_index)
             if medium == "ssd":
                 read = self._ssd_executor.submit(
@@ -988,10 +1002,10 @@ class FlatMemoryDirectLinker(UnifiedCacheLinker):
             )
         elapsed = time.perf_counter() - started
         if failure is None:
+            payload_bytes = self._payload_bytes(transfers)
             with self._lock:
-                self._prefetch_samples.append(
-                    (dram + ssd, self._payload_bytes(transfers), elapsed)
-                )
+                self._prefetch_samples.append((dram + ssd, payload_bytes, elapsed))
+                self._read_rates[medium].append((payload_bytes, elapsed))
         return FlatLoadResult(
             rid, failure, medium, elapsed, dram, ssd, mixed, unsafe=unsafe
         )
@@ -1052,6 +1066,7 @@ class FlatMemoryDirectLinker(UnifiedCacheLinker):
             result = future.result()
             self._loads.pop(rid)
             self._read_progress.pop(rid, None)
+            self._read_media.pop(rid, None)
             self._rid_signals.pop(rid, None)
             if (index := self._rid_counters.pop(rid, None)) is not None:
                 self.layer_done_counter.forget(index)

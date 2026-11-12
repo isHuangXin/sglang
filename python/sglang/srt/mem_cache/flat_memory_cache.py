@@ -299,7 +299,12 @@ class FlatMemoryCache:
         # FLAT_MEMORY: FC-CIO layer-pipelined restore. Early-published pages are
         # private to their owner until the read ends; a failed read retracts the
         # owner and recomputes it. The lead bounds a forward stall; it is arbitrary.
-        self.layer_wise_restore = bool(config.get("layer_wise_restore", False))
+        self.layer_wise_media = frozenset(
+            medium
+            for medium in ("dram", "ssd")
+            if config.get(f"layer_wise_restore_{medium}", config.get("layer_wise_restore"))
+        )
+        self.layer_wise_restore = bool(self.layer_wise_media)
         self.layer_wise_admit_lead = (
             float(config.get("layer_wise_admit_lead_ms", 200.0)) / 1000
         )
@@ -1759,8 +1764,11 @@ class FlatMemoryCache:
             or extend > self.layer_wise_max_extend_tokens
         ):
             return False
+        medium = self.cache_linker.load_medium(state.req.rid)
+        if medium not in self.layer_wise_media:
+            return False
         done, total = self.cache_linker.load_progress(state.req.rid)
-        bandwidth = self.cache_linker.read_bandwidth()
+        bandwidth = self.cache_linker.read_bandwidth(medium)
         if total <= 0 or bandwidth is None:
             return False
         budget = self.layer_wise_admit_lead

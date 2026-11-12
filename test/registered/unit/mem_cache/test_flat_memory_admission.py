@@ -122,7 +122,10 @@ class _Storage:
     def load_progress(self, rid):
         return self.progress.get(rid, (0, 0))
 
-    def read_bandwidth(self):
+    def load_medium(self, rid):
+        return "ssd" if rid in self.ssd_rids else "dram"
+
+    def read_bandwidth(self, medium):
         return self.bandwidth
 
     def layer_counter_for(self, rids):
@@ -526,6 +529,7 @@ class TestFlatMemoryAdmission(CustomTestCase):
 
     def _streaming(self):
         self.runtime.layer_wise_restore = True
+        self.runtime.layer_wise_media = frozenset({"dram", "ssd"})
         self.runtime.layer_wise_admit_lead = 1.0
         self.runtime.layer_wise_prefill_tokens_per_s = 0.0
         req = self._req()
@@ -600,6 +604,7 @@ class TestFlatMemoryAdmission(CustomTestCase):
         """An early admit whose remaining read outlasts the owner's own prefill
         would stall every batch member on storage, so it must keep waiting."""
         self.runtime.layer_wise_restore = True
+        self.runtime.layer_wise_media = frozenset({"dram", "ssd"})
         self.runtime.layer_wise_admit_lead = 1.0
         req = self._req()
         self.runtime.poll()
@@ -614,6 +619,23 @@ class TestFlatMemoryAdmission(CustomTestCase):
         self.storage.progress[req.rid] = (99, 100)  # 0.01 s left
         self.runtime.poll()
         self.assertTrue(state.streaming)
+
+    def test_layer_wise_streams_only_enabled_media(self):
+        """With only DRAM layer-wise on, an SSD restore waits for its whole read
+        however close it is to done."""
+        self.runtime.layer_wise_restore = True
+        self.runtime.layer_wise_media = frozenset({"dram"})
+        self.runtime.layer_wise_admit_lead = 1.0
+        self.runtime.layer_wise_prefill_tokens_per_s = 0.0
+        req = self._req()
+        self.storage.ssd_rids.add(req.rid)
+        self.runtime.poll()
+        self.runtime.prepare_admission([req], self._adder(), has_chunked_req=False)
+        state = self.runtime.prefetches[req.rid]
+        self.storage.bandwidth = 100.0
+        self.storage.progress[req.rid] = (99, 100)
+        self.runtime.poll()
+        self.assertEqual((state.phase, state.streaming), ("read", False))
 
     def test_layer_wise_pages_are_private_to_their_owner(self):
         """Another request must not compute on a still-streaming restore."""

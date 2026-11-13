@@ -570,7 +570,12 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             self.local_rank = (
                 storage_config.tp_rank if storage_config is not None else 0
             )
-            self.warmup()
+            if self.gds_direct_writes:
+                # Tutti mounts no DRAM segment, so a plain put always fails
+                # with insufficient space; only check that the master answers.
+                self._warmup_master_only()
+            else:
+                self.warmup()
             logger.info("Mooncake store warmup successfully.")
             if self.gds_enabled:
                 # Shared cuFile workers per rank; 16 matches FlatCake's GDS workers.
@@ -723,6 +728,24 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
 
         assert self.store.is_exist(warmup_key) == 1
         assert self.store.get(warmup_key) == warmup_value
+
+    def _warmup_master_only(self):
+        warmup_key = "sglang_mooncake_store_warmup_key" + uuid.uuid4().hex
+        max_retries = 10
+        retry_delay = 1.0  # seconds
+        for attempt in range(max_retries):
+            # 0 = absent (master reachable), 1 = exists, negative = error code.
+            ret = self.store.is_exist(warmup_key)
+            if ret == 0:
+                return
+            logger.warning(
+                f"[TP{self.local_rank}] Master warmup failed (attempt {attempt + 1}/{max_retries}), "
+                f"ret={ret}, retrying in {retry_delay}s..."
+            )
+            time.sleep(retry_delay)
+        raise RuntimeError(
+            f"[TP{self.local_rank}] Mooncake master not reachable after {max_retries} attempts"
+        )
 
     def register_mem_pool_host(self, mem_pool_host: HostKVCache):
         super().register_mem_pool_host(mem_pool_host)

@@ -396,6 +396,16 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 if storage_config
                 else None
             )
+            # FLAT_MEMORY: Mooncake-GDS baseline; SSD hits are read by cuFile (compat).
+            gds_mode = (extra_config or {}).get("gds_mode", "off")
+            if gds_mode not in ("off", "compat"):
+                raise ValueError("Mooncake gds_mode must be off or compat")
+            self.gds_enabled = gds_mode == "compat"
+            self._gds_pools: set = set()
+            if self.gds_enabled and (
+                self.config.standalone_storage or self.config.protocol != "tcp"
+            ):
+                raise ValueError("Mooncake GDS (compat) requires the TCP RealClient")
             self.enable_group_semantics = bool(
                 extra_config.get("enable_group_semantics", False)
                 if extra_config
@@ -557,6 +567,21 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             )
             self.warmup()
             logger.info("Mooncake store warmup successfully.")
+            if self.gds_enabled:
+                # Parallel SSD readers per rank; 4 matches FlatCake's SSD readers.
+                gds_workers = int(extra_config.get("gds_workers", 4))
+                self.store.enable_gds(
+                    extra_config["gds_ssd_root"],
+                    torch.cuda.current_device(),
+                    int(extra_config.get("gds_max_io_bytes", 16 << 20)),
+                    gds_workers,
+                )
+                logger.info(
+                    "Mooncake GDS (compat) enabled: SSD root %s, device %d, %d readers",
+                    extra_config["gds_ssd_root"],
+                    torch.cuda.current_device(),
+                    gds_workers,
+                )
 
             self.enable_storage_metrics = False
             if storage_config is not None:
@@ -717,6 +742,29 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         # accessor, or ordinary KV-like host pools used as SWA side pools.
         for buf in self._iter_host_pool_buffers(host_pool):
             super().register_buffer(buf)
+        if self.gds_enabled:
+            self._attach_gds_pool(host_pool, host_pool_name)
+
+    def _attach_gds_pool(self, host_pool: HostKVCache, host_pool_name) -> None:
+        from sglang.srt.mem_cache.memory_pool_host import (
+            DeepSeekV4PagedHostPool,
+            DeepSeekV4StateHostPool,
+            attach_gds_mirror,
+        )
+
+        if not isinstance(host_pool, (DeepSeekV4PagedHostPool, DeepSeekV4StateHostPool)):
+            logger.warning(
+                "Mooncake GDS (compat) does not cover pool %s; it stays host-staged",
+                host_pool_name,
+            )
+            return
+        attach_gds_mirror(host_pool)
+        self._gds_pools.add(host_pool_name)
+        logger.info(
+            "Mooncake GDS (compat) GPU twin for pool %s: %.2f GB",
+            host_pool_name,
+            host_pool.gds_mirror.nbytes / 1e9,
+        )
 
     def _tag_keys(self, keys: List[str]) -> List[str]:
         if self.config_prefix is None:
@@ -939,6 +987,10 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                     )
                     for i, res in zip(missing_idx, put_results):
                         io_results[i] = res
+            elif transfer.name in self._gds_pools:
+                io_results = self._get_batch_gds(
+                    host_pool, key_strs, ptr_list, element_size_list
+                )
             else:
                 io_results = self._get_batch_zero_copy_impl(
                     key_strs, ptr_list, element_size_list
@@ -1395,6 +1447,41 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             results = self.store.batch_get_into(key_strs, buffer_ptrs, buffer_sizes)
         return results
 
+    def _get_batch_gds(
+        self, host_pool, key_strs: List[str], ptrs: List[int], sizes: List[int]
+    ) -> List[int]:
+        """SSD-only objects go SSD -> GPU twin by cuFile; objects with a DRAM
+        replica, and failed GDS reads, take the original host-staged read."""
+        host_base = host_pool.kv_buffer.data_ptr()
+        gpu_base = host_pool.gds_mirror.data_ptr()
+        row_bytes = host_pool.kv_buffer[0].nbytes
+        results = [0] * len(key_strs)
+        # GDSReader takes at most 4096 unique keys per call.
+        for start in range(0, len(key_strs), 4096):
+            end = min(start + 4096, len(key_strs))
+            media = self.store.batch_get_into_gpu(
+                key_strs[start:end],
+                [gpu_base + ptr - host_base for ptr in ptrs[start:end]],
+                sizes[start:end],
+                skip_memory=True,
+            )
+            for i, medium in enumerate(media, start):
+                if medium == 2:
+                    results[i] = sizes[i]
+        on_gpu = [result > 0 for result in results]
+        host_reads = [i for i, gds in enumerate(on_gpu) if not gds]
+        if host_reads:
+            host_results = self._get_batch_zero_copy_impl(
+                [key_strs[i] for i in host_reads],
+                [ptrs[i] for i in host_reads],
+                [sizes[i] for i in host_reads],
+            )
+            for i, result in zip(host_reads, host_results):
+                results[i] = result
+        rows = torch.tensor([(ptr - host_base) // row_bytes for ptr in ptrs])
+        host_pool.gds_rows_on_gpu[rows] = torch.tensor(on_gpu)
+        return results
+
     def _batch_exist(self, key_strs: List[str]) -> List[int]:
         return self.store.batch_is_exist(key_strs)
 
@@ -1407,7 +1494,10 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 "reason": "Mooncake client lacks get_io_stats_snapshot",
             }
         try:
-            return snapshot()
+            result = snapshot()
+            if self.gds_enabled:
+                result["gds"] = self.store.get_gds_stats()
+            return result
         except Exception as exc:
             return {
                 "status": "unavailable",

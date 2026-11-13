@@ -402,6 +402,11 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 raise ValueError("Mooncake gds_mode must be off or compat")
             self.gds_enabled = gds_mode == "compat"
             self._gds_pools: set = set()
+            # Tutti baseline: no DRAM tier; KV is written GPU -> SSD by cuFile
+            # into the SSD owner's buckets and read SSD -> GPU.
+            self.gds_direct_writes = bool((extra_config or {}).get("gds_direct_writes", False))
+            if self.gds_direct_writes and not self.gds_enabled:
+                raise ValueError("gds_direct_writes needs gds_mode=compat")
             if self.gds_enabled and (
                 self.config.standalone_storage or self.config.protocol != "tcp"
             ):
@@ -582,6 +587,16 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                     torch.cuda.current_device(),
                     gds_workers,
                 )
+            if self.gds_direct_writes:
+                # The owner's offload RPC endpoint (MOONCAKE_OFFLOAD_RPC_PORT).
+                self.store.enable_gds_writes(
+                    extra_config["gds_owner_endpoint"],
+                    int(extra_config.get("gds_write_bucket_bytes", 64 << 20)),
+                )
+                logger.info(
+                    "Mooncake GDS direct writes to owner %s",
+                    extra_config["gds_owner_endpoint"],
+                )
 
             self.enable_storage_metrics = False
             if storage_config is not None:
@@ -753,12 +768,17 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         )
 
         if not isinstance(host_pool, (DeepSeekV4PagedHostPool, DeepSeekV4StateHostPool)):
+            if self.gds_direct_writes:
+                raise ValueError(
+                    f"Tutti (gds_direct_writes) covers DeepSeek-V4 pools only, not {host_pool_name}"
+                )
             logger.warning(
                 "Mooncake GDS (compat) does not cover pool %s; it stays host-staged",
                 host_pool_name,
             )
             return
         attach_gds_mirror(host_pool)
+        host_pool.gds_direct_writes = self.gds_direct_writes
         self._gds_pools.add(host_pool_name)
         logger.info(
             "Mooncake GDS (compat) GPU twin for pool %s: %.2f GB",
@@ -978,7 +998,16 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 exist_result = self._batch_exist(key_strs)
                 io_results = [0 if state == 1 else -1 for state in exist_result]
                 missing_idx = [i for i, state in enumerate(exist_result) if state != 1]
-                if missing_idx:
+                if missing_idx and self.gds_direct_writes and transfer.name in self._gds_pools:
+                    put_results = self._put_batch_gds(
+                        host_pool,
+                        [key_strs[i] for i in missing_idx],
+                        [ptr_list[i] for i in missing_idx],
+                        [element_size_list[i] for i in missing_idx],
+                    )
+                    for i, res in zip(missing_idx, put_results):
+                        io_results[i] = res
+                elif missing_idx:
                     put_results = self._put_batch_zero_copy_impl(
                         [key_strs[i] for i in missing_idx],
                         [ptr_list[i] for i in missing_idx],
@@ -1480,6 +1509,25 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 results[i] = result
         rows = torch.tensor([(ptr - host_base) // row_bytes for ptr in ptrs])
         host_pool.gds_rows_on_gpu[rows] = torch.tensor(on_gpu)
+        return results
+
+    def _put_batch_gds(
+        self, host_pool, key_strs: List[str], ptrs: List[int], sizes: List[int]
+    ) -> List[int]:
+        """Writes the objects GPU twin -> SSD (the backup put them in the twin);
+        0 per object written, -1 otherwise, as batch_put_from reports."""
+        host_base = host_pool.kv_buffer.data_ptr()
+        gpu_base = host_pool.gds_mirror.data_ptr()
+        results = []
+        # GDSReader takes at most 4096 unique keys per call.
+        for start in range(0, len(key_strs), 4096):
+            end = min(start + 4096, len(key_strs))
+            written = self.store.batch_put_from_gpu(
+                key_strs[start:end],
+                [gpu_base + ptr - host_base for ptr in ptrs[start:end]],
+                sizes[start:end],
+            )
+            results.extend(0 if ok else -1 for ok in written)
         return results
 
     def _batch_exist(self, key_strs: List[str]) -> List[int]:

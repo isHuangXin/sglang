@@ -245,6 +245,8 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
         # Set by attach_gds_mirror when Mooncake GDS (compat) reads are enabled.
         self.gds_mirror: Optional[torch.Tensor] = None
         self.gds_rows_on_gpu: Optional[torch.Tensor] = None
+        # Tutti baseline: backups go D2D into gds_mirror, which then writes to SSD.
+        self.gds_direct_writes = False
         self.size_per_token = item_bytes
         self.start_layer = 0
         self.end_layer = self.layer_num
@@ -473,7 +475,7 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
             _clear_gds_rows(self, host_rows)
             transfer_kv_all_layer_direct_lf_pf(
                 src_ptrs=self.device_buffers,
-                dst_ptrs=[self.kv_buffer],
+                dst_ptrs=[self.gds_mirror if self.gds_direct_writes else self.kv_buffer],
                 src_indices=device_rows,
                 dst_indices=host_rows,
                 page_size=1,
@@ -650,6 +652,8 @@ class DeepSeekV4StateHostPool(HostKVCache):
         # Set by attach_gds_mirror when Mooncake GDS (compat) reads are enabled.
         self.gds_mirror: Optional[torch.Tensor] = None
         self.gds_rows_on_gpu: Optional[torch.Tensor] = None
+        # Tutti baseline: backups go D2D into gds_mirror, which then writes to SSD.
+        self.gds_direct_writes = False
         self.start_layer = 0
         self.end_layer = self.layer_num
         self.lock = threading.RLock()
@@ -870,7 +874,7 @@ class DeepSeekV4StateHostPool(HostKVCache):
             _clear_gds_rows(self, host_rows)
             transfer_kv_all_layer_direct_lf_pf(
                 src_ptrs=self.device_page_views,
-                dst_ptrs=[self.kv_buffer],
+                dst_ptrs=[self.gds_mirror if self.gds_direct_writes else self.kv_buffer],
                 src_indices=device_rows,
                 dst_indices=host_rows,
                 page_size=1,

@@ -581,6 +581,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                     int(extra_config.get("gds_max_io_bytes", 16 << 20)),
                     gds_workers,
                 )
+                self._begin_gds_io_window()
                 logger.info(
                     "Mooncake GDS (compat) enabled: SSD root %s, device %d, %d readers",
                     extra_config["gds_ssd_root"],
@@ -1533,6 +1534,14 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
     def _batch_exist(self, key_strs: List[str]) -> List[int]:
         return self.store.batch_is_exist(key_strs)
 
+    def _begin_gds_io_window(self) -> None:
+        # FLAT_MEMORY: one window per rank for the server's lifetime; every rank starts
+        # on the shared steady-clock 100 ms grid, so the benchmark can sum ranks per bucket.
+        bucket_ns = 100_000_000
+        start_ns = self.store.gds_io_clock_ns() // bucket_ns * bucket_ns
+        if not self.store.begin_gds_io_window(window_id=1, start_ns=start_ns):
+            logger.warning("Mooncake GDS I/O window did not start; GDS peaks unavailable")
+
     def get_io_stats_snapshot(self) -> dict:
         # The optional native API is cumulative and never resets.
         snapshot = getattr(self.store, "get_io_stats_snapshot", None)
@@ -1545,6 +1554,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             result = snapshot()
             if self.gds_enabled:
                 result["gds"] = self.store.get_gds_stats()
+                result["gds_io_window"] = self.store.get_gds_io_window()
             return result
         except Exception as exc:
             return {

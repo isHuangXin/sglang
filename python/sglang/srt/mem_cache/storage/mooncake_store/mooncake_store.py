@@ -568,8 +568,8 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             self.warmup()
             logger.info("Mooncake store warmup successfully.")
             if self.gds_enabled:
-                # Parallel SSD readers per rank; 4 matches FlatCake's SSD readers.
-                gds_workers = int(extra_config.get("gds_workers", 4))
+                # Shared cuFile workers per rank; 16 matches FlatCake's GDS workers.
+                gds_workers = int(extra_config.get("gds_workers", 16))
                 self.store.enable_gds(
                     extra_config["gds_ssd_root"],
                     torch.cuda.current_device(),

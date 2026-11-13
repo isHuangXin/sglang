@@ -49,6 +49,50 @@ from sglang.srt.mem_cache.pool_host.hisparse import HiSparseHostPoolMixin
 # ---- V4 Compressed KV Host Pools ----
 
 
+def attach_gds_mirror(host_pool) -> None:
+    """GPU twin of a page_first_direct host pool: a GDS (compat) read puts an
+    SSD page in the twin row instead of the host row, and the load copies it
+    D2D from there; the host-staged read path is unchanged."""
+    if host_pool.layout != "page_first_direct":
+        raise ValueError(f"Mooncake GDS needs page_first_direct, got {host_pool.layout}")
+    host_pool.gds_mirror = torch.empty(
+        host_pool.kv_buffer.shape, dtype=host_pool.kv_buffer.dtype, device=host_pool.gpu_device
+    )
+    host_pool.gds_rows_on_gpu = torch.zeros(
+        host_pool.kv_buffer.shape[0], dtype=torch.bool
+    )
+
+
+def _clear_gds_rows(host_pool, host_rows: torch.Tensor) -> None:
+    if host_pool.gds_rows_on_gpu is not None:
+        host_pool.gds_rows_on_gpu[host_rows.cpu()] = False
+
+
+def _load_page_first_direct(
+    host_pool, *, dst: torch.Tensor, host_rows: torch.Tensor, device_rows: torch.Tensor, layer_id: int
+) -> None:
+    sources = [(host_pool.kv_buffer, host_rows, device_rows)]
+    if host_pool.gds_rows_on_gpu is not None:
+        on_gpu = host_pool.gds_rows_on_gpu[host_rows.cpu()]
+        if on_gpu.any():
+            gpu_pick = on_gpu.nonzero().squeeze(1)
+            host_pick = (~on_gpu).nonzero().squeeze(1)
+            sources = [
+                (src, host_rows[pick.to(host_rows.device)], device_rows[pick.to(device_rows.device)])
+                for src, pick in ((host_pool.kv_buffer, host_pick), (host_pool.gds_mirror, gpu_pick))
+                if pick.numel()
+            ]
+    for src, src_rows, dst_rows in sources:
+        transfer_kv_per_layer_direct_pf_lf(
+            src_ptrs=[src],
+            dst_ptrs=[dst],
+            src_indices=src_rows,
+            dst_indices=dst_rows,
+            layer_id=layer_id,
+            page_size=1,
+        )
+
+
 class LogicalHostPool:
     """Pure-logical anchor pool for V4 HiCache.
 
@@ -198,6 +242,9 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
         self.page_size = slot_page_size
         self.size = num_host_pages * slot_page_size
         self.layout = layout
+        # Set by attach_gds_mirror when Mooncake GDS (compat) reads are enabled.
+        self.gds_mirror: Optional[torch.Tensor] = None
+        self.gds_rows_on_gpu: Optional[torch.Tensor] = None
         self.size_per_token = item_bytes
         self.start_layer = 0
         self.end_layer = self.layer_num
@@ -423,6 +470,7 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
                 page_size=1,
             )
         elif io_backend == "direct" and self.layout == "page_first_direct":
+            _clear_gds_rows(self, host_rows)
             transfer_kv_all_layer_direct_lf_pf(
                 src_ptrs=self.device_buffers,
                 dst_ptrs=[self.kv_buffer],
@@ -490,13 +538,12 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
                 page_size=1,
             )
         elif io_backend == "direct" and self.layout == "page_first_direct":
-            transfer_kv_per_layer_direct_pf_lf(
-                src_ptrs=[self.kv_buffer],
-                dst_ptrs=[self.device_buffers[layer_id]],
-                src_indices=host_rows,
-                dst_indices=device_rows,
+            _load_page_first_direct(
+                self,
+                dst=self.device_buffers[layer_id],
+                host_rows=host_rows,
+                device_rows=device_rows,
                 layer_id=layer_id,
-                page_size=1,
             )
         else:
             raise ValueError(
@@ -600,6 +647,9 @@ class DeepSeekV4StateHostPool(HostKVCache):
         self.page_size = swa_page_size
         self.size = num_host_pages * swa_page_size
         self.layout = layout
+        # Set by attach_gds_mirror when Mooncake GDS (compat) reads are enabled.
+        self.gds_mirror: Optional[torch.Tensor] = None
+        self.gds_rows_on_gpu: Optional[torch.Tensor] = None
         self.start_layer = 0
         self.end_layer = self.layer_num
         self.lock = threading.RLock()
@@ -817,6 +867,7 @@ class DeepSeekV4StateHostPool(HostKVCache):
                 page_size=1,
             )
         elif io_backend == "direct" and self.layout == "page_first_direct":
+            _clear_gds_rows(self, host_rows)
             transfer_kv_all_layer_direct_lf_pf(
                 src_ptrs=self.device_page_views,
                 dst_ptrs=[self.kv_buffer],
@@ -870,13 +921,12 @@ class DeepSeekV4StateHostPool(HostKVCache):
                 page_size=1,
             )
         elif io_backend == "direct" and self.layout == "page_first_direct":
-            transfer_kv_per_layer_direct_pf_lf(
-                src_ptrs=[self.kv_buffer],
-                dst_ptrs=[self.device_page_views[layer_id]],
-                src_indices=host_rows,
-                dst_indices=device_rows,
+            _load_page_first_direct(
+                self,
+                dst=self.device_page_views[layer_id],
+                host_rows=host_rows,
+                device_rows=device_rows,
                 layer_id=layer_id,
-                page_size=1,
             )
         else:
             raise ValueError(

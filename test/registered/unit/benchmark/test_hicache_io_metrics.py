@@ -189,6 +189,73 @@ def _ssd_samples():
     return before, after
 
 
+def _gds_sample(*, completed=False, starts=(1_000_000_000, 1_100_000_000)):
+    """Two ranks whose GDS windows start one 100 ms bucket apart on the shared clock."""
+    info = _server_info(completed=completed)
+    for rank, start in zip(info["internal_states"][0]["hicache_io"]["ranks"], starts):
+        # One byte before the case. During it, rank 0 reads 3 GB in absolute bucket 10 and
+        # 1 GB in 11; rank 1 (its index 0 = absolute 11) reads 3 GB: bucket 11 peaks at 4 GB.
+        if not completed:
+            buckets, total = [{"index": 0, "ssd_read": 1}], 1
+        elif rank["tp_rank"] == 0:
+            buckets = [{"index": 0, "ssd_read": 3 * 10**9 + 1}, {"index": 1, "ssd_read": 10**9}]
+            total = 4 * 10**9 + 1
+        else:
+            buckets, total = [{"index": 0, "ssd_read": 3 * 10**9 + 1}], 3 * 10**9 + 1
+        rank["mooncake"]["gds"] = {
+            "ssd_read_bytes": total,
+            "ssd_read_ops": 1 + (4 if completed else 0),
+            "ssd_read_ns": 1 + (2 * 10**9 if completed else 0),
+            "read_errors": 0,
+        }
+        rank["mooncake"]["gds_io_window"] = {
+            "window": {
+                "id": 1,
+                "active": True,
+                "start_ns": start,
+                "bucket_ns": 100_000_000,
+                "capture_buckets": True,
+                "overflowed": False,
+                "aborted": False,
+                "buckets": buckets,
+            }
+        }
+    sample = _sample(completed=completed)
+    sample["server"]["snapshot"] = project_hicache_snapshot(info)
+    return sample
+
+
+class TestGDSReads(CustomTestCase):
+    def test_peak_sums_ranks_per_absolute_bucket_not_per_rank_peaks(self):
+        """Rank windows with different starts align on the shared 100 ms grid before the max."""
+        result = summarize_hicache_io(_gds_sample(), _gds_sample(completed=True))
+        # 4 GB / 100 ms; a per-rank max would give 30, a sum of per-rank peaks 60.
+        self.assertAlmostEqual(result["gds_ssd_read_peak_bw_gbps"], 40.0)
+        # 7 GB over 4 s of summed cuFile read time, 8 reads.
+        self.assertAlmostEqual(result["gds_ssd_read_bw_per_worker_gbps"], 1.75)
+        self.assertAlmostEqual(result["gds_ssd_read_latency_ms"], 500.0)
+
+        restarted = _gds_sample(completed=True, starts=(1_000_000_000, 1_200_000_000))
+        result = summarize_hicache_io(_gds_sample(), restarted)
+        self.assertIsNone(result["gds_ssd_read_peak_bw_gbps"])
+        self.assertIn("restarted", result["hicache_io_metadata"]["metric_status"][
+            "gds_ssd_read_peak_bw_gbps"]["reason"])
+        self.assertAlmostEqual(result["dram_read_bw_gbps"], 8 / 3)
+
+    def test_runs_without_a_gds_reader_report_not_tested(self):
+        """Experiment 4 and FlatCake have no GDS reader; the rows must read --, not an error."""
+        collector = HiCacheIOCollector(base_url="http://server", enabled=True)
+        before, after = _sample(), _sample(completed=True)
+        collector.before = before
+        with patch.object(collector, "_capture", AsyncMock(return_value=after)):
+            asyncio.run(collector.__aexit__(None, None, None))
+        statuses = collector.result["hicache_io_metadata"]["metric_status"]
+        for name in ("gds_ssd_read_latency_ms", "gds_ssd_read_peak_bw_gbps"):
+            self.assertEqual(statuses[name]["status"], "not_tested")
+        report = format_hicache_io_report(collector.result)
+        self.assertIn("SSD -> GPU (GDS) read 100ms peak bandwidth, all ranks (GB/s): --\n", report)
+
+
 class TestHiCacheIODeltas(CustomTestCase):
     def test_weighted_rank_bandwidth_and_fetch_batch_denominator(self):
         """Unequal TP workloads require ratios of sums, not averaging rank ratios."""

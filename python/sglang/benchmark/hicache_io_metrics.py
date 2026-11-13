@@ -34,10 +34,17 @@ _METRICS = (
     "ssd_write_ops",
     "ssd_read_peak_bw_gbps",
     "ssd_write_peak_bw_gbps",
+    # FLAT_MEMORY: the ranks' own cuFile reads (Mooncake-GDS, Tutti); the owner never sees them.
+    "gds_ssd_read_latency_ms",
+    "gds_ssd_read_bw_per_worker_gbps",
+    "gds_ssd_read_peak_bw_gbps",
 )
+_GDS_METRICS = _METRICS[-3:]
 _L2_FIELDS = ("bytes", "duration_ns", "batches", "untimed_batches")
 _FETCH_FIELDS = ("bytes", "latency_ns_sum", "batches", "errors", "inflight")
 _PENDING_FIELDS = ("h2d", "d2h", "storage_prefetch", "storage_backup")
+# Mooncake GDSReader::Stats(); ssd_read_ns sums the time of each cuFileRead call.
+_GDS_STAT_FIELDS = ("ssd_read_bytes", "ssd_read_ops", "ssd_read_ns", "read_errors")
 
 
 class _SnapshotError(ValueError):
@@ -79,6 +86,38 @@ def _project_native(value: Any) -> dict:
         "status": source.get("status"),
         "ssd_to_host_fetch": _project_counters(
             source.get("ssd_to_host_fetch"), _FETCH_FIELDS
+        ),
+        "gds": (
+            _project_counters(source["gds"], _GDS_STAT_FIELDS)
+            if isinstance(source.get("gds"), Mapping)
+            else None
+        ),
+        "gds_io_window": _project_gds_window(source.get("gds_io_window")),
+    }
+
+
+def _project_gds_window(value: Any) -> dict | None:
+    # Mooncake StorageIOMetric::SnapshotJson(); only the SSD read direction is kept.
+    if not isinstance(value, Mapping) or not isinstance(value.get("window"), Mapping):
+        return None
+    window = value["window"]
+    buckets = window.get("buckets")
+    return {
+        "id": window.get("id"),
+        "active": window.get("active"),
+        "start_ns": window.get("start_ns"),
+        "bucket_ns": window.get("bucket_ns"),
+        "capture_buckets": window.get("capture_buckets"),
+        "overflowed": window.get("overflowed"),
+        "aborted": window.get("aborted"),
+        "buckets": (
+            [
+                {"index": bucket.get("index"), "ssd_read": bucket.get("ssd_read")}
+                for bucket in buckets
+                if isinstance(bucket, Mapping) and bucket.get("ssd_read")
+            ]
+            if isinstance(buckets, list)
+            else None
         ),
     }
 
@@ -525,6 +564,8 @@ def _empty_result() -> dict:
         )
     return result | {
         "mean_l2_kv_readback_ms": None,
+        "gds_read_errors": None,
+        "gds_ssd_read_semantics": "rank_cufile_read_completions_100ms_v1",
         "hicache_io_status": "unavailable",
         "mooncake_io_status": "unavailable",
         "ssd_read_evidence_status": "unavailable",
@@ -542,6 +583,9 @@ def _empty_result() -> dict:
             "ssd_write_ops": "data_synced_buckets",
             "ssd_read_peak_bw_gbps": "GB/s",
             "ssd_write_peak_bw_gbps": "GB/s",
+            "gds_ssd_read_latency_ms": "ms",
+            "gds_ssd_read_bw_per_worker_gbps": "GB/s",
+            "gds_ssd_read_peak_bw_gbps": "GB/s",
         },
     }
 
@@ -571,6 +615,7 @@ def summarize_hicache_io(before: Mapping, after: Mapping) -> dict:
     if pairs is not None:
         _summarize_l2(result=result, pairs=pairs, metadata=metadata)
         _summarize_fetch(result=result, pairs=pairs, metadata=metadata)
+        _summarize_gds(result=result, pairs=pairs, metadata=metadata)
     try:
         begin, end = (_source_snapshot(sample, "owner") for sample in (before, after))
         for snapshot in (begin, end):
@@ -726,6 +771,85 @@ def _summarize_fetch(*, result: dict, pairs: list, metadata: dict) -> None:
         metadata["metric_status"][name]["reason"] = str(error)
 
 
+def _gds_window_reads(window: Any, *, name: str) -> tuple[tuple, dict[int, int]]:
+    """(id, start_ns) and SSD read bytes per absolute 100 ms bucket of one rank."""
+    window = _mapping(window, f"{name} GDS I/O window")
+    start_ns = _counter(window.get("start_ns"), "GDS window start")
+    if (
+        window.get("capture_buckets") is not True
+        or window.get("active") is not True
+        or window.get("bucket_ns") != _SSD_BUCKET_NS
+        or start_ns % _SSD_BUCKET_NS
+    ):
+        raise _SnapshotError("GDS I/O window is not an open, 100 ms aligned window")
+    if window.get("overflowed") or window.get("aborted"):
+        raise _SnapshotError("GDS I/O window overflowed or was aborted")
+    buckets = window.get("buckets")
+    if not isinstance(buckets, list):
+        raise _SnapshotError("GDS I/O window buckets are unavailable")
+    # Ranks align start_ns to the shared steady clock, so absolute ids match across ranks.
+    base = start_ns // _SSD_BUCKET_NS
+    reads = {}
+    for bucket in buckets:
+        bucket = _mapping(bucket, "GDS window bucket")
+        reads[base + _counter(bucket.get("index"), "GDS bucket index")] = _counter(
+            bucket.get("ssd_read"), "GDS bucket bytes"
+        )
+    return (window.get("id"), start_ns), reads
+
+
+def _gds_delta(pairs: list[tuple[Mapping, Mapping]]) -> tuple[dict, dict[int, int]]:
+    total = dict.fromkeys(_GDS_STAT_FIELDS, 0)
+    buckets: dict[int, int] = {}
+    for before, after in pairs:
+        left, right = before["mooncake"], after["mooncake"]
+        if left.get("gds") is None or right.get("gds") is None:
+            raise _SnapshotError("A rank has no GDS reader statistics")
+        values = _deltas(left["gds"], right["gds"], _GDS_STAT_FIELDS)
+        for field, value in values.items():
+            total[field] += value
+        begin, begin_reads = _gds_window_reads(left.get("gds_io_window"), name="before")
+        end, end_reads = _gds_window_reads(right.get("gds_io_window"), name="after")
+        if begin != end:
+            raise _SnapshotError("GDS I/O window was restarted")
+        rank_bytes = 0
+        for index, value in end_reads.items():
+            delta = value - begin_reads.get(index, 0)
+            if delta < 0:
+                raise _SnapshotError("GDS bucket counter decreased")
+            buckets[index] = buckets.get(index, 0) + delta
+            rank_bytes += delta
+        if rank_bytes != values["ssd_read_bytes"]:
+            raise _SnapshotError("GDS buckets do not match the read-byte delta")
+    return total, buckets
+
+
+def _summarize_gds(*, result: dict, pairs: list, metadata: dict) -> None:
+    statuses = metadata["metric_status"]
+    try:
+        raw, buckets = _gds_delta(pairs)
+    except (KeyError, TypeError, ValueError) as error:
+        for name in _GDS_METRICS:
+            statuses[name]["reason"] = str(error)
+        return
+    metadata["deltas"]["gds_ssd_read"] = raw | {
+        "peak_bucket_bytes": max(buckets.values(), default=0)
+    }
+    result["gds_read_errors"] = raw["read_errors"]
+    if not raw["ssd_read_ops"] or not raw["ssd_read_ns"]:
+        for name in _GDS_METRICS:
+            statuses[name] = {"status": "no_samples", "reason": "no_gds_ssd_reads"}
+        return
+    result["gds_ssd_read_latency_ms"] = raw["ssd_read_ns"] / raw["ssd_read_ops"] / 1e6
+    # bytes / ns == GB/s; the summed per-read time is one worker's busy time.
+    result["gds_ssd_read_bw_per_worker_gbps"] = raw["ssd_read_bytes"] / raw["ssd_read_ns"]
+    result["gds_ssd_read_peak_bw_gbps"] = (
+        metadata["deltas"]["gds_ssd_read"]["peak_bucket_bytes"] / _SSD_BUCKET_NS
+    )
+    for name in _GDS_METRICS:
+        statuses[name] = {"status": "ok", "reason": None}
+
+
 _OWNER_METRICS = ("ssd_write_ops", "ssd_read_peak_bw_gbps", "ssd_write_peak_bw_gbps")
 
 
@@ -744,12 +868,28 @@ def _has_native_mooncake(sample: Mapping) -> bool:
     return walk(sample.get("server", {}) if isinstance(sample, Mapping) else {})
 
 
-def mark_not_tested(result: dict, *, owner_configured: bool, native_mooncake: bool) -> dict:
+def _has_gds_reader(sample: Mapping) -> bool:
+    """True when any TP rank reported Mooncake GDS reader statistics."""
+    snapshot = sample.get("server", {}).get("snapshot") if isinstance(sample, Mapping) else None
+    ranks = snapshot.get("ranks") if isinstance(snapshot, Mapping) else None
+    return isinstance(ranks, list) and any(
+        isinstance(rank, Mapping)
+        and isinstance(rank.get("mooncake"), Mapping)
+        and rank["mooncake"].get("gds") is not None
+        for rank in ranks
+    )
+
+
+def mark_not_tested(
+    result: dict, *, owner_configured: bool, native_mooncake: bool, gds_reader: bool = False
+) -> dict:
     """FLAT_MEMORY: tag metrics this run cannot produce as not tested, not missing."""
     statuses = result["hicache_io_metadata"]["metric_status"]
     absent = [] if owner_configured else list(_OWNER_METRICS)
     if not native_mooncake:
         absent.append("avg_ssd_to_host_latency_ms")
+    if not gds_reader:
+        absent.extend(_GDS_METRICS)
     for name in absent:
         if statuses[name]["status"] != "ok":
             statuses[name] = {"status": "not_tested", "reason": None}
@@ -771,6 +911,11 @@ def format_hicache_io_report(
         ("SSD data-synced buckets (buckets)", "ssd_write_ops"),
         ("SSD read 100ms peak bandwidth (GB/s)", "ssd_read_peak_bw_gbps"),
         ("SSD write 100ms peak bandwidth (GB/s)", "ssd_write_peak_bw_gbps"),
+        ("SSD -> GPU (GDS) read latency, per cuFile read (ms)", "gds_ssd_read_latency_ms"),
+        ("SSD -> GPU (GDS) read bandwidth, per worker active time (GB/s)",
+         "gds_ssd_read_bw_per_worker_gbps"),
+        ("SSD -> GPU (GDS) read 100ms peak bandwidth, all ranks (GB/s)",
+         "gds_ssd_read_peak_bw_gbps"),
     )
     for label, field in labels:
         value, state = result.get(field), statuses[field]
@@ -900,5 +1045,6 @@ class HiCacheIOCollector:
                 owner_configured=bool(self.owner_metrics_url),
                 native_mooncake=_has_native_mooncake(self.before)
                 or _has_native_mooncake(after),
+                gds_reader=_has_gds_reader(self.before) or _has_gds_reader(after),
             )
         return False

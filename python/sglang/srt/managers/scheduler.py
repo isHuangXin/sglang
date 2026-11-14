@@ -3759,14 +3759,19 @@ class Scheduler(
             prefill_tile_block_m=prefill_tile_block_m,
         )
 
-        if self.flat_memory_cache is not None:
-            self.flat_memory_cache.carry_reservation(adder)
-
         if self.chunked_req is not None:
             self.chunked_req.init_next_round_input()
             self.chunked_req = adder.add_chunked_req(self.chunked_req)
+        # FLAT_MEMORY: A request mid chunked prefill already holds its KV, so it takes
+        # the pass budget before restore leases reserve theirs.
+        flat_chunked_req_deferred = (
+            self.flat_memory_cache is not None
+            and self.chunked_req is not None
+            and not any(req is self.chunked_req for req in adder.can_run_list)
+        )
 
         if self.flat_memory_cache is not None:
+            self.flat_memory_cache.carry_reservation(adder)
             self.waiting_queue = self.flat_memory_cache.prepare_admission(
                 self.waiting_queue,
                 adder,
@@ -3797,6 +3802,13 @@ class Scheduler(
             mamba_allocator.alloc_group_begin(len(self.waiting_queue))
         # Get requests from the waiting queue to a new prefill batch
         for req_index, req in enumerate(self.waiting_queue):
+            if flat_chunked_req_deferred:
+                # FLAT_MEMORY: A lease releasing its own reservation must not start a
+                # second chunked request while the deferred one is unfinished.
+                self.flat_memory_cache.observe_scheduler_gate(
+                    "admission_token_budget", self.waiting_queue[req_index:]
+                )
+                break
             if self.enable_lora and not self._can_schedule_lora_req(req, running_loras):
                 if self.flat_memory_cache is not None:
                     self.flat_memory_cache.observe_scheduler_gate("lora", (req,))

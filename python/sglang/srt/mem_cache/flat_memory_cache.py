@@ -2229,13 +2229,12 @@ class FlatMemoryCache:
             self._arrival_pass.pop(state.req.rid, None)
 
     def _classify_scope(self, *, cached_tokens: int, input_tokens: int) -> int:
-        # FLAT_MEMORY: Table 2: nothing cached at arrival is turn 1 (SSD); a short
-        # new suffix on a cached prefix is a short turn (DRAM) unless L_agent is
-        # set and the context reaches it.
+        # FLAT_MEMORY: Table 2: fewer than tau new tokens is a short write (DRAM) in
+        # any turn, since a short first turn is the base every later turn rereads;
+        # a long write goes to SSD, as does any context reaching L_agent if set.
+        # DRAM is never reclaimed, so tau also bounds how fast it fills.
         if not self.scope_media_hints:
             return MEDIA_HINT_ANY
-        if cached_tokens <= 0:
-            return MEDIA_HINT_SSD
         if (
             self.scope_agent_context_tokens
             and input_tokens >= self.scope_agent_context_tokens

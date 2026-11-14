@@ -506,8 +506,9 @@ class TestFlatMemoryAdmission(CustomTestCase):
     def test_scope_rules_follow_table_2_with_short_turn_before_agentic(self):
         classify = self.runtime._classify_scope
         tau = self.runtime.scope_short_turn_tokens
-        # Turn 1: nothing cached at arrival, however short.
-        self.assertEqual(classify(cached_tokens=0, input_tokens=10), MEDIA_HINT_SSD)
+        # Turn 1 follows the same new-token rule: short to DRAM, long to SSD.
+        self.assertEqual(classify(cached_tokens=0, input_tokens=tau - 1), MEDIA_HINT_DRAM)
+        self.assertEqual(classify(cached_tokens=0, input_tokens=tau), MEDIA_HINT_SSD)
         # A long agentic context with a short new suffix is still a short turn.
         self.assertEqual(
             classify(cached_tokens=200_000, input_tokens=200_000 + tau - 1),
